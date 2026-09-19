@@ -1,14 +1,17 @@
 // agentrouter outbound request filter.
 //
-// The character map and the gateway word list are NOT written here: they are
-// generated from the omp pre-hook
-// G:/omp works/.omp/hooks/pre/strip-illegal.ts by tools/gen-filter-core.mjs,
-// and tools/diff-test.mjs proves the generated module agrees with the hook
-// byte-for-byte on a sample set. Edit the hook, re-run the generator.
+// The character map and the gateway word list are NOT written here: they are a
+// byte-for-byte copy of the pure core of the omp pre-hook
+// G:/omp works/.omp/hooks/pre/strip-illegal.ts, produced by
+// tools/gen-filter-core.mjs into filter-core.ts. Only the hook's `import type`
+// line and its `export default function (pi)` wiring are dropped; no annotation
+// rewriting happens (Node 24 strips types natively, and the core uses only
+// erasable syntax). The guard is therefore "the copy is byte-identical to the
+// hook core" - verify with `node tools/diff-test.mjs` after editing the hook.
 //
 // This module adds only the two things the hook does not have:
 //   1. the identity block (user-requested new entry in the word list), applied
-//      before the generated core runs so the hook's own text cannot re-form it;
+//      before the core runs so the hook's own text cannot re-form it;
 //   2. the extra model-facing requirements (workspace AGENTS.md Sec 5 language
 //      rule + identity rule) appended to the request `instructions`.
 //

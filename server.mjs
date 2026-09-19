@@ -56,12 +56,11 @@ const ROUTES = {
   rc: {
     base: process.env.AR_UPSTREAM_RC ?? "https://api.relaycat.top",
     chat: false,
-    // relaycat's responses face is NOT verified for reasoning replay (its astra
-    // was only ever validated over the chat wire). Stripping is a no-op when the
-    // client sent nothing to replay (observed: reasoning=0 on every multi-turn
-    // request so far), so it costs nothing today and protects the first session
-    // that does replay.
-    stripReasoning: true,
+    // No stripReasoning: relaycat never 400'd across resumed turns, and the
+    // earlier "it's a no-op" justification came from telemetry that ran AFTER
+    // the strip (self-fulfilling). Per-route fidelity: don't rewrite what has no
+    // demonstrated problem. Telemetry now reports the pre-strip reasoning count,
+    // so a real replay would be visible in the log before deciding to enable it.
   },
   wb: { base: process.env.AR_UPSTREAM_WB ?? "http://127.0.0.1:7863", chat: true },
   // anyrouter.top is TLS-blocked on a direct connection (omp reports "unknown
@@ -433,6 +432,27 @@ const server = http.createServer(async (req, res) => {
 
   let body = raw.length ? raw.toString("utf8") : undefined;
   let changed = false;
+
+  // Telemetry MUST run before any rewriting: measuring after the strip would
+  // always report reasoning=0 on a stripping route and could never distinguish
+  // "the client sent none" from "we removed them".
+  let incoming = null;
+  if (body !== undefined && isResponses) {
+    try {
+      const parsed = JSON.parse(body);
+      if (Array.isArray(parsed.input)) {
+        incoming = {
+          items: parsed.input.length,
+          reasoning: parsed.input.filter((it) => it?.type === "reasoning").length,
+          calls: parsed.input.filter((it) => it?.type === "function_call").length,
+          outputs: parsed.input.filter((it) => it?.type === "function_call_output").length,
+        };
+      }
+    } catch {
+      /* not JSON (e.g. GET) - nothing to report */
+    }
+  }
+
   if (body !== undefined && (route.filter || route.stripReasoning)) {
     try {
       if (route.filter) {
@@ -449,7 +469,6 @@ const server = http.createServer(async (req, res) => {
             parsed.input = kept;
             body = JSON.stringify(parsed);
             changed = true;
-            log(`stripReasoning ${prefix}${rest}: dropped ${dropped} reasoning item(s)`);
           }
         }
       }
@@ -459,20 +478,20 @@ const server = http.createServer(async (req, res) => {
   }
   if (changed) log(`filter rewrote ${prefix}${rest} body (${raw.length} -> ${Buffer.byteLength(body)})`);
 
-  // Telemetry: how many reasoning items the client sent. codex sends
-  // `include: ["reasoning.encrypted_content"]` and replays reasoning items once
-  // a session has history, which is the shape that 400s on agentrouter's
-  // multi-Azure pool. reasoning=0 means there was nothing to replay.
-  if (body !== undefined && isResponses) {
-    try {
-      const parsed = JSON.parse(body);
-      if (Array.isArray(parsed.input)) {
-        const n = parsed.input.filter((it) => it?.type === "reasoning").length;
-        log(`${prefix}${rest}: items=${parsed.input.length} reasoning=${n}`);
+  if (incoming) {
+    const after = (() => {
+      try {
+        const p = JSON.parse(body);
+        return Array.isArray(p.input) ? p.input.filter((it) => it?.type === "reasoning").length : null;
+      } catch {
+        return null;
       }
-    } catch {
-      /* not JSON (e.g. GET) - nothing to report */
-    }
+    })();
+    log(
+      `${prefix}${rest}: items=${incoming.items} reasoning=${incoming.reasoning}` +
+        (after !== null && after !== incoming.reasoning ? ` -> ${after}` : "") +
+        ` calls=${incoming.calls} outputs=${incoming.outputs}`,
+    );
   }
 
   if (isResponses && isChatUpstream) {

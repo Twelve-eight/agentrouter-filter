@@ -80,18 +80,32 @@
 | `/ar` ds (agentrouter) | 3 -> 5 -> 7 | 全 0 | PONG x3,clean |
 
   items 逐轮增长 = 确实是 resume(非独立单轮).
-- **reasoning 回放的诚实结论**:上述多轮请求里 codex **一次都没带 reasoning item**
-  (`reasoning=0`),所以这几轮没有触发回放路径;但 21:04:55 日志实锤
-  `stripReasoning ar/v1/responses: dropped 1 reasoning item(s)` -- codex 在
-  agentrouter 上**确实会**间歇性回放 reasoning(与 DEVLOG 记录的
-  `rs_0635..` 400 一致).故剥离是**已验证生效的保护**,而非"证明不需要".
-  由于 relaycat 的 responses 面从未针对回放验证过(其 astra 只在 chat 面验证),
-  **`/rc` 也开了 stripReasoning** 作为保险:客户端没东西可回放时它是 no-op
-  (实测 reasoning=0 时零改动),有东西可回放时才起作用.
-- **autostart 实测**:停掉 hub 进程 -> 直接跑 `autostart.cmd` -> 端口 7878 监听,
-  日志写入,`codex exec` 仍 PONG.
+- **带真实工具调用的多轮(关键补测)**:PONG 轮次从不产生
+  `function_call`/`function_call_output`,所以"reasoning 与工具调用配对"这一
+  `/v1/responses` 的核心场景一直没测.改用"读 AGENTS.md 第 1 行并引用"驱动,
+  两条路由各 3 轮全部通过.剥离前遥测(先于任何改写采样):
+
+| 路由 | 观测到的请求 | 结果 |
+|---|---|---|
+| `/ar` agentrouter | `items=6 reasoning=1 -> 0 calls=1 outputs=1`;`items=17 reasoning=4 -> 0 calls=3 outputs=3` | 全 200,clean |
+| `/rc` relaycat | `reasoning=0,0,1,2,2`(**未剥离**) | 全 200,clean |
+
+  即:**剥离 reasoning 的同时保留了配对的 function_call,上游全部 200** --
+  这正是"删 reasoning 可能破坏配对"的风险点,已实测排除.
+  且 relaycat **确实回放 reasoning 且不 400**,故 `/rc` 保持不剥离是正确的.
+- **reasoning 回放的结论**(用剥离前遥测,非自证):agentrouter 上
+  codex **确实回放** reasoning(`reasoning=1..4`,且早前 21:04:55 曾
+  `dropped 1`),故 `/ar` 的剥离是**已验证生效的必要保护**;relaycat 也回放但不 400,
+  故不剥离.**遥测必须在剥离前采样** -- 否则剥离路由永远显示 `reasoning=0`,
+  无法区分"客户端没发"与"被我们删了"(先前版本即有此缺陷,已修).
+- **autostart 实测(含 `.ts` 核心)**:停掉旧实例 -> 直接跑 `autostart.cmd` ->
+  端口 7878 由 `G:\nodejs\node.exe`(v24.18.0,支持类型擦除)绑定,
+  日志出现 `agentrouter gateway listening .. (routes: /ar /rc /wb /an)`,
+  无 TS 加载报错,随后全部多轮测试都跑在这个 autostart 实例上.
   另:重复启动时原会抛未捕获 `EADDRINUSE` 栈,已改为安静退出(第二个实例通常
   就是 autostart 副本,同一组路由由存活实例服务).
+  注意:hub 的 `argw` 进程在 autostart 已占端口时必然退出,这是预期;
+  测试期间曾因此丢失日志可见性,已统一改看 `.tmp/argw-autostart.log`.
 - **profile 矩阵**(`codex exec --skip-git-repo-check -p <x> "只回复:PONG"`):
 
 | profile | provider/model | 结果 |
