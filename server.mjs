@@ -404,7 +404,7 @@ const server = http.createServer(async (req, res) => {
   let filtered = false;
   if (body !== undefined) {
     try {
-      const next = filterBody(body);
+      const next = filterBody(body, { injectInstructions: true });
       filtered = next !== body;
       body = next;
     } catch {

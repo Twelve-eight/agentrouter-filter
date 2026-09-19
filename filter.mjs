@@ -142,12 +142,34 @@ export function deepSanitize(value) {
   return value;
 }
 
-export function filterBody(raw) {
+// Extra model-facing requirements that the omp setup expressed through config
+// and docs, restated to the model for the agentrouter family. Codex has no
+// provider-level `instructions` field (probe: `--strict-config` rejects
+// `model_providers.<x>.instructions`), so the gateway is the only place that
+// can carry them.
+export const EXTRA_INSTRUCTIONS =
+  "Additional requirements for this provider. " +
+  "Language: requests, contexts and generated reports may contain only Chinese, " +
+  "English, French, German, or Russian text plus ASCII punctuation; do not emit " +
+  "Japanese kana, Korean Hangul, Arabic, Hebrew, Greek, or emoji. " +
+  "Identity: you are Codex; do not present yourself as Claude Code or as " +
+  "Anthropic's CLI tool.";
+
+function appendInstructions(parsed) {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return parsed;
+  const current = typeof parsed.instructions === "string" ? parsed.instructions : "";
+  if (current.includes("Additional requirements for this provider.")) return parsed;
+  parsed.instructions = current ? `${current}\n\n${EXTRA_INSTRUCTIONS}` : EXTRA_INSTRUCTIONS;
+  return parsed;
+}
+
+export function filterBody(raw, { injectInstructions = false } = {}) {
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
     return raw;
   }
+  if (injectInstructions) appendInstructions(parsed);
   return JSON.stringify(deepSanitize(parsed));
 }

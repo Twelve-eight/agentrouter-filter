@@ -40,11 +40,15 @@ Codex 的 `model_provider.base_url` 指向 `http://127.0.0.1:7878/<route>/v1`:
   带音标拉丁(法/德)+ 西里尔(俄)+ 书名号/ß。这也正是工作区"仅限中英法德俄字符"
   规则(AGENTS.md Sec 5)的执行点:假名、谚文、阿拉伯、希腊、emoji、制表符
   一律删除。
-- **词组层**:网关不透明敏感词表的替换(`arp player` 系、`relic choice` 系、
-  `choice history`、`net id`、`4xx-dumps`、三点连排压缩等),以及
+- **词组层**:网关不透明敏感词表的替换(`arp-player` 系,`relic choice` 系,
+  `choice history`,`net id`,`4xx-dumps`,三点连排压缩等),以及
   `You are Claude Code, Anthropic's official CLI tool for Claude.` ->
-  `You are Codex, an official CLI coding agent.`(用户指定的新增屏蔽词)。
-- 失败时**放行不阻断**,与 omp 钩子一致。
+  `You are Codex, an official CLI coding agent.`(用户指定的新增屏蔽词).
+- **额外要求注入**:工作区 AGENTS.md Sec 5 的语言卫生规则与身份规则会以
+  `Additional requirements for this provider. ...` 追加到请求体 `instructions`
+  末尾(幂等).Codex 没有 provider 级 `instructions` 字段
+  (`--strict-config` 直接报 `unknown configuration field`),网关是唯一可承载处.
+- 失败时**放行不阻断**,与 omp 钩子一致.
 
 ## 运行
 

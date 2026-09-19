@@ -39,6 +39,10 @@
   (500 `负载已经达到上限` / codex 侧 `high demand`).直连 TLS 被拦,需 7897 代理.
 - **CONNECT 隧道必须显式带 `Host` 头**:Node `https.request({socket})` 不自动补,
   缺了会被 anyrouter 的阿里云 ESA 边缘返回 403 `Forbidden`(非上游业务错误).
+- **Codex 无 provider 级 `instructions` 字段**:`--strict-config` 报
+  `unknown configuration field 'model_providers.<x>.instructions'`;
+  非 strict 模式静默忽略(等于无效).故语言卫生/身份规则改由网关注入
+  请求体 `instructions`(幂等,`EXTRA_INSTRUCTIONS`).
 
 ### 交付
 - `filter.mjs` -- 字符映射表 + 词组表(含新增身份句屏蔽),`sanitize`/`deepSanitize`/
