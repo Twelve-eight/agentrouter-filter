@@ -1,9 +1,9 @@
-// Differential test: generated filter-core.mjs vs the ORIGINAL omp hook.
+// Differential test: generated filter-core.ts vs the ORIGINAL omp hook.
 //
-// The hook is TypeScript with an `import type`; node 24 erases type-only
+// The hook is TypeScript with an `import type`; node 24 strips types natively,
 // imports, so it can be loaded directly. Both sides get identical inputs and
 // must agree byte-for-byte, which is what proves the generator lost no rule.
-import { sanitize as genSanitize, deepStrip as genDeepStrip } from "../filter-core.mjs";
+import { sanitize as genSanitize, deepStrip as genDeepStrip } from "../filter-core.ts";
 import fs from "node:fs";
 
 const SRC = "G:/omp works/.omp/hooks/pre/strip-illegal.ts";

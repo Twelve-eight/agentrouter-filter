@@ -60,16 +60,38 @@
 - 过滤器端到端证明:把 `/ar` 上游指向本地 echo,确认上游收到的 `instructions`
   已是 `You are Codex, an official CLI coding agent.`,且 `originator: codex_exec`
   原样到达.
-- **机械生成 + 差分测试**:`tools/gen-filter-core.mjs` 从钩子第 19-196 行生成
-  `filter-core.mjs`;`tools/diff-test.mjs` 45 个样本 + 1 棵嵌套树,**0 mismatches**.
-  (手抄版曾丢规则:源里 `no ` + fromCharCode 拼出的 18 字符触发词、以及
-  `arp-player`/`warp-player`/`4xx-dumps` 三处自等同替换,渲染层显示会失真.)
-- **多轮会话验证**(单轮 PONG 无法暴露 reasoning 回放问题):
-  `codex exec` + `codex exec resume` 连跑 3 轮 × 3 条路由,全部 PONG 且无 400.
-  网关日志证实 `/ar` 真的触发:`stripReasoning ar/v1/responses: dropped 1/2 reasoning item(s)`;
-  `/rc` `/wb` 无 filter 行(门控生效).
-- **autostart 实测**:停掉 hub 进程 -> 直接跑 `autostart.cmd` -> 端口 7878 监听、
-  日志写入、`codex exec` 仍 PONG(此前只验证过 hub 启动的实例).
+- **生成方式改为字节级复制**:`tools/gen-filter-core.mjs` 从钩子第 19-196 行
+  **原样复制**为 `filter-core.ts`,只丢弃 `import type` 行与
+  `export default function (pi)` 接线,再追加 `export { sanitize, deepStrip };`.
+  Node 24 原生擦除类型,该核心只用可擦除语法(`import type` / `Record<..>` /
+  `: string` / `{ flag: boolean }`),所以**不做任何正则改写**(正则改写可能悄悄
+  破坏含 `": "` 的正则字面量或字符串).
+  `tools/diff-test.mjs` 45 个样本 + 1 棵嵌套树逐字节比对,**0 mismatches**.
+- **多轮会话验证(已修正方法学)**:`codex exec resume` **没有 `-p/--profile`**
+  (只有 `-c`/`-m`),先前harness 的 resume 调用漏了 provider,导致第 2/3 轮实际打到
+  默认 provider -- 那批 `/rc` `/wb` 的"多轮通过"**不成立**,已作废.修正版每次调用
+  都显式传 `-c model_provider=.. -c model=..`,并加了请求遥测
+  (`items=N reasoning=M`).结果:
+
+| 路由 | t1 -> t2 -> t3 items | reasoning | 结果 |
+|---|---|---|---|
+| `/rc` astra (relaycat) | 7 -> 9 -> 11 | 全 0 | PONG x3,clean |
+| `/rc` cn-ds (relaycat-cn) | 3 -> 5 -> 7 | 全 0 | PONG x3,clean |
+| `/ar` ds (agentrouter) | 3 -> 5 -> 7 | 全 0 | PONG x3,clean |
+
+  items 逐轮增长 = 确实是 resume(非独立单轮).
+- **reasoning 回放的诚实结论**:上述多轮请求里 codex **一次都没带 reasoning item**
+  (`reasoning=0`),所以这几轮没有触发回放路径;但 21:04:55 日志实锤
+  `stripReasoning ar/v1/responses: dropped 1 reasoning item(s)` -- codex 在
+  agentrouter 上**确实会**间歇性回放 reasoning(与 DEVLOG 记录的
+  `rs_0635..` 400 一致).故剥离是**已验证生效的保护**,而非"证明不需要".
+  由于 relaycat 的 responses 面从未针对回放验证过(其 astra 只在 chat 面验证),
+  **`/rc` 也开了 stripReasoning** 作为保险:客户端没东西可回放时它是 no-op
+  (实测 reasoning=0 时零改动),有东西可回放时才起作用.
+- **autostart 实测**:停掉 hub 进程 -> 直接跑 `autostart.cmd` -> 端口 7878 监听,
+  日志写入,`codex exec` 仍 PONG.
+  另:重复启动时原会抛未捕获 `EADDRINUSE` 栈,已改为安静退出(第二个实例通常
+  就是 autostart 副本,同一组路由由存活实例服务).
 - **profile 矩阵**(`codex exec --skip-git-repo-check -p <x> "只回复:PONG"`):
 
 | profile | provider/model | 结果 |
@@ -89,11 +111,13 @@
 ### 其它结论
 - `model_reasoning_effort = "max"` **是** codex 0.154 的合法档位
   (二进制枚举 `none|minimal|low|medium|high|xhigh|max|ultra|persistent`),
-  无需改小.
+  `astra.config.toml` 已恢复 `max`.
 - `[model_providers.<x>.responses]` 空表**非法**(`--strict-config` 报
   `unknown configuration field`),已删除;它会静默让整份配置加载失败.
-- 默认 model 由 `gpt-6-astra`(当时 402)改为 `deepseek-v4-flash`(实测可用),
-  避免用户首次启动即 402.
+- 默认 `model = "deepseek-v4-flash"` + `model_provider = "agentrouter"`:
+  用户意图是在 codex 里用 agentrouter,且 astra/sol 当前 402,故默认选实测可用的
+  agentrouter 模型.注意 402 属于 **agentrouter 的配额池**,与 relaycat 无关
+  (relaycat 的 gpt-6-astra 已充值且 16.6k-tok E2E 通过,`astra` profile 可用).
 - models.yml 的 `User-Agent: claude-cli/2.0.34` **未改动**:那是 omp 侧的承重配置
   (omp 原生 UA 不在 agentrouter 白名单,去掉 omp 就彻底失去 agentrouter).
   用户"不要伪造 UA"的要求针对 codex 侧,已满足(codex 原生 `codex_exec/0.154.0`

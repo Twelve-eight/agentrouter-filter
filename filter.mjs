@@ -16,7 +16,7 @@
 // ..), so this filter runs in a local forward proxy that Codex points at via
 // provider base_url.
 
-import { sanitize as coreSanitize, deepStrip as coreDeepStrip } from "./filter-core.mjs";
+import { sanitize as coreSanitize, deepStrip as coreDeepStrip } from "./filter-core.ts";
 
 // --- identity block (not present in the hook) ------------------------------
 // Probe: the sentence passes upstream either way, so this is an identity

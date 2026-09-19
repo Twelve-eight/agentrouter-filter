@@ -42,14 +42,16 @@ Codex 的 `model_provider.base_url` 指向 `http://127.0.0.1:7878/<route>/v1`:
 
 ## 过滤内容
 
-**核心规则不在本仓库手写**.`filter-core.mjs` 由 `tools/gen-filter-core.mjs`
+**核心规则不在本仓库手写**.`filter-core.ts` 由 `tools/gen-filter-core.mjs`
 从 omp 钩子 `G:/omp works/.omp/hooks/pre/strip-illegal.ts` 的纯核心段(第 19-196 行)
-机械生成,唯一变换是删除 TypeScript 类型标注.`tools/diff-test.mjs` 用 45 个样本 +
-一棵嵌套树对"生成版 vs 原钩子"做逐字节比对(当前 0 处不一致),这是"没有丢规则"的证明.
+**字节级原样复制**而来:只丢弃 `import type` 行与 `export default function (pi)` 接线,
+再追加一行 export.Node 24 原生擦除类型,该核心只用可擦除语法,所以**不做任何正则改写**
+(正则改写可能悄悄破坏含 `": "` 的正则字面量或字符串).`tools/diff-test.mjs` 用
+45 个样本 + 一棵嵌套树对"生成版 vs 原钩子"做逐字节比对(当前 0 处不一致).
 **改规则请改钩子,然后重跑生成器**:
 
 ```
-node tools/gen-filter-core.mjs   # 重新生成 filter-core.mjs
+node tools/gen-filter-core.mjs   # 重新生成 filter-core.ts
 node tools/diff-test.mjs         # 必须 0 mismatches
 ```
 

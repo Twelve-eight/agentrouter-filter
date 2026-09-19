@@ -53,11 +53,22 @@ const ROUTES = {
     filter: true,
     stripReasoning: true,
   },
-  rc: { base: process.env.AR_UPSTREAM_RC ?? "https://api.relaycat.top", chat: false },
+  rc: {
+    base: process.env.AR_UPSTREAM_RC ?? "https://api.relaycat.top",
+    chat: false,
+    // relaycat's responses face is NOT verified for reasoning replay (its astra
+    // was only ever validated over the chat wire). Stripping is a no-op when the
+    // client sent nothing to replay (observed: reasoning=0 on every multi-turn
+    // request so far), so it costs nothing today and protects the first session
+    // that does replay.
+    stripReasoning: true,
+  },
   wb: { base: process.env.AR_UPSTREAM_WB ?? "http://127.0.0.1:7863", chat: true },
   // anyrouter.top is TLS-blocked on a direct connection (omp reports "unknown
   // certificate verification error"); it needs the local HTTP proxy. The proxy
   // is applied per-route so agentrouter (which hangs through it) stays direct.
+  // No stripReasoning: anyrouter's astra was verified replay-safe (3x replay OK,
+  // including across prompt_cache_key changes).
   an: { base: process.env.AR_UPSTREAM_AN ?? "https://anyrouter.top", chat: false, proxy: process.env.AR_PROXY_AN ?? "http://127.0.0.1:7897" },
 };
 
@@ -448,6 +459,22 @@ const server = http.createServer(async (req, res) => {
   }
   if (changed) log(`filter rewrote ${prefix}${rest} body (${raw.length} -> ${Buffer.byteLength(body)})`);
 
+  // Telemetry: how many reasoning items the client sent. codex sends
+  // `include: ["reasoning.encrypted_content"]` and replays reasoning items once
+  // a session has history, which is the shape that 400s on agentrouter's
+  // multi-Azure pool. reasoning=0 means there was nothing to replay.
+  if (body !== undefined && isResponses) {
+    try {
+      const parsed = JSON.parse(body);
+      if (Array.isArray(parsed.input)) {
+        const n = parsed.input.filter((it) => it?.type === "reasoning").length;
+        log(`${prefix}${rest}: items=${parsed.input.length} reasoning=${n}`);
+      }
+    } catch {
+      /* not JSON (e.g. GET) - nothing to report */
+    }
+  }
+
   if (isResponses && isChatUpstream) {
     let parsed;
     try {
@@ -502,4 +529,15 @@ const server = http.createServer(async (req, res) => {
   upstream.pipe(res);
 });
 
-server.listen(PORT, HOST, () => log(`agentrouter gateway listening on http://${HOST}:${PORT} (routes: /ar /rc /wb)`));
+server.on("error", (e) => {
+  // A second instance (typically the autostart copy) already owns the port.
+  // Exiting quietly beats an unhandled 'error' stack dump; the live instance
+  // serves the same routes.
+  if (e && e.code === "EADDRINUSE") {
+    log(`port ${PORT} already in use; another gateway instance is serving it (exiting)`);
+    process.exit(0);
+  }
+  throw e;
+});
+
+server.listen(PORT, HOST, () => log(`agentrouter gateway listening on http://${HOST}:${PORT} (routes: /ar /rc /wb /an)`));
