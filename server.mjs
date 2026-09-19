@@ -31,8 +31,28 @@ const HOST = "127.0.0.1";
 // http://127.0.0.1:7878/<prefix>/v1).
 // AR_UPSTREAM_<PREFIX> overrides a route's origin (e.g. to point /ar at a
 // mirror, or at a local echo for testing).
+//
+// Per-route behaviour:
+//   filter        - run the agentrouter char/word filter + identity block and
+//                   inject the extra model-facing requirements. Only agentrouter
+//                   needs it (its word list blocks on opaque content); running it
+//                   on other upstreams would only lose fidelity (emoji and
+//                   non-approved scripts deleted, identifiers rewritten).
+//   stripReasoning- drop replayed `reasoning` items before forwarding.
+//                   agentrouter's astra sits behind a multi-Azure-resource pool
+//                   with no session affinity: an encrypted_content item is bound
+//                   to the resource that created it, so replaying it after the
+//                   load balancer moves the session returns 400
+//                   ("could not be verified" / "different .. OpenAI resource").
+//                   This is the codex-side equivalent of models.yml
+//                   `compat.replayResponsesReasoning: false`.
 const ROUTES = {
-  ar: { base: process.env.AR_UPSTREAM_AR ?? "https://ps.air-outer.com", chat: false },
+  ar: {
+    base: process.env.AR_UPSTREAM_AR ?? "https://ps.air-outer.com",
+    chat: false,
+    filter: true,
+    stripReasoning: true,
+  },
   rc: { base: process.env.AR_UPSTREAM_RC ?? "https://api.relaycat.top", chat: false },
   wb: { base: process.env.AR_UPSTREAM_WB ?? "http://127.0.0.1:7863", chat: true },
   // anyrouter.top is TLS-blocked on a direct connection (omp reports "unknown
@@ -401,17 +421,32 @@ const server = http.createServer(async (req, res) => {
   const isChatUpstream = route.chat;
 
   let body = raw.length ? raw.toString("utf8") : undefined;
-  let filtered = false;
-  if (body !== undefined) {
+  let changed = false;
+  if (body !== undefined && (route.filter || route.stripReasoning)) {
     try {
-      const next = filterBody(body, { injectInstructions: true });
-      filtered = next !== body;
-      body = next;
+      if (route.filter) {
+        const next = filterBody(body, { injectInstructions: true });
+        changed = next !== body;
+        body = next;
+      }
+      if (route.stripReasoning) {
+        const parsed = JSON.parse(body);
+        if (Array.isArray(parsed.input)) {
+          const kept = parsed.input.filter((it) => it?.type !== "reasoning");
+          const dropped = parsed.input.length - kept.length;
+          if (dropped > 0) {
+            parsed.input = kept;
+            body = JSON.stringify(parsed);
+            changed = true;
+            log(`stripReasoning ${prefix}${rest}: dropped ${dropped} reasoning item(s)`);
+          }
+        }
+      }
     } catch {
       /* fail-open, matching the omp hook */
     }
   }
-  if (filtered) log(`filter rewrote ${prefix}${rest} body (${raw.length} -> ${Buffer.byteLength(body)})`);
+  if (changed) log(`filter rewrote ${prefix}${rest} body (${raw.length} -> ${Buffer.byteLength(body)})`);
 
   if (isResponses && isChatUpstream) {
     let parsed;
