@@ -240,19 +240,35 @@ function bridgeChatStream(upstream, res, model, effort) {
   let seq = 2;
   let msgId = null;
   let msgOpen = false;
+  let msgIndex = -1;
   let text = "";
   let reasoning = "";
-  const calls = new Map(); // index -> {id,name,args,itemId,added}
+  const calls = new Map(); // index -> {id,name,args,itemId,added,outIndex}
   let usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
-  const output = [];
+  // output_index must be a monotonic per-item counter, NOT output.length: items
+  // are only appended to `output` at close/finish, so using output.length gave a
+  // message and a function_call the same index, and codex drops such a stream
+  // (observed as repeated identical resends). items[] keeps slot order so the
+  // final `output` array matches the indices regardless of emit order.
+  let nextOutIndex = 0;
+  const items = [];
+  const openItem = () => {
+    const i = nextOutIndex++;
+    items[i] = null;
+    return i;
+  };
+  const placeItem = (i, item) => {
+    items[i] = item;
+  };
 
   const openMessage = () => {
     if (msgOpen) return;
     msgOpen = true;
     msgId = "msg_" + Math.random().toString(36).slice(2, 14);
+    msgIndex = openItem();
     sse(res, "response.output_item.added", {
       type: "response.output_item.added",
-      output_index: output.length,
+      output_index: msgIndex,
       item: { type: "message", id: msgId, role: "assistant", status: "in_progress", content: [] },
       sequence_number: seq++,
     });
@@ -260,7 +276,7 @@ function bridgeChatStream(upstream, res, model, effort) {
       type: "response.content_part.added",
       content_index: 0,
       item_id: msgId,
-      output_index: output.length,
+      output_index: msgIndex,
       part: { type: "output_text", text: "", annotations: [] },
       sequence_number: seq++,
     });
@@ -279,33 +295,34 @@ function bridgeChatStream(upstream, res, model, effort) {
       type: "response.content_part.done",
       content_index: 0,
       item_id: msgId,
-      output_index: output.length,
+      output_index: msgIndex,
       part: { type: "output_text", text, annotations: [] },
       sequence_number: seq++,
     });
     sse(res, "response.output_item.done", {
       type: "response.output_item.done",
-      output_index: output.length,
+      output_index: msgIndex,
       item,
       sequence_number: seq++,
     });
-    output.push(item);
+    placeItem(msgIndex, item);
     msgOpen = false;
   };
 
   const openCall = (idx, delta) => {
     let c = calls.get(idx);
     if (!c) {
-      c = { id: delta.id || `call_${idx}_${Math.random().toString(36).slice(2, 10)}`, name: "", args: "", itemId: "fc_" + Math.random().toString(36).slice(2, 14), added: false };
+      c = { id: delta.id || `call_${idx}_${Math.random().toString(36).slice(2, 10)}`, name: "", args: "", itemId: "fc_" + Math.random().toString(36).slice(2, 14), added: false, outIndex: -1 };
       calls.set(idx, c);
     }
     if (delta.id) c.id = delta.id;
     if (delta.function?.name) c.name += delta.function.name;
     if (!c.added && c.name) {
       c.added = true;
+      c.outIndex = openItem();
       sse(res, "response.output_item.added", {
         type: "response.output_item.added",
-        output_index: output.length,
+        output_index: c.outIndex,
         item: { type: "function_call", id: c.itemId, status: "in_progress", arguments: "", call_id: c.id, name: c.name },
         sequence_number: seq++,
       });
@@ -317,7 +334,7 @@ function bridgeChatStream(upstream, res, model, effort) {
         type: "response.function_call_arguments.delta",
         delta: chunk,
         item_id: c.itemId,
-        output_index: output.length,
+        output_index: c.outIndex,
         sequence_number: seq++,
       });
     }
@@ -331,21 +348,21 @@ function bridgeChatStream(upstream, res, model, effort) {
         type: "response.function_call_arguments.done",
         arguments: c.args || "{}",
         item_id: c.itemId,
-        output_index: output.length,
+        output_index: c.outIndex,
         sequence_number: seq++,
       });
       const item = { type: "function_call", id: c.itemId, status: "completed", arguments: c.args || "{}", call_id: c.id, name: c.name };
       sse(res, "response.output_item.done", {
         type: "response.output_item.done",
-        output_index: output.length,
+        output_index: c.outIndex,
         item,
         sequence_number: seq++,
       });
-      output.push(item);
+      placeItem(c.outIndex, item);
     }
     sse(res, "response.completed", {
       type: "response.completed",
-      response: { ...base, status: "completed", output, usage },
+      response: { ...base, status: "completed", output: items.filter(Boolean), usage },
     });
     res.end();
   };
@@ -383,7 +400,7 @@ function bridgeChatStream(upstream, res, model, effort) {
           content_index: 0,
           delta: d.content,
           item_id: msgId,
-          output_index: output.length,
+          output_index: msgIndex,
           sequence_number: seq++,
         });
       }
