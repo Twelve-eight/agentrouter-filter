@@ -92,13 +92,29 @@
 | `/rc` relaycat | `items=19 reasoning=2 calls=0 outputs=0`(未剥离) | 全 200,clean |
 | `/wb` bridge | `items=13 reasoning=0 calls=3 outputs=3`(桥接) | 全 200,clean |
 
-  结论按路由分开写,避免以偏概全:
-  - **`/ar`**:reasoning **与工具调用配对**同时出现,剥离 reasoning 后
-    `function_call`/`function_call_output` 全部保留,上游 200 -- 这是本项目最关键的
-    风险点,已实测排除.
-  - **`/rc`**:验证的是 **reasoning 回放不 400**(`reasoning` 0,0,1,2,2);
-    该会话**没有产生 function_call**(`calls=0`),所以 relaycat 上的
-    "工具配对 + 回放"组合**未覆盖**.
+  **注意上表有模型混淆**:`/ar` 跑 deepseek-v4-flash 而 `/rc` 跑 gpt-6-astra,
+  所以 `/rc` 的 `calls=0` 可能是**模型不愿调用工具**,而非路由缺陷.为排除该因素,
+  用**同一 deepseek 家族**在三条路由上重跑同一"必须用工具才能回答"的提示词:
+
+| 路由 | 模型 | 剥离前遥测 | 结果 |
+|---|---|---|---|
+| `/ar` | deepseek-v4-flash | `items=16 reasoning=3 -> 0 calls=3 outputs=3` | 200,clean |
+| `/rc` | deepseek-v4.1-flash | `items=15 reasoning=4 calls=3 outputs=3` | 200,clean |
+| `/wb` | global:deepseek-v4.1-flash | `items=11 reasoning=0 calls=3 outputs=3` | 200,clean |
+
+  即:**三条路由都确认能跑通工具调用**(`calls>=1`),
+  且 `/rc` 上"**reasoning 回放 + 工具配对**"组合同时出现(`reasoning=4` 与
+  `calls=3`)仍 200 -- 早先 `/rc` 的 `calls=0` 确系 gpt-6-astra 的行为,不是路由问题.
+  `/wb` 首轮曾因上游 `503 no_healthy_account`(workbuddy 账户池暂时不可用)重试,
+  随后成功;这是上游可用性问题,与桥接无关.
+
+  结论按路由分开写(以"同模型家族"那组为准):
+  - **`/ar`**:reasoning **与工具调用配对**同时出现(`reasoning=3` 与 `calls=3`),
+    剥离 reasoning 后 `function_call`/`function_call_output` 全部保留,上游 200 --
+    这是本项目最关键的风险点,已实测排除.
+  - **`/rc`**:"**reasoning 回放 + 工具配对**"组合已覆盖
+    (`items=15 reasoning=4 calls=3 outputs=3`),不 400,故不剥离.
+    (早先 gpt-6-astra 会话 `calls=0` 是模型行为,非路由缺陷.)
   - **`/wb`**:验证的是**桥接的工具往返**(唯一手写协议翻译),
     `calls=3 outputs=3` 经 responses<->chat 双向转换成功;该路由按设计丢弃 reasoning
     (`reasoning=0`),故不涉及回放.
