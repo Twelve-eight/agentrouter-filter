@@ -13,7 +13,7 @@
 // i.e. a duplicate index plus an added/done mismatch, which makes codex drop the
 // stream and resend the identical request body.
 import { Readable } from "node:stream";
-import { bridgeChatStream } from "../server.mjs";
+import { bridgeChatStream } from "../bridge.mjs";
 
 // A fake chat-completions SSE upstream: content first, then a tool call.
 function fakeUpstream() {
