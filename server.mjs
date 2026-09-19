@@ -22,6 +22,7 @@
 
 import http from "node:http";
 import https from "node:https";
+import { pathToFileURL } from "node:url";
 import { filterBody } from "./filter.mjs";
 
 const PORT = Number(process.env.AR_GATEWAY_PORT ?? 7878);
@@ -576,4 +577,15 @@ server.on("error", (e) => {
   throw e;
 });
 
-server.listen(PORT, HOST, () => log(`agentrouter gateway listening on http://${HOST}:${PORT} (routes: /ar /rc /wb /an)`));
+// Exported so tests can drive the bridge in-process (see
+// tools/test-bridge-indices.mjs): a synthetic upstream stream plus a recording
+// `res` is deterministic, whereas a live turn only hits these lines when the
+// model happens to emit a content preamble before its tool call.
+export { bridgeChatStream, toChatBody, toChatMessages, toChatTools };
+
+// Only bind the port when run as the entry point; importing this module (tests)
+// must not start a second gateway.
+const isEntryPoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isEntryPoint) {
+  server.listen(PORT, HOST, () => log(`agentrouter gateway listening on http://${HOST}:${PORT} (routes: /ar /rc /wb /an)`));
+}
