@@ -161,3 +161,36 @@
   (omp 原生 UA 不在 agentrouter 白名单,去掉 omp 就彻底失去 agentrouter).
   用户"不要伪造 UA"的要求针对 codex 侧,已满足(codex 原生 `codex_exec/0.154.0`
   + `originator: codex_exec` 本就在白名单,网关只原样转发).
+
+## 2026-09-20(续):服务以 WT 标签呈现 + 分离启动 + 交接
+
+### 服务生命周期(设计决定)
+服务**分离启动**(`Start-Process -WindowStyle Hidden`),标签只 `tail` 日志.
+理由:wb2api 是在跑的 agent 会话的 API 端点(其 DEPLOY-NOTES:会话运行期间绝不可杀),
+而共享的 WT 窗口很容易误关.**实测**:杀掉 tail 的 powershell 后,分离的 node 仍在监听 7878.
+
+曾考虑但否决的形式:`& exe *>&1 | Tee-Object`(服务挂在标签下)-> 误关窗口即杀服务.
+
+### 双流 tail
+`Start-Process` 无法合并 stdout/stderr,而 Go 的 `log` 包默认写 stderr.
+所以每个标签**同时 tail 日志与其 `.err`**,否则 wb2api/wbgui 标签会一直空白,
+而真正的日志全进了 `.err`.(`Get-Content -Wait` 在写入者持有句柄时仍可读.)
+
+### 开机自动应用暂存构建
+`apply-staged-wb2api.ps1`:把 `out\wb2api-new.exe` 换到 `out\wb2api.exe`,但
+**仅当 7863 未监听**(有会话在用就拒绝,避免自断链路)且暂存构建更新时.
+由 `autostart.ps1` 在端口探测前调用 -> 开机(无会话)时生效,会话中是无害 no-op.
+旧二进制保留为 `out\wb2api.exe.old`.
+
+### 验收(保留 7863,只停 7878/8787)
+`autostart.cmd` -> `apply-staged` 正确拒绝(7863 在跑)-> 7878+8787 起为
+**同一窗口的两个标签**(WT 进程数 1)-> codex 仍 PONG.
+
+### 踩坑记录(PS 5.1)
+- `ProcessStartInfo` 无 `ArgumentList`(.NET Core/PS7 才有)-> 用引号拼接的 `Arguments`.
+- PS 5.1 的 `Process` **不支持** `$proc.OutputDataReceived += ..` -> 不能用事件读流.
+- `Tee-Object -Append` / cmd `>>` 独占日志文件,第二个写入者直接失败.
+- `Start-Process -ArgumentList` 数组**不引用**参数,含空格的路径会被拆开
+  -> 跨进程只传无空格的 service key,路径在 `services.ps1` 里查表.
+- `cmd.exe /c` 对"首参带引号"有特殊解析,含空格的 .cmd 路径会被拆 -> 用无空格路径.
+- `-RedirectStandardOutput` **截断**而非追加 -> 交接时先移走旧文件再重定向.
