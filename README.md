@@ -73,14 +73,25 @@ node tools/diff-test.mjs         # 必须 0 mismatches
 node server.mjs          # 监听 127.0.0.1:7878
 ```
 
-开机自启已注册到 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
-(`agentrouter-gateway` -> `autostart.cmd`)。移除:
+开机自启注册为**单个** Run 项 `omp-services`(-> `autostart.cmd`),它用一个
+Windows Terminal 窗口启动**全部三个服务**,每个服务一个标签:
+
+| 服务 | 端口 | 目录 |
+|---|---|---|
+| agentrouter 网关 | 7878 | `G:\omp works\Tools\agentrouter-filter` |
+| wb2api | 7863 | `G:\workbuddy2api` |
+| wbgui(面板) | 8787 | `G:\workbuddy2api-gui` |
+
+服务为**分离启动**,标签只 tail 日志,所以关窗口不会停服务.端口已在监听的会被跳过,
+重复执行安全.旧的启动文件夹项 `WorkBuddyGateway.cmd` 已移除.
+
+移除自启:
 
 ```
-reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v agentrouter-gateway /f
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v omp-services /f
 ```
 
-**网关不在时,config.toml 里指向它的 provider 全部失败**,这是预期行为(不静默降级)。
+**网关不在时,config.toml 里指向它的 provider 全部失败**,这是预期行为(不静默降级).
 
 ## 验证
 
