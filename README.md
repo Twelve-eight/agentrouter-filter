@@ -22,33 +22,48 @@ Codex CLI 侧的 agentrouter 过滤/桥接网关。
 
 Codex 的 `model_provider.base_url` 指向 `http://127.0.0.1:7878/<route>/v1`:
 
-| route | 上游 | 方式 |
-|---|---|---|
-| `ar` | `https://ps.air-outer.com` | responses 透传 |
-| `rc` | `https://api.relaycat.top` | responses 透传 |
-| `wb` | `http://127.0.0.1:7863` | responses -> chat/completions 桥接 |
-| `an` | `https://anyrouter.top` | responses 透传,经 `http://127.0.0.1:7897` CONNECT 隧道 |
+| route | 上游 | 方式 | filter | stripReasoning |
+|---|---|---|---|---|
+| `ar` | `https://ps.air-outer.com` | responses 透传 | 是 | 是 |
+| `rc` | `https://api.relaycat.top` | responses 透传 | 否 | 否 |
+| `wb` | `http://127.0.0.1:7863` | responses -> chat/completions 桥接 | 否 | 桥接天然丢弃 |
+| `an` | `https://anyrouter.top` | responses 透传,经 `http://127.0.0.1:7897` CONNECT 隧道 | 否 | 否 |
+
+**为什么只给 `ar` 开 filter**:字符剥离与词表改写只对 agentrouter 有意义
+(它的词表会对不透明内容 400/500);对 relaycat/wb2api 跑这些规则只有保真度损失
+(emoji 与非批准文字被删、`relic-bag`/`net id` 这类标识符被改写),包括模型正在读写的代码.
+
+**为什么只给 `ar` 开 stripReasoning**:agentrouter 的 astra 位于多 Azure 资源池后且无
+会话粘性,`encrypted_content` 绑定创建它的资源,回放落别的资源必 400.这是 models.yml
+`compat.replayResponsesReasoning: false` 的 codex 侧等价物.其余上游无此问题.
 
 `an` 单独走代理是因为 anyrouter.top 直连被 TLS 层拦截;其余路由保持直连
-(agentrouter 经该代理会挂起)。上游可用 `AR_UPSTREAM_<ROUTE>` / `AR_PROXY_AN` 覆盖。
+(agentrouter 经该代理会挂起).上游可用 `AR_UPSTREAM_<ROUTE>` / `AR_PROXY_AN` 覆盖.
 
-## 过滤内容(`filter.mjs`)
+## 过滤内容
 
-从 omp 钩子逐条移植,全部经 ps.air-outer.com 实测:
+**核心规则不在本仓库手写**.`filter-core.mjs` 由 `tools/gen-filter-core.mjs`
+从 omp 钩子 `G:/omp works/.omp/hooks/pre/strip-illegal.ts` 的纯核心段(第 19-196 行)
+机械生成,唯一变换是删除 TypeScript 类型标注.`tools/diff-test.mjs` 用 45 个样本 +
+一棵嵌套树对"生成版 vs 原钩子"做逐字节比对(当前 0 处不一致),这是"没有丢规则"的证明.
+**改规则请改钩子,然后重跑生成器**:
 
-- **字符层**:非批准字符替换为网关接受的 ASCII 等价物。批准集 = CJK 汉字 +
-  带音标拉丁(法/德)+ 西里尔(俄)+ 书名号/ß。这也正是工作区"仅限中英法德俄字符"
-  规则(AGENTS.md Sec 5)的执行点:假名、谚文、阿拉伯、希腊、emoji、制表符
-  一律删除。
-- **词组层**:网关不透明敏感词表的替换(`arp-player` 系,`relic choice` 系,
-  `choice history`,`net id`,`4xx-dumps`,三点连排压缩等),以及
+```
+node tools/gen-filter-core.mjs   # 重新生成 filter-core.mjs
+node tools/diff-test.mjs         # 必须 0 mismatches
+```
+
+`filter.mjs` 只额外承担两件钩子没有的事:
+
+- **身份句屏蔽**(用户指定的新增屏蔽词):
   `You are Claude Code, Anthropic's official CLI tool for Claude.` ->
-  `You are Codex, an official CLI coding agent.`(用户指定的新增屏蔽词).
-- **额外要求注入**:工作区 AGENTS.md Sec 5 的语言卫生规则与身份规则会以
-  `Additional requirements for this provider. ...` 追加到请求体 `instructions`
+  `You are Codex, an official CLI coding agent.`
+- **额外要求注入**:工作区 AGENTS.md Sec 5 的语言卫生规则与身份规则以
+  `Additional requirements for this provider. ..` 追加到请求体 `instructions`
   末尾(幂等).Codex 没有 provider 级 `instructions` 字段
   (`--strict-config` 直接报 `unknown configuration field`),网关是唯一可承载处.
-- 失败时**放行不阻断**,与 omp 钩子一致.
+
+失败时**放行不阻断**,与 omp 钩子一致.
 
 ## 运行
 

@@ -60,6 +60,41 @@
 - 过滤器端到端证明:把 `/ar` 上游指向本地 echo,确认上游收到的 `instructions`
   已是 `You are Codex, an official CLI coding agent.`,且 `originator: codex_exec`
   原样到达.
-- codex E2E(`codex exec --skip-git-repo-check [-p <profile>] "只回复:PONG"`):
-  默认(relaycat/gpt-6-astra)PONG;`ar-ds` PONG;`rc-ds` PONG;`wb-ds` PONG
-  (含工具调用桥接);`an-astra` 因 anyrouter 上游满载失败(预期).
+- **机械生成 + 差分测试**:`tools/gen-filter-core.mjs` 从钩子第 19-196 行生成
+  `filter-core.mjs`;`tools/diff-test.mjs` 45 个样本 + 1 棵嵌套树,**0 mismatches**.
+  (手抄版曾丢规则:源里 `no ` + fromCharCode 拼出的 18 字符触发词、以及
+  `arp-player`/`warp-player`/`4xx-dumps` 三处自等同替换,渲染层显示会失真.)
+- **多轮会话验证**(单轮 PONG 无法暴露 reasoning 回放问题):
+  `codex exec` + `codex exec resume` 连跑 3 轮 × 3 条路由,全部 PONG 且无 400.
+  网关日志证实 `/ar` 真的触发:`stripReasoning ar/v1/responses: dropped 1/2 reasoning item(s)`;
+  `/rc` `/wb` 无 filter 行(门控生效).
+- **autostart 实测**:停掉 hub 进程 -> 直接跑 `autostart.cmd` -> 端口 7878 监听、
+  日志写入、`codex exec` 仍 PONG(此前只验证过 hub 启动的实例).
+- **profile 矩阵**(`codex exec --skip-git-repo-check -p <x> "只回复:PONG"`):
+
+| profile | provider/model | 结果 |
+|---|---|---|
+| (默认) | agentrouter/deepseek-v4-flash | PONG |
+| `ar-ds` | agentrouter/deepseek-v4-flash | PONG |
+| `astra` | relaycat/gpt-6-astra | PONG |
+| `rc-ds` | relaycat-cn/deepseek-v4.1-flash | PONG |
+| `wb-ds` | wb2api/global:deepseek-v4.1-flash | PONG(含工具桥接) |
+| `ar-sol` | agentrouter/gpt-5.6-sol | 402 配额耗尽 |
+| `ar-astra` | agentrouter/gpt-6-astra | 402 配额耗尽 |
+| `ar-glm` | agentrouter/glm-5.3 | 503 无可用渠道 |
+| `an-astra` | anyrouter/gpt-6-astra | anyrouter 通道满载 |
+
+  即:**配置全部就绪,4 个当前可用,5 个卡在上游账户配额/通道**,不是配置缺陷.
+
+### 其它结论
+- `model_reasoning_effort = "max"` **是** codex 0.154 的合法档位
+  (二进制枚举 `none|minimal|low|medium|high|xhigh|max|ultra|persistent`),
+  无需改小.
+- `[model_providers.<x>.responses]` 空表**非法**(`--strict-config` 报
+  `unknown configuration field`),已删除;它会静默让整份配置加载失败.
+- 默认 model 由 `gpt-6-astra`(当时 402)改为 `deepseek-v4-flash`(实测可用),
+  避免用户首次启动即 402.
+- models.yml 的 `User-Agent: claude-cli/2.0.34` **未改动**:那是 omp 侧的承重配置
+  (omp 原生 UA 不在 agentrouter 白名单,去掉 omp 就彻底失去 agentrouter).
+  用户"不要伪造 UA"的要求针对 codex 侧,已满足(codex 原生 `codex_exec/0.154.0`
+  + `originator: codex_exec` 本就在白名单,网关只原样转发).
