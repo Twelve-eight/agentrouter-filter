@@ -34,6 +34,12 @@ function Quote([string]$s) {
 }
 
 $tabs = @()
+
+# Apply any staged wb2api build before probing ports. It refuses while 7863 is
+# listening, so at logon (nothing running yet) a pending fix takes effect, and
+# during a live session it is a harmless no-op.
+& (Join-Path $here 'apply-staged-wb2api.ps1')
+
 foreach ($key in $ServiceOrder) {
   $spec = $ServiceTable[$key]
   if (Test-Listening $spec.Port) { continue }
