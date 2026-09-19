@@ -68,10 +68,9 @@
   破坏含 `": "` 的正则字面量或字符串).
   `tools/diff-test.mjs` 45 个样本 + 1 棵嵌套树逐字节比对,**0 mismatches**.
 - **多轮会话验证(已修正方法学)**:`codex exec resume` **没有 `-p/--profile`**
-  (只有 `-c`/`-m`),先前harness 的 resume 调用漏了 provider,导致第 2/3 轮实际打到
-  默认 provider -- 那批 `/rc` `/wb` 的"多轮通过"**不成立**,已作废.修正版每次调用
-  都显式传 `-c model_provider=.. -c model=..`,并加了请求遥测
-  (`items=N reasoning=M`).结果:
+  (只有 `-c`/`-m`),先前 harness 的 resume 调用漏了 provider,导致第 2/3 轮实际打到
+  默认 provider -- 那批"多轮通过"**不成立**,已作废.修正版每次调用都显式传
+  `-c model_provider=.. -c model=..`.该批(PONG 提示词)的请求遥测:
 
 | 路由 | t1 -> t2 -> t3 items | reasoning | 结果 |
 |---|---|---|---|
@@ -79,25 +78,35 @@
 | `/rc` cn-ds (relaycat-cn) | 3 -> 5 -> 7 | 全 0 | PONG x3,clean |
 | `/ar` ds (agentrouter) | 3 -> 5 -> 7 | 全 0 | PONG x3,clean |
 
-  items 逐轮增长 = 确实是 resume(非独立单轮).
+  (此表 `reasoning` 列采自**修复前**的剥离后遥测,不可信,仅留作方法学记录;
+  可信数据见下方"带真实工具调用的多轮".)items 逐轮增长 = 确实是 resume.
 - **带真实工具调用的多轮(关键补测)**:PONG 轮次从不产生
   `function_call`/`function_call_output`,所以"reasoning 与工具调用配对"这一
-  `/v1/responses` 的核心场景一直没测.改用"读 AGENTS.md 第 1 行并引用"驱动,
-  两条路由各 3 轮全部通过.剥离前遥测(先于任何改写采样):
+  `/v1/responses` 的核心场景一直没测.改用"读 AGENTS.md 第 1 行并引用"驱动.
+  工具是否真的被调用**以网关遥测 `calls=`/`outputs=` 为准**
+  (早先用 `/\bread\b/` 匹配正文会假阳性).剥离前遥测:
 
 | 路由 | 观测到的请求 | 结果 |
 |---|---|---|
 | `/ar` agentrouter | `items=6 reasoning=1 -> 0 calls=1 outputs=1`;`items=17 reasoning=4 -> 0 calls=3 outputs=3` | 全 200,clean |
-| `/rc` relaycat | `reasoning=0,0,1,2,2`(**未剥离**) | 全 200,clean |
+| `/rc` relaycat | `items=19 reasoning=2 calls=0 outputs=0`(未剥离) | 全 200,clean |
+| `/wb` bridge | `items=13 reasoning=0 calls=3 outputs=3`(桥接) | 全 200,clean |
 
-  即:**剥离 reasoning 的同时保留了配对的 function_call,上游全部 200** --
-  这正是"删 reasoning 可能破坏配对"的风险点,已实测排除.
-  且 relaycat **确实回放 reasoning 且不 400**,故 `/rc` 保持不剥离是正确的.
+  结论按路由分开写,避免以偏概全:
+  - **`/ar`**:reasoning **与工具调用配对**同时出现,剥离 reasoning 后
+    `function_call`/`function_call_output` 全部保留,上游 200 -- 这是本项目最关键的
+    风险点,已实测排除.
+  - **`/rc`**:验证的是 **reasoning 回放不 400**(`reasoning` 0,0,1,2,2);
+    该会话**没有产生 function_call**(`calls=0`),所以 relaycat 上的
+    "工具配对 + 回放"组合**未覆盖**.
+  - **`/wb`**:验证的是**桥接的工具往返**(唯一手写协议翻译),
+    `calls=3 outputs=3` 经 responses<->chat 双向转换成功;该路由按设计丢弃 reasoning
+    (`reasoning=0`),故不涉及回放.
 - **reasoning 回放的结论**(用剥离前遥测,非自证):agentrouter 上
-  codex **确实回放** reasoning(`reasoning=1..4`,且早前 21:04:55 曾
-  `dropped 1`),故 `/ar` 的剥离是**已验证生效的必要保护**;relaycat 也回放但不 400,
-  故不剥离.**遥测必须在剥离前采样** -- 否则剥离路由永远显示 `reasoning=0`,
-  无法区分"客户端没发"与"被我们删了"(先前版本即有此缺陷,已修).
+  codex **确实回放** reasoning(`reasoning=1..4`),故 `/ar` 的剥离是**已验证生效的
+  必要保护**;relaycat **也回放**(1..2 个)且**不报 400**,故 `/rc` **保持不剥离**
+  (有实证支撑,不再加保险).**遥测必须在剥离前采样** -- 否则剥离路由永远显示
+  `reasoning=0`,无法区分"客户端没发"与"被我们删了"(先前版本即有此缺陷,已修).
 - **autostart 实测(含 `.ts` 核心)**:停掉旧实例 -> 直接跑 `autostart.cmd` ->
   端口 7878 由 `G:\nodejs\node.exe`(v24.18.0,支持类型擦除)绑定,
   日志出现 `agentrouter gateway listening .. (routes: /ar /rc /wb /an)`,
