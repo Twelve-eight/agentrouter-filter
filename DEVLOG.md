@@ -234,3 +234,46 @@ high 均值 reasoning_tokens = 2969.3
 max  均值 reasoning_tokens = 4373.7   (+47%,max>high 4/6 轮)
 ```
 且 `wb-ds.config.toml` 已由 `high` 改为 `max`.
+
+## 2026-09-21:codex 模型选择器只显示内置模型 -- 根因与修复
+
+### 现象
+用户在 codex 里只看到几个内置模型(`gpt-6-astra` / `gpt-5.6-sol` / `gpt-5.6-terra` /
+`gpt-5.6-luna` / `gpt-5.5` / `gpt-5.2`),我们自己的模型一个都没有.
+
+### 根因
+**`config.toml` 从未设置 `model_catalog_json`**.`~/.codex/omp-model-catalog.json`
+是 2026-09-12 建的(见 `archive/retired/workbuddy-desktop-api/DEVLOG.md` 第 33 行),
+但**没有任何地方引用它**,所以 codex 一直渲染内置目录.`codex debug models` 输出
+11 条(全是内置),证实了这一点.
+
+### 关键机制(全部实测)
+1. **`model_catalog_json` 是"替换"不是"追加"**.指向旧的 5 条文件后,`gpt-6-astra`
+   / `gpt-5.5` / `gpt-5.4` 等**全部消失**.所以必须自己把内置条目合并进去.
+2. **内置目录可以往返**:把 `codex debug models` 的输出原样写回作为输入目录,
+   结果**逐字节相同**(实测 `JSON.stringify` 全等).因此内置条目可以原样取用.
+3. **目录条目不能指定 provider**:`model_provider` / `provider` 字段**被丢弃**.
+4. **slug 原样转发**:`agentrouter/deepseek-v4-flash` 未做任何剥离,直达
+   `ps.air-outer.com` 并 503.所以 slug 必须就是上游模型 id.
+5. **裸文件名不解析**:`model_catalog_json = "omp-model-catalog.json"` 报
+   `系统找不到指定的文件`,必须写绝对路径.
+
+### 修复
+- 新增 `tools/build-model-catalog.cjs`(CJS,非 `.mjs`):取内置目录原样 + 追加我们的
+  模型,输出 29 条 / 24 条可见.
+- `config.toml` 增加 `model_catalog_json = "C:\\Users\\o_Obl\\.codex\\omp-model-catalog.json"`.
+- 上游模型**逐个实测 200 后才加入**;`claude-opus-*` / `glm-5.3`(agentrouter)当前
+  503,但 id 真实,保留待恢复.
+
+### 已知限制
+**选择器是全局的,provider 来自 config.toml/profile**.所以选 agentrouter 的模型
+但 provider 是 wb2api 时会失败(实测:反向组合报 `Reconnecting.. 1/5`).
+命名上按 provider 区分(`(agentrouter)` / `(workbuddy)` / `(relaycat)`)以便察觉.
+
+### 验证
+```
+codex debug models        -> 29 条,24 条可见(含我们的)
+<default> / -p ar-ds / -p rc-ds / -p wb-ds  -> 全部 PONG
+-p wb-ds -c model=global:kimi-k3            -> PONG
+-p wb-ds -c model=global:gpt-5.3-codex      -> PONG
+```
