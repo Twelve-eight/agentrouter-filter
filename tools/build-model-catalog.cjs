@@ -18,15 +18,30 @@ const { execFileSync } = require('child_process');
 const CODEX = 'G:/omp works/.tooling/npm-global/codex.cmd';
 const OUT = path.join(os.homedir(), '.codex', 'omp-model-catalog.json');
 const TMP = path.join('G:/omp works/.tmp', 'catalog-builtin.json');
+// Read the BUILT-IN catalog through a scratch CODEX_HOME that has no
+// model_catalog_json. Reading through the real CODEX_HOME would be circular:
+// once config.toml points at OUT, `debug models` renders OUT, so the script would
+// take its own previous output as "built-in" and could never recover from a bad
+// write (it happens to be idempotent today, but it would bake in any mistake).
+const SCRATCH = 'G:/omp works/.tmp/codex-scratch-home';
+fs.mkdirSync(SCRATCH, { recursive: true });
+fs.writeFileSync(path.join(SCRATCH, 'config.toml'), 'model = "gpt-5.2"\n');
 
 // 1) built-in catalog, verbatim
 const raw = execFileSync('cmd.exe', ['/c', CODEX, 'debug', 'models'], {
   encoding: 'utf8',
   maxBuffer: 256 * 1024 * 1024,
+  env: { ...process.env, CODEX_HOME: SCRATCH },
 });
 const builtin = JSON.parse(raw);
 if (!Array.isArray(builtin.models) || builtin.models.length < 5) {
   throw new Error(`refusing to build: built-in catalog looks wrong (${builtin.models?.length} models)`);
+}
+// Guard: the built-in catalog must NOT contain our additions, otherwise we are
+// reading our own output again (e.g. CODEX_HOME was ignored).
+const ours_present = builtin.models.some((m) => m.slug === 'global:kimi-k3');
+if (ours_present) {
+  throw new Error('refusing to build: read a catalog that already contains our models (circular read)');
 }
 fs.writeFileSync(TMP, JSON.stringify(builtin));
 
