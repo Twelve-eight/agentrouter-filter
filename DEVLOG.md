@@ -255,8 +255,11 @@ max  均值 reasoning_tokens = 4373.7   (+47%,max>high 4/6 轮)
 3. **目录条目不能指定 provider**:`model_provider` / `provider` 字段**被丢弃**.
 4. **slug 原样转发**:`agentrouter/deepseek-v4-flash` 未做任何剥离,直达
    `ps.air-outer.com` 并 503.所以 slug 必须就是上游模型 id.
-5. **裸文件名不解析**:`model_catalog_json = "omp-model-catalog.json"` 报
-   `系统找不到指定的文件`,必须写绝对路径.
+5. **相对路径的解析基准不一致**(实测):
+   - `config.toml` 里的相对路径按 **CODEX_HOME** 解析 -> `"omp-model-catalog.json"` **可用**.
+   - `-c model_catalog_json=".."` 按 **当前 cwd** 解析 -> 从别的目录跑就报
+     `系统找不到指定的文件`.我最初用 `-c` 测出裸文件名不解析,那是**测试方法**
+     的产物,不是 config.toml 的行为.
 
 ### 修复
 - 新增 `tools/build-model-catalog.cjs`(CJS,非 `.mjs`):取内置目录原样 + 追加我们的
@@ -277,3 +280,17 @@ codex debug models        -> 29 条,24 条可见(含我们的)
 -p wb-ds -c model=global:kimi-k3            -> PONG
 -p wb-ds -c model=global:gpt-5.3-codex      -> PONG
 ```
+
+### 2026-09-21 更正与加固(复核 advisor 两条)
+- **相对路径可用**(见上第 5 条更正).此前"必须绝对路径"的结论来自 `-c` 测试,
+  是测试方法的产物.已改为 `model_catalog_json = "omp-model-catalog.json"`.
+- **生成器存在循环读取**:它用真实 CODEX_HOME 跑 `codex debug models` 取"内置"目录,
+  而 config.toml 一旦指向它自己写的文件,读到的就是**自己的上次输出**.实测它报
+  `built-in: 17`(真值 11).虽因幂等而未致错,但会把任何一次错误写入**固化**.
+  已改为通过**独立的 scratch CODEX_HOME**(无 `model_catalog_json`)读取,并加断言:
+  若"内置"读回里已含我们的模型则**拒绝构建**.
+- 复核 slug:全目录 **0 条**命名空间前缀(`agentrouter/` `workbuddy/` `relaycat/`
+  `tokenrhythm/`),均为上游真实模型 id.
+- `codex --strict-config` 对 `debug` 子命令**不支持**(报
+  `--strict-config is not supported for codex debug`);对 `exec` 可用,实测通过无
+  unknown-field 错误.
