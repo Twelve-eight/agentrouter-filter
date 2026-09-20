@@ -40,7 +40,7 @@ Codex 的 `model_provider.base_url` 指向 `http://127.0.0.1:7878/<route>/v1`:
 `an` 单独走代理是因为 anyrouter.top 直连被 TLS 层拦截;其余路由保持直连
 (agentrouter 经该代理会挂起).上游可用 `AR_UPSTREAM_<ROUTE>` / `AR_PROXY_AN` 覆盖.
 
-## 过滤内容
+## 过滤内容(`filter.mjs`)
 
 **核心规则不在本仓库手写**.`filter-core.ts` 由 `tools/gen-filter-core.mjs`
 从 omp 钩子 `G:/omp works/.omp/hooks/pre/strip-illegal.ts` 的纯核心段(第 19-196 行)
@@ -48,6 +48,7 @@ Codex 的 `model_provider.base_url` 指向 `http://127.0.0.1:7878/<route>/v1`:
 再追加一行 export.Node 24 原生擦除类型,该核心只用可擦除语法,所以**不做任何正则改写**
 (正则改写可能悄悄破坏含 `": "` 的正则字面量或字符串).`tools/diff-test.mjs` 用
 45 个样本 + 一棵嵌套树对"生成版 vs 原钩子"做逐字节比对(当前 0 处不一致).
+
 **改规则请改钩子,然后重跑生成器**:
 
 ```
@@ -57,13 +58,28 @@ node tools/diff-test.mjs         # 必须 0 mismatches
 
 `filter.mjs` 只额外承担两件钩子没有的事:
 
-- **身份句屏蔽**(用户指定的新增屏蔽词):
+- **身份句改写**(用户明确要求,无条件保留):
   `You are Claude Code, Anthropic's official CLI tool for Claude.` ->
   `You are Codex, an official CLI coding agent.`
+  探针显示该句无论如何都能通过上游,所以它**不是**由阻断行为证明的条目.
 - **额外要求注入**:工作区 AGENTS.md Sec 5 的语言卫生规则与身份规则以
   `Additional requirements for this provider. ..` 追加到请求体 `instructions`
   末尾(幂等).Codex 没有 provider 级 `instructions` 字段
   (`--strict-config` 直接报 `unknown configuration field`),网关是唯一可承载处.
+
+**只对 `ar`(agentrouter)开启**.对 relaycat/wb2api 跑这些规则只有保真度损失.
+
+### 关于"是否还需要这层过滤"的现状(2026-09-20)
+
+**未定论,故保留**:
+
+- 钩子源码注释写明词表是 **GLM 上游**词表,Sts2 的 500 也来自 GLM.
+- 用 `deepseek-v4-flash` 复测时那些词组全部通过,但**不同上游**不能互证.
+- `glm-5.3` 当前 **503**(无可用渠道),**无法复测**,所以不能判定该层过时.
+- 上游是**累积式**分类器(Sts2 二分:5.5KB 纯 ASCII 工具结果只在 600 条消息的
+  上下文中被拦),小请求单测不足以证明"安全".
+
+待 `glm-5.3` 可探测后再复核.
 
 失败时**放行不阻断**,与 omp 钩子一致.
 

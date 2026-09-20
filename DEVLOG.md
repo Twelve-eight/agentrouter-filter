@@ -194,3 +194,43 @@
   -> 跨进程只传无空格的 service key,路径在 `services.ps1` 里查表.
 - `cmd.exe /c` 对"首参带引号"有特殊解析,含空格的 .cmd 路径会被拆 -> 用无空格路径.
 - `-RedirectStandardOutput` **截断**而非追加 -> 交接时先移走旧文件再重定向.
+
+## 2026-09-20(四):恢复过滤层 + 修桥接的 effort/usage 转发
+
+### 撤回上一节的"整体移除"
+上一节我基于"词表全部通过"判定词组层过时并整体删除.该结论有**两个盲点**:
+
+1. **测错了上游**:钩子源码注释明写 `Phrase-level filter (GLM upstream word list)`,
+   Sts2 的 500 也来自 GLM,而我用 `deepseek-v4-flash` 测.不同上游,结论不通用.
+   且 `glm-5.3` 现在是 **503**(无可用渠道),**无法复测** -> 不能判它过时.
+2. **漏了一条规则**:18 字符触发词用 `String.fromCharCode` 拼写(避开自身源码),
+   我的探针没覆盖它.
+
+另:小请求单测不足以证明"安全"(上游是**累积式**分类器).
+
+### 现在的范围(收窄后的正当理由)
+- **词组层保留**:等 `glm-5.3` 可探测后再判定.
+- **身份改写无条件保留**:`You are Claude Code, Anthropic's official CLI tool for Claude.`
+  -> `You are Codex, an official CLI coding agent.`.这是**用户明确要求**的条目,
+  且探针显示该句无论如何都能通过 -- 它从来就不是由阻断行为证明的.
+- **stripReasoning 保持移除**(用户已声明不需要).
+
+### 修掉的两个真 bug(交付路径)
+两个都是"只测上游、没测 codex 实际走的路径"造成的:
+
+1. **`toChatBody` 从不转发 effort**.codex 请求 `max`,到 wb2api 时 effort 已丢失,
+   上游按自己的默认档(`high`)执行.此前"wb2api 的 ds 是 max"的 6/6 结论是
+   **直连 `:7863/v1/chat/completions`** 测的,绕过了桥接,只证明上游能力.
+   现改为转发 `reasoning_effort`,并把 codex 专有档位(`ultra`/`persistent`)
+   钳到 `max`(上游对未知档位报 422,已在 agentrouter 实测).
+2. **桥接丢弃 reasoning 计数**.`usage` 只带 input/output/total,responses 流里
+   看不到推理用量,客户端无法观测档位是否生效.现把 `completion_thinking_tokens`
+   (及 `completion_tokens_details.reasoning_tokens`)映射到
+   `output_tokens_details.reasoning_tokens`.
+
+### 修复后的交付路径实测(经桥接,6 轮交错,难题)
+```
+high 均值 reasoning_tokens = 2969.3
+max  均值 reasoning_tokens = 4373.7   (+47%,max>high 4/6 轮)
+```
+且 `wb-ds.config.toml` 已由 `high` 改为 `max`.
