@@ -194,3 +194,53 @@
   -> 跨进程只传无空格的 service key,路径在 `services.ps1` 里查表.
 - `cmd.exe /c` 对"首参带引号"有特殊解析,含空格的 .cmd 路径会被拆 -> 用无空格路径.
 - `-RedirectStandardOutput` **截断**而非追加 -> 交接时先移走旧文件再重定向.
+
+## 2026-09-20(三):移除内容过滤与 reasoning 剥离
+
+### 决定
+用户要求"不再剥离 reasoning",并追问能否把内容过滤放到 codex 侧.查证后:**两件事都从网关移除**.
+
+### 为什么 codex 侧放不了过滤
+codex 0.154 的 hook 事件全集(`session_start/end`,`user_prompt_submit`,
+`pre/post_tool_use`,`pre_compact`,`stop`,`notification`)中:
+- `PreToolUse` 只有 `updatedInput`(改**工具参数**),不能改请求体;
+- `UserPromptSubmit` 只有 `additionalContext`(**追加**上下文),不能替换用户输入;
+- 其余只有 `systemMessage` 之类.
+
+**没有任何事件能改写最终发出的请求体**(系统提示,历史消息,助手回复原样发出).
+所以线上过滤只能由代理做.
+
+### 为什么连代理里的过滤也删掉
+按"先证明再移植"的顺序做了决定性实验:
+
+1. **词表层**:`filter.mjs` 会改写的每个触发词逐条直发 agentrouter ->
+   `warp-player`/`relic-bag`/`relic choices`/`relic choice`/`choice history`/
+   `model choice history entry`/`net id`/`4xx-dumps`/`RELIC-CHOICES`/三点连排/
+   长文件 id/全部合并 -> **12/12 全部 200 PASS**.该层是过时的.
+2. **字符层**:探测 25 个 Unicode 区段(通用标点/上下标/货币/字母式/箭头/数学/
+   杂项技术/制表符/几何/杂项符号/装饰符/绘文字/表情/交通/平假名/片假名/谚文/
+   CJK 标点/CJK 汉字/全角/西里尔/希腊/阿拉伯/希伯来/泰文)-> **全部 ALLOW 2/2**.
+3. **不确定性**:同一输入重复测试结果会变 -- emoji 先 3/3 BLOCK,后 2/2 ALLOW;
+   `arrow+emdash` 先 PASS,后 BLOCK.即**概率性**,不是确定性规则.
+4. **真实机制**(`Sts/sts2-spire1/DEVLOG.md` 二分实验):累积式内容分类器 --
+   一个 5.5KB **纯 ASCII** 工具结果只在 600 条消息的上下文中被拦,293 条时通过;
+   700 破折号 + 180 箭头 + CJK 的小请求通过;414KB 混合字符请求通过.
+
+结论:确定性过滤器**既拦不住真实触发条件,又静默损失保真度**,故整体移除.
+
+### 代码变化
+- `server.mjs`:移除 `filter` / `stripReasoning` 两个路由标志与全部改写逻辑,
+  只保留 telemetry(记录客户端实际发送的 items/reasoning/calls/outputs).
+- 删除 `filter.mjs` / `filter-core.ts` / `tools/gen-filter-core.mjs` / `tools/diff-test.mjs`.
+- 保留 `bridge.mjs`(wb2api 的 responses<->chat 桥接,codex 唯一无法替代的能力)
+  与 `tools/test-bridge-indices.mjs`(其回归测试).
+
+### 顺带修掉的真 bug
+`~/.codex/config.toml` 的 `model_reasoning_effort = "ultra"` 会被 agentrouter
+**422 拒绝**:`unknown variant 'ultra', expected one of 'none','minimal','low','medium','high','xhigh','max'`.
+已改为 `max`.默认模型也改为当前唯一可用的 agentrouter 模型 `deepseek-v4-flash`
+(`gpt-6-astra`/`gpt-5.6-sol` 402,`glm-5.3` 503).
+
+### 遗留
+agentrouter astra 402 配额耗尽,anyrouter astra 500 通道满载 -- 均为上游侧,
+配置已就绪,恢复即可用.
