@@ -23,6 +23,7 @@
 import http from "node:http";
 import https from "node:https";
 import { pathToFileURL } from "node:url";
+import { filterBody } from "./filter.mjs";
 import { bridgeChatStream, toChatBody } from "./bridge.mjs";
 
 const PORT = Number(process.env.AR_GATEWAY_PORT ?? 7878);
@@ -34,46 +35,35 @@ const HOST = "127.0.0.1";
 // mirror, or at a local echo for testing).
 //
 // Per-route behaviour:
-//   filter        - run the agentrouter char/word filter + identity block and
-//                   inject the extra model-facing requirements. Only agentrouter
-//                   needs it (its word list blocks on opaque content); running it
-//                   on other upstreams would only lose fidelity (emoji and
-//                   non-approved scripts deleted, identifiers rewritten).
-//   stripReasoning- drop replayed `reasoning` items before forwarding.
-//                   agentrouter's astra sits behind a multi-Azure-resource pool
-//                   with no session affinity: an encrypted_content item is bound
-//                   to the resource that created it, so replaying it after the
-//                   load balancer moves the session returns 400
-//                   ("could not be verified" / "different .. OpenAI resource").
-//                   This is the codex-side equivalent of models.yml
-//                   `compat.replayResponsesReasoning: false`.
+//   filter - run the agentrouter char/word filter + identity block and inject
+//            the extra model-facing requirements. Only agentrouter needs it (its
+//            word list blocks on opaque content); running it on other upstreams
+//            would only lose fidelity (emoji and non-approved scripts deleted,
+//            identifiers rewritten).
+//            The phrase list is the GLM upstream word list, so it stays until
+//            glm-5.3 is reachable for re-testing (it is 503 right now); the
+//            identity rewrite is an unconditional user requirement.
 const ROUTES = {
   ar: {
     base: process.env.AR_UPSTREAM_AR ?? "https://ps.air-outer.com",
     chat: false,
-    // No filter, no stripReasoning.
-    //
-    // Filter removed 2026-09-20 after measurement: agentrouter's blocking is a
-    // cumulative, probabilistic content classifier, not a character/word rule.
-    //   - every phrase filter.mjs rewrote: 12/12 PASS
-    //   - every Unicode range probed (25 ranges incl. emoji/kana): ALLOW 2/2
-    //   - the same input blocked on one run and passed on another
-    // Sts2 DEVLOG's bisect had already shown the real trigger is a 5.5KB pure-ASCII
-    // tool result that only blocks inside a 600-message context. A deterministic
-    // filter cannot address that, and it silently cost fidelity (emoji and
-    // non-approved scripts deleted, identifiers rewritten).
-    //
-    // Reasoning stripping was retired for the same reason the user gave: it is no
-    // longer needed.
+    filter: true,
   },
   rc: {
     base: process.env.AR_UPSTREAM_RC ?? "https://api.relaycat.top",
     chat: false,
+    // No stripReasoning: relaycat never 400'd across resumed turns, and the
+    // earlier "it's a no-op" justification came from telemetry that ran AFTER
+    // the strip (self-fulfilling). Per-route fidelity: don't rewrite what has no
+    // demonstrated problem. Telemetry now reports the pre-strip reasoning count,
+    // so a real replay would be visible in the log before deciding to enable it.
   },
   wb: { base: process.env.AR_UPSTREAM_WB ?? "http://127.0.0.1:7863", chat: true },
   // anyrouter.top is TLS-blocked on a direct connection (omp reports "unknown
   // certificate verification error"); it needs the local HTTP proxy. The proxy
   // is applied per-route so agentrouter (which hangs through it) stays direct.
+  // No stripReasoning: anyrouter's astra was verified replay-safe (3x replay OK,
+  // including across prompt_cache_key changes).
   an: { base: process.env.AR_UPSTREAM_AN ?? "https://anyrouter.top", chat: false, proxy: process.env.AR_PROXY_AN ?? "http://127.0.0.1:7897" },
 };
 
@@ -169,19 +159,44 @@ const server = http.createServer(async (req, res) => {
   const isChatUpstream = route.chat;
 
   let body = raw.length ? raw.toString("utf8") : undefined;
+  let changed = false;
 
-  // Telemetry only: report what the client sent, so the log shows the real
-  // request shape. No rewriting happens on any route (see the ROUTES comment).
+  // Telemetry MUST run before any rewriting: measuring after the strip would
+  // always report reasoning=0 on a stripping route and could never distinguish
+  // "the client sent none" from "we removed them".
+  let incoming = null;
   if (body !== undefined && isResponses) {
     try {
       const parsed = JSON.parse(body);
       if (Array.isArray(parsed.input)) {
-        const n = (t) => parsed.input.filter((it) => it?.type === t).length;
-        log(`${prefix}${rest}: items=${parsed.input.length} reasoning=${n("reasoning")} calls=${n("function_call")} outputs=${n("function_call_output")}`);
+        incoming = {
+          items: parsed.input.length,
+          reasoning: parsed.input.filter((it) => it?.type === "reasoning").length,
+          calls: parsed.input.filter((it) => it?.type === "function_call").length,
+          outputs: parsed.input.filter((it) => it?.type === "function_call_output").length,
+        };
       }
     } catch {
       /* not JSON (e.g. GET) - nothing to report */
     }
+  }
+
+  if (body !== undefined && route.filter) {
+    try {
+      const next = filterBody(body, { injectInstructions: true });
+      changed = next !== body;
+      body = next;
+    } catch {
+      /* fail-open, matching the omp hook */
+    }
+  }
+  if (changed) log(`filter rewrote ${prefix}${rest} body (${raw.length} -> ${Buffer.byteLength(body)})`);
+
+  if (incoming) {
+    log(
+      `${prefix}${rest}: items=${incoming.items} reasoning=${incoming.reasoning}` +
+        ` calls=${incoming.calls} outputs=${incoming.outputs}`,
+    );
   }
 
   if (isResponses && isChatUpstream) {

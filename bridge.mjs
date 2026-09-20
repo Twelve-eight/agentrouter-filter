@@ -87,6 +87,17 @@ function toChatBody(body, model) {
   if (body.max_output_tokens) chat.max_tokens = body.max_output_tokens;
   if (body.temperature !== undefined) chat.temperature = body.temperature;
   if (body.parallel_tool_calls !== undefined) chat.parallel_tool_calls = body.parallel_tool_calls;
+  // Forward the reasoning effort. Without this the upstream applies its own
+  // default (wb2api injects `high`), so a codex request for max silently ran at
+  // high - verified by measuring completion_thinking_tokens through the bridge
+  // vs directly against the upstream.
+  const effort = body.reasoning?.effort;
+  if (typeof effort === "string" && effort) {
+    // codex also emits levels the chat upstreams do not know (`ultra`,
+    // `persistent`); agentrouter rejects unknown variants with 422, so clamp to
+    // the highest level the upstreams accept.
+    chat.reasoning_effort = effort === "ultra" || effort === "persistent" ? "max" : effort;
+  }
   return chat;
 }
 
@@ -262,6 +273,17 @@ function bridgeChatStream(upstream, res, model, effort) {
           output_tokens: j.usage.completion_tokens ?? 0,
           total_tokens: j.usage.total_tokens ?? 0,
         };
+        // Carry the upstream's reasoning counters through. Without these the
+        // responses stream reports no reasoning usage, so callers (and effort
+        // comparisons) cannot tell whether the requested level took effect.
+        const detail = j.usage.completion_tokens_details;
+        if (detail && typeof detail === "object") {
+          usage.output_tokens_details = { reasoning_tokens: detail.reasoning_tokens ?? 0 };
+        }
+        if (typeof j.usage.completion_thinking_tokens === "number") {
+          usage.output_tokens_details = usage.output_tokens_details ?? {};
+          usage.output_tokens_details.reasoning_tokens = j.usage.completion_thinking_tokens;
+        }
       }
       const d = j.choices?.[0]?.delta;
       if (!d) continue;
