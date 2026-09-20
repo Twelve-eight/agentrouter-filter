@@ -22,20 +22,21 @@ Codex CLI 侧的 agentrouter 过滤/桥接网关。
 
 Codex 的 `model_provider.base_url` 指向 `http://127.0.0.1:7878/<route>/v1`:
 
-| route | 上游 | 方式 | filter | stripReasoning |
-|---|---|---|---|---|
-| `ar` | `https://ps.air-outer.com` | responses 透传 | 是 | 是 |
-| `rc` | `https://api.relaycat.top` | responses 透传 | 否 | 否 |
-| `wb` | `http://127.0.0.1:7863` | responses -> chat/completions 桥接 | 否 | 桥接天然丢弃 |
-| `an` | `https://anyrouter.top` | responses 透传,经 `http://127.0.0.1:7897` CONNECT 隧道 | 否 | 否 |
+| route | 上游 | 方式 | filter |
+|---|---|---|---|
+| `ar` | `https://ps.air-outer.com` | responses 透传 | 是 |
+| `rc` | `https://api.relaycat.top` | responses 透传 | 否 |
+| `wb` | `http://127.0.0.1:7863` | responses -> chat/completions 桥接 | 否 |
+| `an` | `https://anyrouter.top` | responses 透传,经 `http://127.0.0.1:7897` CONNECT 隧道 | 否 |
 
 **为什么只给 `ar` 开 filter**:字符剥离与词表改写只对 agentrouter 有意义
 (它的词表会对不透明内容 400/500);对 relaycat/wb2api 跑这些规则只有保真度损失
-(emoji 与非批准文字被删、`relic-bag`/`net id` 这类标识符被改写),包括模型正在读写的代码.
+(emoji 与非批准文字被删,`relic-bag`/`net id` 这类标识符被改写),包括模型正在读写的代码.
 
-**为什么只给 `ar` 开 stripReasoning**:agentrouter 的 astra 位于多 Azure 资源池后且无
-会话粘性,`encrypted_content` 绑定创建它的资源,回放落别的资源必 400.这是 models.yml
-`compat.replayResponsesReasoning: false` 的 codex 侧等价物.其余上游无此问题.
+**reasoning 剥离已整体移除**:曾有一个 `stripReasoning` 开关(丢弃回放的 `reasoning`
+item),用于规避 agentrouter 多 Azure 资源池无会话粘性导致的 400.用户已声明不再需要,
+且实测带 `encrypted_content` 回放上游返回 200,故**不留该机制,也不为没有实证问题的
+东西做改写**.
 
 `an` 单独走代理是因为 anyrouter.top 直连被 TLS 层拦截;其余路由保持直连
 (agentrouter 经该代理会挂起).上游可用 `AR_UPSTREAM_<ROUTE>` / `AR_PROXY_AN` 覆盖.

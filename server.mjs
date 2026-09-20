@@ -52,18 +52,11 @@ const ROUTES = {
   rc: {
     base: process.env.AR_UPSTREAM_RC ?? "https://api.relaycat.top",
     chat: false,
-    // No stripReasoning: relaycat never 400'd across resumed turns, and the
-    // earlier "it's a no-op" justification came from telemetry that ran AFTER
-    // the strip (self-fulfilling). Per-route fidelity: don't rewrite what has no
-    // demonstrated problem. Telemetry now reports the pre-strip reasoning count,
-    // so a real replay would be visible in the log before deciding to enable it.
   },
   wb: { base: process.env.AR_UPSTREAM_WB ?? "http://127.0.0.1:7863", chat: true },
   // anyrouter.top is TLS-blocked on a direct connection (omp reports "unknown
   // certificate verification error"); it needs the local HTTP proxy. The proxy
   // is applied per-route so agentrouter (which hangs through it) stays direct.
-  // No stripReasoning: anyrouter's astra was verified replay-safe (3x replay OK,
-  // including across prompt_cache_key changes).
   an: { base: process.env.AR_UPSTREAM_AN ?? "https://anyrouter.top", chat: false, proxy: process.env.AR_PROXY_AN ?? "http://127.0.0.1:7897" },
 };
 
@@ -161,9 +154,10 @@ const server = http.createServer(async (req, res) => {
   let body = raw.length ? raw.toString("utf8") : undefined;
   let changed = false;
 
-  // Telemetry MUST run before any rewriting: measuring after the strip would
-  // always report reasoning=0 on a stripping route and could never distinguish
-  // "the client sent none" from "we removed them".
+  // Telemetry runs before any rewriting and reports the reasoning-item count as
+  // the client sent it. Nothing removes reasoning items any more (the
+  // stripReasoning switch is gone), so this is a plain observation of the
+  // request, not a pre/post measurement.
   let incoming = null;
   if (body !== undefined && isResponses) {
     try {
