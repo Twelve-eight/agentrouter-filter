@@ -108,17 +108,43 @@ const ours = [
   entry('cn:kimi-k3-1', 'Kimi K3 (workbuddy CN)', 'Kimi K3 via the local WorkBuddy gateway (CN node)', ['low', 'medium', 'high', 'max'], 1000000),
 ];
 
-// 3) merge, built-ins first; a slug collision keeps the built-in entry (its
-//    base_instructions/model_messages are model-specific and strictly better).
+// 3) merge, built-ins first.
+//
+// On a slug collision the BUILT-IN entry wins: codex authors it for that exact
+// model and it carries fields ours does not set (model_messages, the
+// model-specific base_instructions, tool_mode, multi_agent_version,
+// experimental_supported_tools, ..), so overlaying our thinner entry would lose
+// real behaviour.
+//
+// But the collision MUST NOT be silent: a collision means the entry below is dead
+// code, so a later edit here (e.g. changing reasoning levels) would appear to do
+// nothing. Report every ignored field difference instead.
+const RICH_ONLY = ['base_instructions', 'model_messages', 'tool_mode', 'multi_agent_version'];
 const have = new Set(builtin.models.map((m) => m.slug));
 const added = ours.filter((m) => !have.has(m.slug));
-const skipped = ours.filter((m) => have.has(m.slug)).map((m) => m.slug);
+const collisions = ours.filter((m) => have.has(m.slug));
 
 const merged = { models: [...builtin.models, ...added] };
 fs.writeFileSync(OUT, JSON.stringify(merged, null, 2) + '\n');
 
 console.log(`built-in: ${builtin.models.length}`);
 console.log(`added:    ${added.length} -> ${added.map((m) => m.slug).join(', ')}`);
-if (skipped.length) console.log(`skipped (already built in, kept built-in entry): ${skipped.join(', ')}`);
 console.log(`total:    ${merged.models.length}`);
 console.log(`written:  ${OUT}`);
+
+if (collisions.length) {
+  console.log('');
+  console.log('!! SLUG COLLISIONS - the entries below are IGNORED (built-in wins)');
+  for (const o of collisions) {
+    const b = builtin.models.find((m) => m.slug === o.slug);
+    console.log(`!!   ${o.slug}`);
+    const keys = new Set([...Object.keys(o), ...Object.keys(b)]);
+    for (const k of [...keys].sort()) {
+      if (RICH_ONLY.includes(k)) continue;
+      const ov = JSON.stringify(o[k]);
+      const bv = JSON.stringify(b[k]);
+      if (ov !== bv) console.log(`!!     ${k}: ours=${ov} builtin=${bv}`);
+    }
+    console.log('!!     -> rename the slug, or drop this entry from `ours`');
+  }
+}
