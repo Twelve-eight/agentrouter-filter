@@ -109,17 +109,24 @@ function sse(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function bridgeChatStream(upstream, res, model, effort) {
+function bridgeChatStream(upstream, res, model, effort, stream = true) {
   const respId = "resp_" + Math.random().toString(36).slice(2, 14);
   const created = Math.floor(Date.now() / 1000);
   const base = { id: respId, object: "response", created_at: created, model, status: "in_progress", output: [] };
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-  sse(res, "response.created", { type: "response.created", response: base });
-  sse(res, "response.in_progress", { type: "response.in_progress", response: base });
+  // Streaming: write SSE headers up front and emit events as they arrive.
+  // Non-streaming: write NOTHING here - `emit` becomes a no-op collector and
+  // finish() writes a single JSON body. Writing the SSE header eagerly made a
+  // stream:false request come back as text/event-stream.
+  if (stream) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+  }
+  const emit = stream ? (ev, d) => sse(res, ev, d) : () => {};
+  emit("response.created", { type: "response.created", response: base });
+  emit("response.in_progress", { type: "response.in_progress", response: base });
 
   let buf = "";
   let seq = 2;
@@ -151,13 +158,13 @@ function bridgeChatStream(upstream, res, model, effort) {
     msgOpen = true;
     msgId = "msg_" + Math.random().toString(36).slice(2, 14);
     msgIndex = openItem();
-    sse(res, "response.output_item.added", {
+    emit("response.output_item.added", {
       type: "response.output_item.added",
       output_index: msgIndex,
       item: { type: "message", id: msgId, role: "assistant", status: "in_progress", content: [] },
       sequence_number: seq++,
     });
-    sse(res, "response.content_part.added", {
+    emit("response.content_part.added", {
       type: "response.content_part.added",
       content_index: 0,
       item_id: msgId,
@@ -176,7 +183,7 @@ function bridgeChatStream(upstream, res, model, effort) {
       status: "completed",
       content: [{ type: "output_text", text, annotations: [] }],
     };
-    sse(res, "response.content_part.done", {
+    emit("response.content_part.done", {
       type: "response.content_part.done",
       content_index: 0,
       item_id: msgId,
@@ -184,7 +191,7 @@ function bridgeChatStream(upstream, res, model, effort) {
       part: { type: "output_text", text, annotations: [] },
       sequence_number: seq++,
     });
-    sse(res, "response.output_item.done", {
+    emit("response.output_item.done", {
       type: "response.output_item.done",
       output_index: msgIndex,
       item,
@@ -205,7 +212,7 @@ function bridgeChatStream(upstream, res, model, effort) {
     if (!c.added && c.name) {
       c.added = true;
       c.outIndex = openItem();
-      sse(res, "response.output_item.added", {
+      emit("response.output_item.added", {
         type: "response.output_item.added",
         output_index: c.outIndex,
         item: { type: "function_call", id: c.itemId, status: "in_progress", arguments: "", call_id: c.id, name: c.name },
@@ -215,7 +222,7 @@ function bridgeChatStream(upstream, res, model, effort) {
     const chunk = delta.function?.arguments;
     if (chunk) {
       c.args += chunk;
-      sse(res, "response.function_call_arguments.delta", {
+      emit("response.function_call_arguments.delta", {
         type: "response.function_call_arguments.delta",
         delta: chunk,
         item_id: c.itemId,
@@ -226,10 +233,29 @@ function bridgeChatStream(upstream, res, model, effort) {
   };
 
   const finish = () => {
+    // Non-streaming request: the client asked for one JSON object, but this
+    // bridge consumes the upstream's SSE. Accumulate and emit the completed
+    // response as JSON instead of the event stream. Codex always streams, so
+    // this only shows up for other clients (curl, SDKs) - verified missing
+    // before this fix: stream:false returned text/event-stream.
+    if (!stream) {
+      closeMessage();
+      const out = [];
+      for (const c of calls.values()) {
+        if (!c.added) continue;
+        out.push({ type: "function_call", id: c.itemId, status: "completed", arguments: c.args || "{}", call_id: c.id, name: c.name });
+      }
+      const items2 = items.filter(Boolean);
+      const msg = items2.find((it) => it.type === "message");
+      const output = msg ? [msg, ...out] : out;
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
+      res.end(JSON.stringify({ ...base, status: "completed", output, usage }));
+      return;
+    }
     closeMessage();
     for (const c of calls.values()) {
       if (!c.added) continue;
-      sse(res, "response.function_call_arguments.done", {
+      emit("response.function_call_arguments.done", {
         type: "response.function_call_arguments.done",
         arguments: c.args || "{}",
         item_id: c.itemId,
@@ -237,7 +263,7 @@ function bridgeChatStream(upstream, res, model, effort) {
         sequence_number: seq++,
       });
       const item = { type: "function_call", id: c.itemId, status: "completed", arguments: c.args || "{}", call_id: c.id, name: c.name };
-      sse(res, "response.output_item.done", {
+      emit("response.output_item.done", {
         type: "response.output_item.done",
         output_index: c.outIndex,
         item,
@@ -245,7 +271,7 @@ function bridgeChatStream(upstream, res, model, effort) {
       });
       placeItem(c.outIndex, item);
     }
-    sse(res, "response.completed", {
+    emit("response.completed", {
       type: "response.completed",
       response: { ...base, status: "completed", output: items.filter(Boolean), usage },
     });
@@ -291,7 +317,7 @@ function bridgeChatStream(upstream, res, model, effort) {
       if (d.content) {
         openMessage();
         text += d.content;
-        sse(res, "response.output_text.delta", {
+        emit("response.output_text.delta", {
           type: "response.output_text.delta",
           content_index: 0,
           delta: d.content,
@@ -308,7 +334,14 @@ function bridgeChatStream(upstream, res, model, effort) {
   upstream.on("end", finish);
   upstream.on("error", () => {
     try {
-      sse(res, "response.failed", { type: "response.failed", response: { ...base, status: "failed" } });
+            if (!stream) {
+        // Non-streaming: a JSON body, never a bare end (which would look like an
+        // empty success to the client).
+        if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "upstream stream error", type: "upstream_error" } }));
+        return;
+      }
+sse(res, "response.failed", { type: "response.failed", response: { ...base, status: "failed" } });
       res.end();
     } catch {}
   });

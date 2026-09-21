@@ -1,0 +1,87 @@
+{
+  "_comment": [
+    "Single source of truth for the unified gateway: which upstream serves which",
+    "model, and whether that upstream needs the agentrouter filter.",
+    "",
+    "The gateway's /u route dispatches on the request's `model` field, so a client",
+    "only needs ONE provider entry (http://127.0.0.1:7878/u/v1) and picks a model.",
+    "tools/build-model-catalog.cjs reads this file, so the codex picker and the",
+    "gateway can never disagree about which models exist.",
+    "",
+    "`wire`: responses = upstream speaks the Responses API natively (pass through);",
+    "        chat      = upstream is chat/completions only (the gateway bridges).",
+    "`filter`: run filter.mjs (char allowlist + word list + identity rewrite).",
+    "        Only agentrouter needs it; on other upstreams it only loses fidelity.",
+    "`proxy`: CONNECT tunnel, needed by anyrouter.top (TLS-blocked when direct)."
+  ],
+  "providers": {
+    "agentrouter": {
+      "base": "https://ps.air-outer.com",
+      "wire": "responses",
+      "filter": true,
+      "keyEnv": "AGENTROUTER_API_KEY"
+    },
+    "relaycat": {
+      "base": "https://api.relaycat.top",
+      "wire": "responses",
+      "keyEnv": "RELAYCAT_API_KEY"
+    },
+    "relaycat-cn": {
+      "base": "https://api.relaycat.top",
+      "wire": "responses",
+      "keyEnv": "RELAYCAT_CN_API_KEY"
+    },
+    "wb2api": {
+      "base": "http://127.0.0.1:7863",
+      "wire": "chat",
+      "keyEnv": "WORKBUDDY_API_KEY"
+    },
+    "anyrouter": {
+      "base": "https://anyrouter.top",
+      "wire": "responses",
+      "keyEnv": "ANYROUTER_API_KEY",
+      "proxy": "http://127.0.0.1:7897"
+    }
+  },
+
+  "_models_comment": [
+    "key   = the model id the CLIENT sends (also the codex catalog slug)",
+    "value = { p: provider, m: upstream model id (omit when identical) }",
+    "",
+    "Only ids that were probed live are listed. Entries whose upstream currently",
+    "answers 402/503 stay listed when the id is real (it recovers); the gateway",
+    "passes the upstream error through unchanged so the cause stays visible."
+  ],
+  "models": {
+    "deepseek-v4-flash": { "p": "agentrouter" },
+    "glm-5.3": { "p": "agentrouter" },
+    "claude-opus-4-8": { "p": "agentrouter" },
+    "claude-opus-5": { "p": "agentrouter" },
+
+    "deepseek-v4.1-flash": { "p": "relaycat-cn" },
+
+    "global:deepseek-v4.1-flash": { "p": "wb2api" },
+    "global:deepseek-v4.1-flash-sg": { "p": "wb2api" },
+    "global:gpt-6-astra": { "p": "wb2api" },
+    "global:gpt-5.6-sol": { "p": "wb2api" },
+    "global:gpt-5.6-terra": { "p": "wb2api" },
+    "global:gpt-5.6-luna": { "p": "wb2api" },
+    "global:gpt-5.5": { "p": "wb2api" },
+    "global:gpt-5.3-codex": { "p": "wb2api" },
+    "global:gemini-3.5-flash": { "p": "wb2api" },
+    "global:glm-5.3": { "p": "wb2api" },
+    "global:kimi-k3": { "p": "wb2api" },
+    "cn:deepseek-v4-pro": { "p": "wb2api" },
+    "cn:kimi-k3-1": { "p": "wb2api" },
+
+    "_builtin_comment": "codex built-in slugs, served natively by relaycat",
+    "gpt-6-astra": { "p": "relaycat" },
+    "gpt-5.6-sol": { "p": "relaycat" },
+    "gpt-5.6-terra": { "p": "relaycat" },
+    "gpt-5.6-luna": { "p": "relaycat" },
+    "gpt-5.5": { "p": "relaycat" },
+    "gpt-5.4": { "p": "relaycat" },
+    "gpt-5.2": { "p": "relaycat" },
+    "gpt-5.3-codex": { "p": "relaycat" }
+  }
+}

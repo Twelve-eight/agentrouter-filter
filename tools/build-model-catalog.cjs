@@ -92,31 +92,39 @@ function entry(slug, display, description, efforts, contextWindow) {
   };
 }
 
-const ours = [
-  // agentrouter (ps.air-outer.com) - provider `agentrouter`, route /ar
-  entry('deepseek-v4-flash', 'DeepSeek V4 Flash (agentrouter)', 'DeepSeek V4 Flash via agentrouter', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('glm-5.3', 'GLM 5.3 (agentrouter)', 'GLM 5.3 via agentrouter', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('claude-opus-4-8', 'Claude Opus 4.8 (agentrouter)', 'Claude Opus 4.8 via agentrouter', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('claude-opus-5', 'Claude Opus 5 (agentrouter)', 'Claude Opus 5 via agentrouter', ['low', 'medium', 'high', 'max'], 1000000),
-  // relaycat-cn (api.relaycat.top, CN key group) - provider `relaycat-cn`, route /rc.
-  // The plain `relaycat` key serves the built-in names (gpt-6-astra, gpt-5.6-sol, ..)
-  // which are already in the built-in catalog, so nothing to add for it.
-  entry('deepseek-v4.1-flash', 'DeepSeek V4.1 Flash (relaycat)', 'DeepSeek V4.1 Flash via relaycat', ['low', 'medium', 'high', 'max'], 1000000),
-  // wb2api (local 127.0.0.1:7863) - provider `wb2api`, route /wb. All verified 200.
-  entry('global:deepseek-v4.1-flash', 'DeepSeek V4.1 Flash (workbuddy)', 'DeepSeek V4.1 Flash via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:gpt-6-astra', 'GPT-6-Astra (workbuddy)', 'GPT-6-Astra via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:gpt-5.6-sol', 'GPT-5.6-Sol (workbuddy)', 'GPT-5.6-Sol via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:gpt-5.6-terra', 'GPT-5.6-Terra (workbuddy)', 'GPT-5.6-Terra via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:gpt-5.6-luna', 'GPT-5.6-Luna (workbuddy)', 'GPT-5.6-Luna via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:gpt-5.5', 'GPT-5.5 (workbuddy)', 'GPT-5.5 via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:gpt-5.3-codex', 'GPT-5.3-Codex (workbuddy)', 'GPT-5.3-Codex via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:gemini-3.5-flash', 'Gemini 3.5 Flash (workbuddy)', 'Gemini 3.5 Flash via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:glm-5.3', 'GLM 5.3 (workbuddy)', 'GLM 5.3 via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:kimi-k3', 'Kimi K3 (workbuddy)', 'Kimi K3 via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('global:deepseek-v4.1-flash-sg', 'DeepSeek V4.1 Flash SG (workbuddy)', 'DeepSeek V4.1 Flash (SG node) via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('cn:deepseek-v4-pro', 'DeepSeek V4 Pro (workbuddy)', 'DeepSeek V4 Pro via the local WorkBuddy gateway', ['low', 'medium', 'high', 'max'], 1000000),
-  entry('cn:kimi-k3-1', 'Kimi K3 (workbuddy CN)', 'Kimi K3 via the local WorkBuddy gateway (CN node)', ['low', 'medium', 'high', 'max'], 1000000),
-];
+// The model list comes from providers.json - the same file the gateway routes on.
+// Hand-maintaining a second list here is how the picker and the gateway would
+// drift apart (a model could appear in one and not the other). The label is
+// derived from the provider so the origin stays visible in the picker.
+const REGISTRY = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "providers.json"), "utf8"));
+
+// Per-provider context windows. Only set where it is actually known; everything
+// else gets the conservative default rather than a made-up number.
+const CONTEXT = { relaycat: 400000, wb2api: 1000000 };
+const CTX_DEFAULT = 200000;
+
+// Reasoning levels offered per provider. agentrouter/wb2api accept all four
+// (probed); relaycat's entries keep their own built-in sets and are excluded
+// here anyway (they collide with built-in slugs and the built-in entry wins).
+const EFFORTS = ["low", "medium", "high", "max"];
+
+const ours = Object.entries(REGISTRY.models)
+  .filter(([, v]) => v && typeof v === "object")
+  .map(([slug, spec]) => {
+    const prov = spec.p;
+    const upstream = spec.m ?? slug;
+    return entry(
+      slug,
+      `${slug} (via ${prov})`,
+      `${upstream} served by ${prov} through the local gateway`,
+      EFFORTS,
+      CONTEXT[prov] ?? CTX_DEFAULT,
+    );
+  })
+  // The registry also lists codex's built-in slugs (the gateway must route them),
+  // but their catalog entries already exist and are richer. Drop them here: the
+  // built-in entry wins below, and reporting that as a "collision" would be noise.
+  .filter((m) => !builtin.models.some((b) => b.slug === m.slug));
 
 // 3) merge, built-ins first.
 //

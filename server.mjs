@@ -20,6 +20,7 @@
 //   /rc/*  -> https://api.relaycat.top/v1     (native responses upstream)
 // Everything posted is sanitised by filter.mjs first.
 
+import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import { pathToFileURL } from "node:url";
@@ -60,6 +61,54 @@ const ROUTES = {
   an: { base: process.env.AR_UPSTREAM_AN ?? "https://anyrouter.top", chat: false, proxy: process.env.AR_PROXY_AN ?? "http://127.0.0.1:7897" },
 };
 
+// ---------------------------------------------------------------------------
+// model registry (providers.json)
+//
+// The /u route dispatches on the request's `model` field, so one client provider
+// entry covers every upstream. providers.json is also what
+// tools/build-model-catalog.cjs reads, so the picker and the gateway cannot
+// disagree about which models exist or where they go.
+// ---------------------------------------------------------------------------
+const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", wb2api: "WB", anyrouter: "AN" };
+
+const REGISTRY = JSON.parse(fs.readFileSync(new URL("./providers.json", import.meta.url), "utf8"));
+
+/** Resolve a client model id to the upstream that serves it. */
+function providerFor(model) {
+  const spec = REGISTRY.models[model];
+  if (!spec || typeof spec !== "object") return null;
+  const p = REGISTRY.providers[spec.p];
+  if (!p) return null;
+  return {
+    name: spec.p,
+    // Overridable for testing/mirrors. Accept the provider name
+    // (AR_UPSTREAM_AGENTROUTER) and the legacy route prefix (AR_UPSTREAM_AR),
+    // so the existing /ar-style overrides keep working.
+    base: process.env[`AR_UPSTREAM_${spec.p.toUpperCase().replace(/-/g, "_")}`]
+      ?? process.env[`AR_UPSTREAM_${ROUTE_PREFIX[spec.p] ?? ""}`]
+      ?? p.base,
+    chat: p.wire === "chat",
+    filter: p.filter === true,
+    proxy: p.proxy,
+    // Upstream model id, when it differs from the id the client sent.
+    upstreamModel: spec.m ?? model,
+    // The credential is per-provider, but a client of the unified route sends only
+    // ONE key (its own provider's env_key). Forwarding that key to a different
+    // upstream fails - e.g. the agentrouter key at the local wb2api returns
+    // "missing or invalid API key". So the gateway substitutes the key each
+    // upstream actually needs; without this the unified route only works for the
+    // provider whose key the client happened to send.
+    keyEnv: p.keyEnv,
+    key: p.keyEnv ? process.env[p.keyEnv] : undefined,
+  };
+}
+
+/** Every client-facing model id, for GET /u/v1/models. */
+function modelList() {
+  return Object.entries(REGISTRY.models)
+    .filter(([, v]) => v && typeof v === "object")
+    .map(([id, v]) => ({ id, object: "model", owned_by: v.p }));
+}
 function log(...a) {
   process.stdout.write(`[${new Date().toISOString()}] ${a.join(" ")}\n`);
 }
@@ -127,14 +176,13 @@ function request(url, { method, headers, body, proxy }) {
 // ---------------------------------------------------------------------------
 
 const server = http.createServer(async (req, res) => {
-  const m = req.url.match(/^\/(ar|rc|wb|an)(\/.*)$/);
+  const m = req.url.match(/^\/(ar|rc|wb|an|u)(\/.*)$/);
   if (!m) {
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");
     return;
   }
   const [, prefix, rest] = m;
-  const route = ROUTES[prefix];
   const chunks = [];
   for await (const c of req.chunks ?? req) chunks.push(c);
   const raw = Buffer.concat(chunks);
@@ -148,11 +196,68 @@ const server = http.createServer(async (req, res) => {
   }
   if (headers["user-agent"] === undefined) headers["user-agent"] = "codex_exec/0.154.0";
 
+
   const isResponses = /\/responses\/?$/.test(rest);
-  const isChatUpstream = route.chat;
+
+  // GET /u/v1/models -> the aggregated registry, so a client can enumerate every
+  // upstream through the single unified provider entry.
+  if (prefix === "u" && /\/models\/?$/.test(rest)) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ object: "list", data: modelList() }));
+    return;
+  }
 
   let body = raw.length ? raw.toString("utf8") : undefined;
   let changed = false;
+  let route;
+
+  if (prefix === "u") {
+    // Unified route: the request's own `model` field selects the upstream, so the
+    // client needs one provider entry for everything and cannot pick a model its
+    // provider does not serve (the failure mode of the per-provider routes).
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "bad json" } }));
+      return;
+    }
+    route = providerFor(parsed.model);
+    if (!route) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: {
+            message: `unknown model '${parsed.model}'; GET /u/v1/models lists the ${modelList().length} available ids`,
+            type: "invalid_request_error",
+          },
+        }),
+      );
+      return;
+    }
+    // Rewrite to the upstream's own id when the registry maps them differently.
+    if (route.upstreamModel !== parsed.model) {
+      parsed.model = route.upstreamModel;
+      body = JSON.stringify(parsed);
+      changed = true;
+    }
+  } else {
+    route = ROUTES[prefix];
+  }
+
+  const isChatUpstream = route.chat;
+  // Substitute the upstream's own credential (see providerFor). Only for the
+  // unified route: the per-provider routes keep forwarding the client's key
+  // verbatim so their behaviour is unchanged.
+  if (prefix === "u") {
+    if (route.key) {
+      headers.authorization = `Bearer ${route.key}`;
+      delete headers["x-api-key"];
+    } else {
+      log(`!! ${route.name} has no ${route.keyEnv} in the environment; forwarding the client key`);
+    }
+  }
 
   // Telemetry runs before any rewriting and reports the reasoning-item count as
   // the client sent it. Nothing removes reasoning items any more (the
@@ -184,7 +289,7 @@ const server = http.createServer(async (req, res) => {
       /* fail-open, matching the omp hook */
     }
   }
-  if (changed) log(`filter rewrote ${prefix}${rest} body (${raw.length} -> ${Buffer.byteLength(body)})`);
+  if (changed && route.filter) log(`filter rewrote ${prefix}${rest} body (${raw.length} -> ${Buffer.byteLength(body)})`);
 
   if (incoming) {
     log(
@@ -203,7 +308,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const chat = toChatBody(parsed, parsed.model);
-    log(`bridge ${prefix}${rest} model=${parsed.model} msgs=${chat.messages.length} tools=${chat.tools?.length ?? 0}`);
+    log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${chat.messages.length} tools=${chat.tools?.length ?? 0}`);
     let upstream;
     try {
       upstream = await request(route.base + "/v1/chat/completions", {
@@ -226,12 +331,12 @@ const server = http.createServer(async (req, res) => {
       res.end(text);
       return;
     }
-    bridgeChatStream(upstream, res, parsed.model, parsed.reasoning?.effort);
+    bridgeChatStream(upstream, res, parsed.model, parsed.reasoning?.effort, parsed.stream !== false);
     return;
   }
 
   const target = route.base + rest;
-  log(`proxy ${prefix}${rest} -> ${target} bytes=${raw.length}`);
+  log(`proxy ${prefix}${rest} -> ${target} (${route.name}) bytes=${raw.length}`);
   let upstream;
   try {
     upstream = await request(target, { method: req.method, headers, body, proxy: route.proxy });
@@ -263,5 +368,5 @@ server.on("error", (e) => {
 // must not start a second gateway.
 const isEntryPoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isEntryPoint) {
-  server.listen(PORT, HOST, () => log(`agentrouter gateway listening on http://${HOST}:${PORT} (routes: /ar /rc /wb /an)`));
+  server.listen(PORT, HOST, () => log(`gateway listening on http://${HOST}:${PORT} (unified /u with ${modelList().length} models; routes: /ar /rc /wb /an)`));
 }
