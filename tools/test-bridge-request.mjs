@@ -125,4 +125,53 @@ check("tool_call ids and arguments are preserved verbatim", () => {
   assert.strictEqual(t.tool_call_id, "call_abc");
 });
 
+
+// --- response direction: reasoning must be emitted BEFORE the tool calls --------
+// Codex records items in stream order and replays them; a real session shows
+// `reasoning` immediately before `function_call`. Emitting reasoning at finish()
+// put it after the calls, so the replayed assistant turn had no
+// reasoning_content and DeepSeek rejected it (code 11155).
+import { Readable } from "node:stream";
+import { bridgeChatStream } from "../bridge.mjs";
+
+function runStream(chunks, stream = true) {
+  const out = [];
+  let body = null;
+  const res = { writeHead() {}, write(s) { out.push(s); }, end(s) { if (s) body = s; } };
+  bridgeChatStream(Readable.from(chunks), res, "m", "max", stream, null);
+  return new Promise((r) => setTimeout(() => r({ text: out.join(""), body }), 60));
+}
+
+const RC_CHUNKS = [
+  'data: {"choices":[{"delta":{"reasoning_content":"think first"}}]}\n\n',
+  'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"exec","arguments":"{}"}}]}}]}\n\n',
+  'data: [DONE]\n\n',
+];
+
+await (async () => {
+  const { text } = await runStream(RC_CHUNKS);
+  check("streaming: reasoning output_index precedes function_call", () => {
+    const order = [...text.matchAll(/"output_index":(\d+),"item":\{"type":"([a-z_]+)"/g)].map((m) => m[2] + "#" + m[1]);
+    assert.ok(order.length >= 2, "expected at least two items, got " + order.length);
+    assert.strictEqual(order[0], "reasoning#0", "reasoning must open first, got " + order.join(" -> "));
+    assert.ok(order.some((o) => o.startsWith("function_call")), "function_call missing");
+  });
+
+  const { body } = await runStream(RC_CHUNKS, false);
+  check("non-streaming: output is [reasoning, ..] with the text preserved", () => {
+    const j = JSON.parse(body);
+    const types = j.output.map((o) => o.type);
+    assert.strictEqual(types[0], "reasoning", "reasoning must come first, got " + types.join(","));
+    assert.strictEqual(j.output[0].content[0].text, "think first");
+  });
+
+  const { text: noRc } = await runStream([
+    'data: {"choices":[{"delta":{"content":"plain"}}]}\n\n',
+    'data: [DONE]\n\n',
+  ]);
+  check("no reasoning upstream -> no reasoning item emitted", () => {
+    assert.ok(!/"type":"reasoning"/.test(noRc), "must not invent a reasoning item");
+  });
+})();
+
 console.log(pass ? `\n${pass} checks passed` : "\nno checks ran");

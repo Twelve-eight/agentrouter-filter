@@ -168,6 +168,9 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
   let msgIndex = -1;
   let text = "";
   let reasoning = "";
+  let rOpen = false;
+  let rIndex = -1;
+  const rId = "rs_" + Math.random().toString(36).slice(2, 14);
   const calls = new Map(); // index -> {id,name,args,itemId,added,outIndex}
   let usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
   // output_index must be a monotonic per-item counter, NOT output.length: items
@@ -203,6 +206,24 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
       item_id: msgId,
       output_index: msgIndex,
       part: { type: "output_text", text: "", annotations: [] },
+      sequence_number: seq++,
+    });
+  };
+
+  // Reasoning must claim its output_index BEFORE the message/function_call items,
+  // because codex records it as the first item of the turn (a real session shows
+  // `reasoning` immediately followed by `function_call`). Opening it lazily in
+  // finish() put it after the tool calls, which replays as
+  // [function_call, reasoning, output] - the assistant turn then still has no
+  // reasoning_content and DeepSeek rejects it with code 11155.
+  const openReasoning = () => {
+    if (rOpen || !reasoning.trim()) return;
+    rOpen = true;
+    rIndex = openItem();
+    emit("response.output_item.added", {
+      type: "response.output_item.added",
+      output_index: rIndex,
+      item: { type: "reasoning", id: rId, summary: [] },
       sequence_number: seq++,
     });
   };
@@ -280,35 +301,20 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
       }
       const items2 = items.filter(Boolean);
       const msg = items2.find((it) => it.type === "message");
-            const output = msg ? [msg, ...out] : out;
-      if (reasoning.trim()) {
-        output.unshift({
-          type: "reasoning",
-          id: "rs_" + Math.random().toString(36).slice(2, 14),
-          summary: [],
-          content: [{ type: "reasoning_text", text: reasoning }],
-        });
-      }
+      const rItemNs = reasoning.trim()
+        ? { type: "reasoning", id: rId, summary: [], content: [{ type: "reasoning_text", text: reasoning }] }
+        : null;
+      const output = rItemNs
+        ? (msg ? [rItemNs, msg, ...out] : [rItemNs, ...out])
+        : (msg ? [msg, ...out] : out);
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
       if (onUsage) try { onUsage(usage); } catch {}
       res.end(JSON.stringify({ ...base, status: "completed", output, usage }));
       return;
     }
-    // Emit the accumulated reasoning as a real `reasoning` item. Without this,
-    // codex never records reasoning for a bridged (wb2api) turn, so the next
-    // request replays a history with tool_calls but no reasoning and DeepSeek
-    // rejects it: code 11155 "the reasoning content from the previous turn must
-    // be passed back in thinking mode" (wb2api surfaces it as 503). The variable
-    // was already being accumulated from the upstream deltas but never emitted.
-    if (reasoning.trim()) {
-      const rIdx = openItem();
-      const rId = "rs_" + Math.random().toString(36).slice(2, 14);
-      emit("response.output_item.added", {
-        type: "response.output_item.added",
-        output_index: rIdx,
-        item: { type: "reasoning", id: rId, summary: [] },
-        sequence_number: seq++,
-      });
+    // Close the reasoning item before the message/function_call items so the
+    // final `output` array is [reasoning, ..] as codex expects.
+    if (rOpen) {
       const rItem = {
         type: "reasoning",
         id: rId,
@@ -317,11 +323,11 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
       };
       emit("response.output_item.done", {
         type: "response.output_item.done",
-        output_index: rIdx,
+        output_index: rIndex,
         item: rItem,
         sequence_number: seq++,
       });
-      placeItem(rIdx, rItem);
+      placeItem(rIndex, rItem);
     }
     closeMessage();
     for (const c of calls.values()) {
@@ -385,7 +391,10 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
       }
       const d = j.choices?.[0]?.delta;
       if (!d) continue;
-      if (d.reasoning_content) reasoning += d.reasoning_content;
+      if (d.reasoning_content) {
+        reasoning += d.reasoning_content;
+        openReasoning(); // claims index 0 before any call/message
+      }
       if (d.content) {
         openMessage();
         text += d.content;
