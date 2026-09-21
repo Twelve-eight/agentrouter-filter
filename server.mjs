@@ -23,11 +23,12 @@
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
-import { pathToFileURL } from "node:url";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { filterBody } from "./filter.mjs";
 import { bridgeAnthropicStream, bridgeChatStream, toAnthropicBody, toChatBody } from "./bridge.mjs";
-import { record as recordUsage, read as readUsage, summarize as summarizeUsage } from "./usage.mjs";
-import { priceInfo } from "./pricing.mjs";
+import { record as recordUsage } from "./usage.mjs";
+import { statsApi } from "./stats-api.mjs";
 
 // Per-provider credentials for upstreams whose key is not already in the
 // machine/user environment (agentrouter's is Machine-scoped; justwoker's could
@@ -113,14 +114,20 @@ const ROUTES = {
 // ---------------------------------------------------------------------------
 const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", wb2api: "WB", anyrouter: "AN", justwoker: "JW" };
 
-// Read per request, not at module load: the dashboard is a local file that gets
-// edited, and caching it here meant every HTML fix required a gateway restart.
-const STATS_HTML_PATH = new URL("./stats.html", import.meta.url);
-const statsHtml = () => fs.readFileSync(STATS_HTML_PATH, "utf8");
+// omp's own dashboard client (MIT), vendored from its embedded-client blob. Served
+// as static files so the browser loads index.js/styles.css relative to /stats/.
+// Read per request, not at module load: the vendored files get swapped when the
+// UI is refreshed, and caching them here would make that require a gateway restart.
+const STATS_CLIENT_DIR = fileURLToPath(new URL("./vendor/omp-stats/", import.meta.url));
+const STATS_CLIENT_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+};
 
 const REGISTRY_PATH = new URL("./providers.json", import.meta.url);
 
-// Read per request, not at module load - same reasoning as statsHtml above. A
+// Read per request, not at module load - same reasoning as the stats client above. A
 // module-load read meant adding a model to providers.json silently required a
 // gateway restart, and the failure mode is nasty: the model is already in the
 // picker (the catalog builder reads the same file directly) so selecting it
@@ -285,31 +292,52 @@ function request(url, { method, headers, body, proxy }) {
 
 const server = http.createServer(async (req, res) => {
   try {
-  // Usage dashboard. Served from this process so there is no second thing to
-  // start; it reads the same JSONL the accounting writes.
+  // Usage dashboard. The UI is omp's own React client (MIT, vendored under
+  // vendor/omp-stats/) and the data comes from stats-api.mjs, which maps this
+  // gateway's usage log onto the API contract that client expects. Kept on the
+  // gateway process so there is no second thing to start.
   if (req.method === "GET" && (req.url === "/stats" || req.url === "/stats/")) {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
-    res.end(statsHtml());
+    res.writeHead(302, { Location: "/stats/index.html", "Cache-Control": "no-cache" });
+    res.end();
     return;
   }
-  if (req.method === "GET" && req.url.startsWith("/stats/data")) {
+  if (req.method === "GET" && req.url.startsWith("/stats/")) {
+    const rel = decodeURIComponent(req.url.slice("/stats/".length).split("?")[0]);
+    // Contain the path: a request for /stats/../../server.mjs must not escape the
+    // vendored client directory.
+    const full = path.join(STATS_CLIENT_DIR, rel);
+    const type = STATS_CLIENT_TYPES[path.extname(full).toLowerCase()];
+    if (!type || !full.startsWith(STATS_CLIENT_DIR)) {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("not found");
+      return;
+    }
+    let body;
+    try {
+      // Read per request, like the registry above: the vendored files are swapped
+      // during development and a cached copy would keep serving the old client.
+      body = fs.readFileSync(full);
+    } catch {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("not found");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": type, "Cache-Control": "no-cache" });
+    res.end(body);
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/")) {
     const q = new URL(req.url, "http://127.0.0.1");
-    const days = Math.min(Math.max(Number(q.searchParams.get("days")) || 7, 1), 365);
-    const rows = readUsage(days);
-    const summary = summarizeUsage(rows);
-    // Most recent first, capped: the table is for inspection, not pagination.
-    // read() returns [today oldest->newest, yesterday oldest->newest, ..], so
-    // neither end of the array is "most recent". Sort explicitly rather than
-    // relying on the iteration order - slicing the tail showed the oldest rows.
-    const recent = rows
-      .slice()
-      .sort((a, b) => String(b.ts ?? "").localeCompare(String(a.ts ?? "")))
-      .slice(0, 200);
+    const payload = statsApi(q.pathname, q.searchParams);
+    if (payload === null) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unknown endpoint" }));
+      return;
+    }
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
-    res.end(JSON.stringify({ days, summary, recent, pricing: priceInfo() }));
+    res.end(JSON.stringify(payload));
     return;
   }
-
   const m = req.url.match(/^\/(ar|rc|wb|an|jw|u)(\/.*)$/);
   if (!m) {
     res.writeHead(404, { "Content-Type": "text/plain" });
