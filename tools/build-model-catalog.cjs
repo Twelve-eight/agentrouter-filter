@@ -147,7 +147,7 @@ const ours = Object.entries(REGISTRY.models)
     const upstream = spec.m ?? slug;
     return entry(
       slug,
-      `${slug} (via ${prov})`,
+      `${spec.m ?? slug} (via ${prov})`,
       `${upstream} served by ${prov} through the local gateway`,
       EFF[slug] ?? EFFORTS_DEFAULT,
       CTX[slug] ?? CTX_DEFAULT,
