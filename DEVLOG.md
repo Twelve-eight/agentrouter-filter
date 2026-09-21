@@ -346,3 +346,59 @@ config.toml,**用户在选择器里点回自己的模型仍会被静默降成 `l
 - `gpt-5.5` / `gpt-5.4` 归一为 `xhigh`,与其支持集一致.
 
 **归一后全目录默认档**:24 条为 `max`,2 条(`gpt-5.5`/`gpt-5.4`)为 `xhigh`.
+
+## 2026-09-21:统一网关(/u) -- 一个端点、一个 key、所有提供商
+
+### 目标
+解决"本机调用任何 API"的问题:不再一个上游配一个 codex provider,而是**单一端点**
+`http://127.0.0.1:7878/u/v1`,客户端选模型,网关按请求体里的 `model` 字段分派.
+
+### 结构
+- **`providers.json` 是唯一真源**:哪个上游服务哪个模型、是否原生 responses、
+  是否需要 agentrouter 过滤、key 存在哪个环境变量.
+- `tools/build-model-catalog.cjs` 现在读**同一个文件**,所以 picker 与网关
+  **不可能漂移**(此前是两份手工维护的列表).
+- 路由:
+  | 路径 | 用途 |
+  |---|---|
+  | `/u/v1/*` | **统一路由**(按模型分派) |
+  | `/u/v1/models` | 聚合模型清单(26 条) |
+  | `/ar` `/rc` `/wb` `/an` | 原逐提供商路由,保留用于钉住某上游 |
+
+### 构建中发现并修掉的三个真缺陷
+1. **凭据未按提供商替换**(advisor 指出).统一客户端只发**一个** key,但各上游 key 不同
+   -- agentrouter 的 key 打到本地 wb2api 会 401 `missing or invalid API key`.
+   `keyEnv` 此前是**死字段**(全仓只有 providers.json 出现,`providerFor()` 不读它).
+   现按上游替换凭据.**实测**:单个 `AGENTROUTER_API_KEY` 打通
+   agentrouter / relaycat-cn / wb2api 三家,**20/26 模型 OK**;6 个失败项经
+   **逐提供商路由直连对比状态码一致**,确认是上游侧(402/503),非网关缺陷.
+2. **`stream:false` 返回 `text/event-stream`**.桥接无条件写 SSE 头且只发事件.
+   codex 恒为流式所以从未暴露,但 curl/SDK 这类客户端会拿到事件流.
+   现非流式返回**单个 JSON 体**;上游错误路径也返回 JSON 错误而非空 body.
+3. **`AR_UPSTREAM_<PROVIDER>` 覆盖不生效**.注册表派生的路由只读旧的按前缀名
+   (`AR_UPSTREAM_AR`),导致测试覆盖**静默打到真实上游**(实测:指向本地 echo 却仍
+   访问 ps.air-outer.com).现两种拼写都支持.
+
+### 过滤作用域(保持)
+`/u` **只对 agentrouter 应用** `filter.mjs`.用本地 echo 上游实测抓包:
+- agentrouter 模型:`instructions` 被改写为
+  `"You are Codex, an official CLI coding agent."`,并追加
+  `Additional requirements for this provider. ..`;
+- wb2api 模型经**同一路由**运行,日志无 `filter rewrote`,未过滤.
+
+### 验证
+```
+codex exec -c model_provider=gateway -c model=deepseek-v4-flash   -> PONG (agentrouter)
+codex exec -c model_provider=gateway -c model=global:kimi-k3      -> PONG (wb2api)
+codex exec -c model_provider=gateway -c model=gpt-6-astra         -> PONG (relaycat)
+GET /u/v1/models -> 26 条
+<default> / -p ar-ds / -p rc-ds / -p wb-ds -> 全部 PONG(逐提供商路由未回归)
+node tools/diff-test.mjs -> 0 mismatches;test-bridge-indices.mjs -> PASS
+```
+
+### 未验证
+- `claude-opus-4-8/5`、`glm-5.3`(agentrouter)仍 503/402,是**上游侧**;两处 DEVLOG
+  记录已按实测统一(两者在 responses 面均为 503,与不存在的模型同码,故
+  "仅 anthropic-messages 面"一说**不成立**,已更正).
+- relaycat 的 `gpt-5.4`/`gpt-5.2`/`gpt-5.6-luna`/`gpt-5.3-codex` 当前 502/503,
+  直连与经网关状态码一致.
