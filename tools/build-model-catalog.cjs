@@ -207,6 +207,16 @@ for (const m of merged.models) {
   const best = PREFERENCE.find((e) => supported.includes(e)) ?? supported[supported.length - 1];
   m.default_reasoning_level = best;
 }
+// Name the upstream on every entry. The built-in entries are taken verbatim from
+// codex, so their display names are bare ("GPT-6-Astra") - ambiguous here, where
+// relaycat / agentrouter / anyrouter / wb2api all serve the same model id. Entries
+// that already say "(via X)" are left exactly as they are.
+for (const m of merged.models) {
+  if (/\(via /.test(m.display_name ?? "")) continue;
+  const prov = REGISTRY.models[m.slug]?.p;
+  if (prov) m.display_name = `${m.display_name} (via ${prov})`;
+}
+
 fs.writeFileSync(OUT, JSON.stringify(merged, null, 2) + '\n');
 
 console.log(`built-in: ${keptBuiltins.length} of ${builtin.models.length} (registry-routed)`);
