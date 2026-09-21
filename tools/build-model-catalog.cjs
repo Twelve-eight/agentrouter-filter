@@ -98,10 +98,26 @@ function entry(slug, display, description, efforts, contextWindow) {
 // derived from the provider so the origin stays visible in the picker.
 const REGISTRY = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "providers.json"), "utf8"));
 
-// Per-provider context windows. Only set where it is actually known; everything
-// else gets the conservative default rather than a made-up number.
-const CONTEXT = { relaycat: 400000, wb2api: 1000000 };
-const CTX_DEFAULT = 200000;
+// Context windows. wb2api publishes a real `context_length` per model, so it is
+// queried rather than guessed (a fabricated 1M would stop codex compacting in
+// time and long sessions would hit the upstream limit - a short test cannot
+// show that). Providers that publish nothing fall back to CTX_DEFAULT, which is
+// marked unverified rather than presented as measured.
+const CTX_DEFAULT = 200000; // UNVERIFIED for providers that publish no context size
+const CTX = {};
+try {
+  const raw = require("node:child_process").execFileSync(
+    "curl",
+    ["-s", "-m", "20", "http://127.0.0.1:7863/v1/models", "-H", `Authorization: Bearer ${process.env.WORKBUDDY_API_KEY ?? "sk-workbuddy"}`],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  for (const m of JSON.parse(raw).data ?? []) {
+    if (m.context_length > 0) CTX[m.id] = m.context_length;
+  }
+  console.log(`context windows: ${Object.keys(CTX).length} from wb2api`);
+} catch (e) {
+  console.log(`context windows: wb2api unreachable (${e?.message?.slice(0, 40)}); using defaults`);
+}
 
 // Reasoning levels offered per provider. agentrouter/wb2api accept all four
 // (probed); relaycat's entries keep their own built-in sets and are excluded
@@ -118,7 +134,7 @@ const ours = Object.entries(REGISTRY.models)
       `${slug} (via ${prov})`,
       `${upstream} served by ${prov} through the local gateway`,
       EFFORTS,
-      CONTEXT[prov] ?? CTX_DEFAULT,
+      CTX[slug] ?? CTX_DEFAULT,
     );
   })
   // The registry also lists codex's built-in slugs (the gateway must route them),
@@ -142,7 +158,14 @@ const have = new Set(builtin.models.map((m) => m.slug));
 const added = ours.filter((m) => !have.has(m.slug));
 const collisions = ours.filter((m) => have.has(m.slug));
 
-const merged = { models: [...builtin.models, ...added] };
+// Only built-ins the registry can route: the picker must never offer a model
+// that /u would answer 404 for. (codex-auto-review, gpt-daybreak-* were listed
+// by codex but served by nobody; codex-auto-review is now in the registry.)
+const ROUTED = new Set(Object.keys(REGISTRY.models).filter((k) => REGISTRY.models[k] && typeof REGISTRY.models[k] === "object"));
+const droppedBuiltins = builtin.models.filter((m) => !ROUTED.has(m.slug)).map((m) => m.slug);
+const keptBuiltins = builtin.models.filter((m) => ROUTED.has(m.slug));
+
+const merged = { models: [...keptBuiltins, ...added] };
 
 // 4) Normalize the default reasoning level across the WHOLE catalog, built-ins
 //    included.
@@ -167,7 +190,8 @@ for (const m of merged.models) {
 }
 fs.writeFileSync(OUT, JSON.stringify(merged, null, 2) + '\n');
 
-console.log(`built-in: ${builtin.models.length}`);
+console.log(`built-in: ${keptBuiltins.length} of ${builtin.models.length} (registry-routed)`);
+if (droppedBuiltins.length) console.log(`dropped (no provider serves them): ${droppedBuiltins.join(', ')}`);
 console.log(`added:    ${added.length} -> ${added.map((m) => m.slug).join(', ')}`);
 console.log(`total:    ${merged.models.length}`);
 console.log(`written:  ${OUT}`);

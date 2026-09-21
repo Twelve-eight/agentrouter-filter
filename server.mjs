@@ -176,6 +176,7 @@ function request(url, { method, headers, body, proxy }) {
 // ---------------------------------------------------------------------------
 
 const server = http.createServer(async (req, res) => {
+  try {
   const m = req.url.match(/^\/(ar|rc|wb|an|u)(\/.*)$/);
   if (!m) {
     res.writeHead(404, { "Content-Type": "text/plain" });
@@ -183,8 +184,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   const [, prefix, rest] = m;
+  // A client that disconnects mid-request makes this throw, and the handler is
+  // async (an unawaited rejection exits Node). This gateway is the only entry
+  // point for every local client, so one bad request must not take it down.
   const chunks = [];
-  for await (const c of req.chunks ?? req) chunks.push(c);
+  try {
+    for await (const c of req.chunks ?? req) chunks.push(c);
+  } catch (e) {
+    log(`request aborted while reading body: ${e?.message ?? e}`);
+    try {
+      res.destroy();
+    } catch {}
+    return;
+  }
   const raw = Buffer.concat(chunks);
 
   // Forward the identity headers Codex sends. agentrouter's client allowlist
@@ -350,7 +362,20 @@ const server = http.createServer(async (req, res) => {
     "Cache-Control": "no-cache",
   });
   upstream.pipe(res);
+  } catch (e) {
+    // Last-resort guard: keep the process alive and tell the client what broke.
+    log(`!! unhandled error in handler: ${e?.stack ?? e}`);
+    try {
+      if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: String(e?.message ?? e), type: "gateway_error" } }));
+    } catch {}
+  }
 });
+
+// Node exits on an unhandled rejection by default. Never let that happen here:
+// this process serves every local client.
+process.on("unhandledRejection", (e) => log(`!! unhandledRejection: ${e?.stack ?? e}`));
+process.on("uncaughtException", (e) => log(`!! uncaughtException: ${e?.stack ?? e}`));
 
 server.on("error", (e) => {
   // A second instance (typically the autostart copy) already owns the port.
