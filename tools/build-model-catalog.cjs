@@ -157,6 +157,25 @@ try {
 // and that wins (see EFF above).
 const EFFORTS_DEFAULT = ["low", "medium", "high", "max"];
 
+// Last-known context windows, read back from the catalog this script previously
+// wrote. Needed because the live sources are not always complete: wb2api lists
+// only the models whose account pool is currently healthy, so while the global
+// accounts are cooling its global:* entries vanish from /v1/models and every one
+// of them silently fell back to CTX_DEFAULT (200000 instead of 1000000) - which
+// then made them compact at ~190k. Precedence keeps live data authoritative
+// (CTX > CTX_YML > CTX_PREV > default), so a genuine upstream correction still
+// wins; this only fills gaps a temporary outage would otherwise turn into a
+// permanent downgrade.
+const CTX_PREV = {};
+try {
+  const prev = JSON.parse(fs.readFileSync(OUT, "utf8"));
+  for (const m of prev.models ?? []) {
+    if (m.slug && m.context_window > 0) CTX_PREV[m.slug] = m.context_window;
+  }
+} catch {
+  // no previous catalog (first run) - nothing to remember
+}
+
 const ours = Object.entries(REGISTRY.models)
   .filter(([, v]) => v && typeof v === "object")
   .map(([slug, spec]) => {
@@ -167,7 +186,7 @@ const ours = Object.entries(REGISTRY.models)
       `${spec.m ?? slug} (via ${prov})`,
       `${upstream} served by ${prov} through the local gateway`,
       EFF[slug] ?? EFFORTS_DEFAULT,
-      CTX[slug] ?? CTX_YML[spec.m ?? slug] ?? CTX_YML[slug] ?? CTX_DEFAULT,
+      CTX[slug] ?? CTX_YML[spec.m ?? slug] ?? CTX_YML[slug] ?? CTX_PREV[slug] ?? CTX_DEFAULT,
     );
   })
   // The registry also lists codex's built-in slugs (the gateway must route them),
@@ -229,7 +248,7 @@ for (const m of merged.models) {
 // models.yml records what the upstream actually accepts (1050000). Leaving the
 // smaller value makes codex compact long before it has to.
 for (const m of merged.models) {
-  const real = CTX_YML[m.slug];
+  const real = CTX_YML[m.slug] ?? CTX_PREV[m.slug];
   if (real && real > (m.context_window ?? 0)) {
     m.context_window = real;
     m.max_context_window = Math.max(real, m.max_context_window ?? 0);
@@ -244,6 +263,30 @@ for (const m of merged.models) {
   if (/\(via /.test(m.display_name ?? "")) continue;
   const prov = REGISTRY.models[m.slug]?.p;
   if (prov) m.display_name = `${m.display_name} (via ${prov})`;
+}
+
+// 5) Per-model auto-compaction limits.
+//
+//    WHY PER-MODEL: the global `model_auto_compact_token_limit` in config.toml
+//    OVERRIDES any per-entry value (measured: per-entry 1000 with global 300000
+//    never compacted; the same entry with the global key absent compacted
+//    immediately). So a single global number cannot express "astra compacts at
+//    260k, everything else at 500k" - the global key has to stay unset and every
+//    entry carries its own value. Defaults > global > per-entry is the precedence.
+//
+//    WHY astra IS LOWER: the agentrouter astra route starts failing once a thread
+//    grows past roughly a quarter million tokens, so it compacts earlier than the
+//    models that tolerate more.
+const COMPACT_ASTRA = 260000;
+const COMPACT_DEFAULT = 500000;
+for (const m of merged.models) {
+  const limit = /astra/.test(m.slug) ? COMPACT_ASTRA : COMPACT_DEFAULT;
+  // Never let the threshold exceed the window: codex compacts when the context
+  // passes this limit, so a limit above context_window would mean the compaction
+  // can never fire and the request dies at the upstream instead. Clamp to the
+  // window minus a margin for the reply, since the limit counts input only.
+  const window = m.context_window ?? 0;
+  m.auto_compact_token_limit = window ? Math.min(limit, Math.max(1000, window - 8192)) : limit;
 }
 
 fs.writeFileSync(OUT, JSON.stringify(merged, null, 2) + '\n');
