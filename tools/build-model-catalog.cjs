@@ -279,14 +279,24 @@ for (const m of merged.models) {
 //    models that tolerate more.
 const COMPACT_ASTRA = 260000;
 const COMPACT_DEFAULT = 500000;
+// Reply headroom. The limit counts input only, so the threshold has to sit far
+// enough below the window that the model still has room to answer.
+const REPLY_MARGIN = 8192;
 for (const m of merged.models) {
   const limit = /astra/.test(m.slug) ? COMPACT_ASTRA : COMPACT_DEFAULT;
-  // Never let the threshold exceed the window: codex compacts when the context
-  // passes this limit, so a limit above context_window would mean the compaction
-  // can never fire and the request dies at the upstream instead. Clamp to the
-  // window minus a margin for the reply, since the limit counts input only.
+  // Never let the threshold exceed the window codex will ACTUALLY use. Codex
+  // applies effective_context_window_percent (95 on every entry here) before
+  // comparing against this limit, so clamping to the raw context_window still
+  // left six entries unreachable: 191808 against an effective 190000 (gpt-5.2,
+  // gpt-5.3-codex), 263808 against 258400 (gpt-5.6-luna, codex-auto-review,
+  // global:gpt-5.3-codex) and 500000 against 486400 (cn:minimax-m3). A limit
+  // above the effective window means compaction can never fire before the
+  // request is already over the window - exactly the failure this clamp exists
+  // to prevent.
   const window = m.context_window ?? 0;
-  m.auto_compact_token_limit = window ? Math.min(limit, Math.max(1000, window - 8192)) : limit;
+  const pct = m.effective_context_window_percent ?? 100;
+  const effective = Math.floor((window * pct) / 100);
+  m.auto_compact_token_limit = effective ? Math.min(limit, Math.max(1000, effective - REPLY_MARGIN)) : limit;
 }
 
 fs.writeFileSync(OUT, JSON.stringify(merged, null, 2) + '\n');
