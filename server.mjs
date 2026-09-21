@@ -25,9 +25,40 @@ import http from "node:http";
 import https from "node:https";
 import { pathToFileURL } from "node:url";
 import { filterBody } from "./filter.mjs";
-import { bridgeChatStream, toChatBody } from "./bridge.mjs";
+import { bridgeAnthropicStream, bridgeChatStream, toAnthropicBody, toChatBody } from "./bridge.mjs";
 import { record as recordUsage, read as readUsage, summarize as summarizeUsage } from "./usage.mjs";
 import { priceInfo } from "./pricing.mjs";
+
+// Per-provider credentials for upstreams whose key is not already in the
+// machine/user environment (agentrouter's is Machine-scoped; justwoker's could
+// not be, since setting Machine scope needs admin). Kept in a gitignored file so
+// the secret never reaches the repository, and loaded BEFORE the registry is read
+// because providerFor() resolves keys from process.env.
+//
+// Format: KEY=value per line, `#` comments, surrounding quotes stripped.
+function loadLocalEnv() {
+  const file = new URL("./.env.local", import.meta.url);
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return; // no local overrides - environment alone is fine
+  }
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const eq = t.indexOf("=");
+    if (eq < 1) continue;
+    const key = t.slice(0, eq).trim();
+    let value = t.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    // A real environment variable wins, so an explicit override still works.
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+}
+loadLocalEnv();
 
 const PORT = Number(process.env.AR_GATEWAY_PORT ?? 7878);
 const HOST = "127.0.0.1";
@@ -65,6 +96,11 @@ const ROUTES = {
   // certificate verification error"); it needs the local HTTP proxy. The proxy
   // is applied per-route so agentrouter (which hangs through it) stays direct.
   an: { name: "anyrouter", base: process.env.AR_UPSTREAM_AN ?? "https://anyrouter.top", chat: false, proxy: process.env.AR_PROXY_AN ?? "http://127.0.0.1:7897" },
+  // justwoker serves Claude models on the anthropic wire. Its
+  // /v1/chat/completions exists but Cloudflare blocks every POST to it (403
+  // "Attention Required!"; GET /v1/models passes), and /v1/responses is
+  // "not implemented" - so the anthropic bridge is the only working path.
+  jw: { name: "justwoker", base: process.env.AR_UPSTREAM_JW ?? "https://api.justwoker.icu", anthropic: true },
 };
 
 // ---------------------------------------------------------------------------
@@ -75,7 +111,7 @@ const ROUTES = {
 // tools/build-model-catalog.cjs reads, so the picker and the gateway cannot
 // disagree about which models exist or where they go.
 // ---------------------------------------------------------------------------
-const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", wb2api: "WB", anyrouter: "AN" };
+const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", wb2api: "WB", anyrouter: "AN", justwoker: "JW" };
 
 // Read per request, not at module load: the dashboard is a local file that gets
 // edited, and caching it here meant every HTML fix required a gateway restart.
@@ -99,6 +135,7 @@ function providerFor(model) {
       ?? process.env[`AR_UPSTREAM_${ROUTE_PREFIX[spec.p] ?? ""}`]
       ?? p.base,
     chat: p.wire === "chat",
+    anthropic: p.wire === "anthropic",
     filter: p.filter === true,
     proxy: p.proxy,
     // Upstream model id, when it differs from the id the client sent.
@@ -119,6 +156,26 @@ function modelList() {
   return Object.entries(REGISTRY.models)
     .filter(([, v]) => v && typeof v === "object")
     .map(([id, v]) => ({ id, object: "model", owned_by: v.p }));
+}
+
+// The anthropic wire authenticates with `x-api-key` and requires
+// `anthropic-version`; a Bearer Authorization header is ignored (probe-verified:
+// /v1/messages with x-api-key returned 200, the same call with Bearer 403'd at
+// Cloudflare). Codex sends `Authorization: Bearer ..`, so translate rather than
+// forward.
+function anthropicHeaders(headers) {
+  const out = { "Content-Type": "application/json", "anthropic-version": "2023-06-01" };
+  const bearer = headers.authorization?.replace(/^Bearer\s+/i, "");
+  const key = headers["x-api-key"] ?? bearer;
+  if (key) out["x-api-key"] = key;
+  // `accept` is deliberately NOT forwarded. This upstream sits behind
+  // Cloudflare, and an explicit `accept: */*` intermittently drew a 403
+  // "Attention Required!" page (measured: same body, same key, 1/3 requests
+  // failed with it, 0/3 without). Nothing here needs content negotiation.
+  for (const h of ["originator", "version", "session_id", "user-agent"]) {
+    if (headers[h] !== undefined) out[h] = headers[h];
+  }
+  return out;
 }
 function log(...a) {
   process.stdout.write(`[${new Date().toISOString()}] ${a.join(" ")}\n`);
@@ -213,7 +270,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const m = req.url.match(/^\/(ar|rc|wb|an|u)(\/.*)$/);
+  const m = req.url.match(/^\/(ar|rc|wb|an|jw|u)(\/.*)$/);
   if (!m) {
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");
@@ -295,6 +352,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   const isChatUpstream = route.chat;
+  const isAnthropicUpstream = route.anthropic;
 
   // The model the client asked for. On the unified route `route.upstreamModel` is
   // set by the registry; on the per-prefix routes the registry is not consulted,
@@ -392,6 +450,57 @@ const server = http.createServer(async (req, res) => {
     }
     const t0 = Date.now();
     bridgeChatStream(upstream, res, parsed.model, parsed.reasoning?.effort, parsed.stream !== false, (u) => {
+      recordUsage({
+        route: prefix,
+        provider: route.name,
+        model: parsed.model,
+        effort: parsed.reasoning?.effort ?? null,
+        ok: true,
+        duration_ms: Date.now() - t0,
+        input_tokens: u?.input_tokens ?? 0,
+        output_tokens: u?.output_tokens ?? 0,
+        reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
+        cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
+      });
+    });
+    return;
+  }
+
+  if (isResponses && isAnthropicUpstream) {
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "bad json" } }));
+      return;
+    }
+    const msg = toAnthropicBody(parsed, parsed.model);
+    log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${msg.messages.length} tools=${msg.tools?.length ?? 0}`);
+    let upstream;
+    try {
+      upstream = await request(route.base + "/v1/messages", {
+        method: "POST",
+        headers: anthropicHeaders(headers),
+        body: JSON.stringify(msg),
+        proxy: route.proxy,
+      });
+    } catch (e) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: String(e?.message ?? e) } }));
+      return;
+    }
+    if (upstream.statusCode >= 400) {
+      const errChunks = [];
+      for await (const c of upstream) errChunks.push(c);
+      const text = Buffer.concat(errChunks).toString("utf8");
+      log(`bridge upstream ${upstream.statusCode}: ${text.slice(0, 200)}`);
+      res.writeHead(upstream.statusCode, { "Content-Type": "application/json" });
+      res.end(text);
+      return;
+    }
+    const t0 = Date.now();
+    bridgeAnthropicStream(upstream, res, parsed.model, parsed.stream !== false, (u) => {
       recordUsage({
         route: prefix,
         provider: route.name,

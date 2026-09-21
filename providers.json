@@ -41,6 +41,11 @@
       "wire": "responses",
       "keyEnv": "ANYROUTER_API_KEY",
       "proxy": "http://127.0.0.1:7897"
+    },
+    "justwoker": {
+      "base": "https://api.justwoker.icu",
+      "wire": "anthropic",
+      "keyEnv": "JUSTWOKER_API_KEY"
     }
   },
   "_models_comment": [
@@ -139,6 +144,9 @@
     "gpt-5.6-sol-ar": {
       "p": "agentrouter",
       "m": "gpt-5.6-sol"
+    },
+    "claude-opus-4-8": {
+      "p": "justwoker"
     }
   },
   "_removed_comment": "claude-opus-4-8 / claude-opus-5 were removed: agentrouter registers them only on the anthropic-messages face (messages=402 quota, responses=503 while a nonexistent model is 503 on both), and codex speaks only responses, so selecting them always failed. Re-add if a responses->messages bridge is built."

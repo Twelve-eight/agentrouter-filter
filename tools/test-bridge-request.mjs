@@ -174,4 +174,155 @@ await (async () => {
   });
 })();
 
+// --- anthropic wire (justwoker) -----------------------------------------------
+// The anthropic bridge has its own request shape and its own SSE dialect, so the
+// chat-side checks above prove nothing about it. Both bugs these guard against
+// are silent: a mis-shaped request is a 400 from the upstream, and a mis-ordered
+// stream makes codex drop the turn (observed as repeated identical resends)
+// rather than error.
+import { toAnthropicBody, bridgeAnthropicStream } from "../bridge.mjs";
+
+check("anthropic: system is top-level, not a message", () => {
+  const b = toAnthropicBody(
+    { instructions: "be terse", input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] },
+    "claude-opus-4-8",
+  );
+  assert.strictEqual(b.system, "be terse");
+  assert.ok(!b.messages.some((m) => m.role === "system"), "system must not appear as a message");
+  assert.strictEqual(b.messages[0].role, "user");
+});
+
+check("anthropic: tools use input_schema and tool_choice is an object", () => {
+  const b = toAnthropicBody(
+    {
+      instructions: "x",
+      tool_choice: "required",
+      tools: [{ type: "function", name: "f", description: "d", parameters: { type: "object", properties: {} } }],
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+    },
+    "m",
+  );
+  assert.strictEqual(b.tools[0].input_schema.type, "object");
+  assert.strictEqual(b.tools[0].function, undefined, "must not carry the chat-style `function` wrapper");
+  assert.deepStrictEqual(b.tool_choice, { type: "any" });
+});
+
+check("anthropic: parallel calls collapse into ONE assistant, results into ONE user", () => {
+  const b = toAnthropicBody(
+    {
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "do both" }] },
+        call("c1", "exec"),
+        call("c2", "list"),
+        out("c1"),
+        out("c2"),
+      ],
+    },
+    "m",
+  );
+  const assistants = b.messages.filter((m) => m.role === "assistant");
+  assert.strictEqual(assistants.length, 1, `expected 1 assistant, got ${assistants.length}`);
+  assert.deepStrictEqual(assistants[0].content.map((c) => c.type), ["tool_use", "tool_use"]);
+  const users = b.messages.filter((m) => m.role === "user");
+  assert.strictEqual(users.length, 2, "the prompt turn plus ONE tool_result turn");
+  assert.deepStrictEqual(users[1].content.map((c) => c.type), ["tool_result", "tool_result"]);
+  // alternating roles is what the wire requires
+  const roles = b.messages.map((m) => m.role);
+  for (let i = 1; i < roles.length; i++) {
+    assert.notStrictEqual(roles[i], roles[i - 1], `roles must alternate, got ${roles.join(",")}`);
+  }
+});
+
+check("anthropic: reasoning is dropped, not sent as an unsigned thinking block", () => {
+  const b = toAnthropicBody(
+    {
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+        reasoning("I should call the tool"),
+        call("c1", "exec"),
+        out("c1"),
+      ],
+    },
+    "m",
+  );
+  const flat = JSON.stringify(b.messages);
+  assert.ok(!/thinking/.test(flat), "a thinking block without a signature is rejected upstream");
+  assert.ok(!/I should call the tool/.test(flat), "reasoning text must not leak into a text block");
+});
+
+check("anthropic: tool arguments string is parsed into input", () => {
+  const b = toAnthropicBody(
+    {
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
+        { type: "function_call", call_id: "c1", name: "f", arguments: '{"city":"Paris"}' },
+      ],
+    },
+    "m",
+  );
+  const tu = b.messages.flatMap((m) => m.content).find((c) => c.type === "tool_use");
+  assert.ok(tu, "tool_use block missing");
+  assert.deepStrictEqual(tu.input, { city: "Paris" });
+  assert.strictEqual(tu.id, "c1");
+});
+
+function runAnthropic(chunks, stream = true) {
+  const out = [];
+  let body = null;
+  const res = { writeHead() {}, write(s) { out.push(s); }, end(s) { if (s) body = s; } };
+  bridgeAnthropicStream(Readable.from(chunks), res, "m", stream, null);
+  return new Promise((r) => setTimeout(() => r({ text: out.join(""), body }), 60));
+}
+
+const AN_CHUNKS = [
+  'data: {"type":"message_start","message":{"usage":{"input_tokens":11,"output_tokens":0}}}\n\n',
+  'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+  'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"consider this"}}\n\n',
+  'data: {"type":"content_block_stop","index":0}\n\n',
+  'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+  'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}\n\n',
+  'data: {"type":"content_block_stop","index":1}\n\n',
+  'data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_9","name":"get_weather","input":{}}}\n\n',
+  'data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\":\\"Par"}}\n\n',
+  'data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"is\\"}"}}\n\n',
+  'data: {"type":"content_block_stop","index":2}\n\n',
+  'data: {"type":"message_delta","usage":{"output_tokens":7}}\n\n',
+  'data: {"type":"message_stop"}\n\n',
+];
+
+await (async () => {
+  const { text } = await runAnthropic(AN_CHUNKS);
+  check("anthropic streaming: reasoning opens before message and function_call", () => {
+    const order = [...text.matchAll(/"output_index":(\d+),"item":\{"type":"([a-z_]+)"/g)].map((m) => m[2] + "#" + m[1]);
+    assert.strictEqual(order[0], "reasoning#0", "reasoning must claim index 0, got " + order.join(" -> "));
+    assert.strictEqual(order[1], "message#1", "message must follow reasoning, got " + order.join(" -> "));
+    assert.strictEqual(order[2], "function_call#2", "function_call must follow the message, got " + order.join(" -> "));
+  });
+
+  check("anthropic streaming: tool input fragments are reassembled", () => {
+    const done = [...text.matchAll(/data: (\{"type":"response\.function_call_arguments\.done".*?\})\n\n/g)];
+    assert.strictEqual(done.length, 1, "expected exactly one arguments.done event");
+    assert.strictEqual(JSON.parse(done[0][1]).arguments, '{"city":"Paris"}');
+  });
+
+  check("anthropic streaming: usage maps input+output tokens", () => {
+    const m = text.match(/data: (\{"type":"response\.completed".*?\})\n\n/s);
+    assert.ok(m, "response.completed missing");
+    const u = JSON.parse(m[1]).response.usage;
+    assert.strictEqual(u.input_tokens, 11);
+    assert.strictEqual(u.output_tokens, 7);
+    assert.strictEqual(u.total_tokens, 18);
+  });
+
+  const { body } = await runAnthropic(AN_CHUNKS, false);
+  check("anthropic non-streaming: JSON body with the same item order", () => {
+    const j = JSON.parse(body);
+    assert.strictEqual(j.status, "completed");
+    const types = j.output.map((o) => o.type);
+    assert.deepStrictEqual(types, ["reasoning", "message", "function_call"], "got " + types.join(","));
+    assert.strictEqual(j.output[1].content[0].text, "hello");
+    assert.strictEqual(j.output[2].name, "get_weather");
+  });
+})();
+
 console.log(pass ? `\n${pass} checks passed` : "\nno checks ran");

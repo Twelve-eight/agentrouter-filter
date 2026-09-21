@@ -1,10 +1,13 @@
-// responses <-> chat/completions translation, and the chat SSE -> responses
-// SSE bridge. Side-effect free: this module binds no port and holds no global
-// state, so tests can import it without starting a gateway (see
-// tools/test-bridge-indices.mjs).
+// responses <-> chat/completions and responses <-> anthropic/messages
+// translation, plus the chat/anthropic SSE -> responses SSE bridges. Side-effect
+// free: this module binds no port and holds no global state, so tests can import
+// it without starting a gateway (see tools/test-bridge-indices.mjs).
 //
-// The bridge is needed because Codex 0.154 accepts only wire_api = "responses",
-// while some upstreams (wb2api) expose only chat/completions.
+// Two bridges are needed because Codex accepts only wire_api = "responses":
+//   - wb2api speaks chat/completions (DeepSeek/Qwen style)
+//   - justwoker speaks anthropic/messages (Claude style) and its
+//     /v1/chat/completions is Cloudflare-blocked (403), so chat is not an option
+//     there even though the endpoint exists.
 
 // ---------------------------------------------------------------------------
 // responses -> chat/completions conversion (for chat-only upstreams)
@@ -135,14 +138,113 @@ function toChatBody(body, model) {
 }
 
 // ---------------------------------------------------------------------------
-// chat SSE -> responses SSE
+// responses -> anthropic/messages conversion (for Claude-wire upstreams)
+// ---------------------------------------------------------------------------
+
+// Merge a content block into the tail of `messages`, appending to the previous
+// message when the role repeats. Anthropic expects alternating roles and rejects
+// a tool_result that is not the first block of a user message, so several
+// consecutive responses items of one role must collapse into ONE message rather
+// than becoming sibling messages.
+function pushBlocks(messages, role, blocks) {
+  if (!blocks.length) return;
+  const last = messages[messages.length - 1];
+  if (last && last.role === role) last.content.push(...blocks);
+  else messages.push({ role, content: blocks });
+}
+
+function toAnthropicBody(body, model) {
+  const messages = [];
+  const items = Array.isArray(body.input) ? body.input : [{ role: "user", content: body.input }];
+  for (const it of items) {
+    if (typeof it === "string") {
+      pushBlocks(messages, "user", [{ type: "text", text: it }]);
+      continue;
+    }
+    if (it.type === "reasoning") {
+      // NOT replayed as a thinking block. Anthropic validates a thinking block's
+      // signature, and a responses `reasoning` item carries only the text - there
+      // is no signature to send back. Probe-verified: a tool round-trip that omits
+      // the thinking block is accepted (200, stop_reason=end_turn), so dropping it
+      // is safe; forging a signature-less thinking block is not.
+      continue;
+    }
+    if (it.type === "function_call") {
+      // Consecutive function_calls are ONE assistant turn with several tool_use
+      // blocks (same collapse as the chat bridge; sibling assistant messages break
+      // the tool_use/tool_result pairing).
+      pushBlocks(messages, "assistant", [
+        {
+          type: "tool_use",
+          id: it.call_id ?? it.id,
+          name: it.name,
+          input: safeParse(it.arguments),
+        },
+      ]);
+      continue;
+    }
+    if (it.type === "function_call_output") {
+      const out = typeof it.output === "string" ? it.output : JSON.stringify(it.output ?? "");
+      pushBlocks(messages, "user", [{ type: "tool_result", tool_use_id: it.call_id, content: out }]);
+      continue;
+    }
+    const role = it.role === "assistant" ? "assistant" : "user";
+    const parts = Array.isArray(it.content) ? it.content : [{ type: "input_text", text: String(it.content ?? "") }];
+    const text = parts
+      .map((p) => {
+        if (typeof p === "string") return p;
+        if (p.type === "input_text" || p.type === "output_text" || p.type === "text") return p.text ?? "";
+        return "";
+      })
+      .join("");
+    if (text) pushBlocks(messages, role, [{ type: "text", text }]);
+  }
+  // Anthropic requires a non-empty message list starting with `user`.
+  if (!messages.length || messages[0].role !== "user") messages.unshift({ role: "user", content: [{ type: "text", text: "." }] });
+
+  const out = { model, messages, max_tokens: body.max_output_tokens ?? 8192, stream: true };
+  // `system` is a top-level string here, not a message (unlike chat).
+  if (body.instructions) out.system = body.instructions;
+
+  const tools = (body.tools ?? [])
+    .filter((t) => t && (t.type === "function" || t.name))
+    .map((t) => ({
+      name: t.name,
+      description: t.description ?? "",
+      input_schema: t.parameters ?? { type: "object", properties: {} },
+    }));
+  if (tools.length) out.tools = tools;
+
+  // tool_choice is an object here: "required" has no direct equivalent, the
+  // closest is `any` (must call some tool).
+  if (body.tool_choice === "required") out.tool_choice = { type: "any" };
+  else if (body.tool_choice === "auto") out.tool_choice = { type: "auto" };
+  return out;
+}
+
+function safeParse(s) {
+  if (s === undefined || s === null || s === "") return {};
+  if (typeof s === "object") return s;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SSE -> responses SSE (shared by both bridges)
 // ---------------------------------------------------------------------------
 
 function sse(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage = null) {
+// The item/event emitter both bridges drive. Extracted so the two wires cannot
+// drift on output_index ordering - that ordering was the hard-won part (see the
+// openReasoning comment) and duplicating it invited a silent regression in one
+// of the two paths.
+function createResponsesEmitter({ res, model, stream, onUsage }) {
   const respId = "resp_" + Math.random().toString(36).slice(2, 14);
   const created = Math.floor(Date.now() / 1000);
   const base = { id: respId, object: "response", created_at: created, model, status: "in_progress", output: [] };
@@ -161,7 +263,6 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
   emit("response.created", { type: "response.created", response: base });
   emit("response.in_progress", { type: "response.in_progress", response: base });
 
-  let buf = "";
   let seq = 2;
   let msgId = null;
   let msgOpen = false;
@@ -171,7 +272,7 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
   let rOpen = false;
   let rIndex = -1;
   const rId = "rs_" + Math.random().toString(36).slice(2, 14);
-  const calls = new Map(); // index -> {id,name,args,itemId,added,outIndex}
+  const calls = new Map(); // key -> {id,name,args,itemId,added,outIndex}
   let usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
   // output_index must be a monotonic per-item counter, NOT output.length: items
   // are only appended to `output` at close/finish, so using output.length gave a
@@ -255,37 +356,6 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
     msgOpen = false;
   };
 
-  const openCall = (idx, delta) => {
-    let c = calls.get(idx);
-    if (!c) {
-      c = { id: delta.id || `call_${idx}_${Math.random().toString(36).slice(2, 10)}`, name: "", args: "", itemId: "fc_" + Math.random().toString(36).slice(2, 14), added: false, outIndex: -1 };
-      calls.set(idx, c);
-    }
-    if (delta.id) c.id = delta.id;
-    if (delta.function?.name) c.name += delta.function.name;
-    if (!c.added && c.name) {
-      c.added = true;
-      c.outIndex = openItem();
-      emit("response.output_item.added", {
-        type: "response.output_item.added",
-        output_index: c.outIndex,
-        item: { type: "function_call", id: c.itemId, status: "in_progress", arguments: "", call_id: c.id, name: c.name },
-        sequence_number: seq++,
-      });
-    }
-    const chunk = delta.function?.arguments;
-    if (chunk) {
-      c.args += chunk;
-      emit("response.function_call_arguments.delta", {
-        type: "response.function_call_arguments.delta",
-        delta: chunk,
-        item_id: c.itemId,
-        output_index: c.outIndex,
-        sequence_number: seq++,
-      });
-    }
-  };
-
   const finish = () => {
     // Non-streaming request: the client asked for one JSON object, but this
     // bridge consumes the upstream's SSE. Accumulate and emit the completed
@@ -313,7 +383,7 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
       return;
     }
     // Close the reasoning item before the message/function_call items so the
-    // final `output` array is [reasoning, ..] as codex expects.
+    // final `output` array is [reasoning, ...] as codex expects.
     if (rOpen) {
       const rItem = {
         type: "reasoning",
@@ -356,6 +426,95 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
     res.end();
   };
 
+  const fail = () => {
+    try {
+      if (!stream) {
+        // Non-streaming: a JSON body, never a bare end (which would look like an
+        // empty success to the client).
+        if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "upstream stream error", type: "upstream_error" } }));
+        return;
+      }
+      sse(res, "response.failed", { type: "response.failed", response: { ...base, status: "failed" } });
+      res.end();
+    } catch {}
+  };
+
+  return {
+    // Reasoning delta: opens the reasoning item on the first non-blank text.
+    reasoning(chunk) {
+      if (!chunk) return;
+      reasoning += chunk;
+      openReasoning();
+    },
+    // Visible-text delta.
+    text(chunk) {
+      if (!chunk) return;
+      openMessage();
+      text += chunk;
+      emit("response.output_text.delta", {
+        type: "response.output_text.delta",
+        content_index: 0,
+        delta: chunk,
+        item_id: msgId,
+        output_index: msgIndex,
+        sequence_number: seq++,
+      });
+    },
+    // Tool-call delta. `key` groups the pieces of one call (chat: the delta index;
+    // anthropic: the content-block index). Name and arguments accumulate because
+    // both wires stream them in pieces.
+    call(key, { id, name, args }) {
+      let c = calls.get(key);
+      if (!c) {
+        c = {
+          id: id || `call_${key}_${Math.random().toString(36).slice(2, 10)}`,
+          name: "",
+          args: "",
+          itemId: "fc_" + Math.random().toString(36).slice(2, 14),
+          added: false,
+          outIndex: -1,
+        };
+        calls.set(key, c);
+      }
+      if (id) c.id = id;
+      if (name) c.name += name;
+      if (!c.added && c.name) {
+        c.added = true;
+        c.outIndex = openItem();
+        emit("response.output_item.added", {
+          type: "response.output_item.added",
+          output_index: c.outIndex,
+          item: { type: "function_call", id: c.itemId, status: "in_progress", arguments: "", call_id: c.id, name: c.name },
+          sequence_number: seq++,
+        });
+      }
+      if (args) {
+        c.args += args;
+        emit("response.function_call_arguments.delta", {
+          type: "response.function_call_arguments.delta",
+          delta: args,
+          item_id: c.itemId,
+          output_index: c.outIndex,
+          sequence_number: seq++,
+        });
+      }
+    },
+    setUsage(u) {
+      usage = u;
+    },
+    finish,
+    fail,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// chat SSE -> responses SSE
+// ---------------------------------------------------------------------------
+
+function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage = null) {
+  const em = createResponsesEmitter({ res, model, stream, onUsage });
+  let buf = "";
   upstream.on("data", (chunk) => {
     buf += chunk.toString("utf8");
     const lines = buf.split("\n");
@@ -372,7 +531,7 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
         continue;
       }
       if (j.usage) {
-        usage = {
+        const u = {
           input_tokens: j.usage.prompt_tokens ?? 0,
           output_tokens: j.usage.completion_tokens ?? 0,
           total_tokens: j.usage.total_tokens ?? 0,
@@ -382,49 +541,115 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
         // comparisons) cannot tell whether the requested level took effect.
         const detail = j.usage.completion_tokens_details;
         if (detail && typeof detail === "object") {
-          usage.output_tokens_details = { reasoning_tokens: detail.reasoning_tokens ?? 0 };
+          u.output_tokens_details = { reasoning_tokens: detail.reasoning_tokens ?? 0 };
         }
         if (typeof j.usage.completion_thinking_tokens === "number") {
-          usage.output_tokens_details = usage.output_tokens_details ?? {};
-          usage.output_tokens_details.reasoning_tokens = j.usage.completion_thinking_tokens;
+          u.output_tokens_details = u.output_tokens_details ?? {};
+          u.output_tokens_details.reasoning_tokens = j.usage.completion_thinking_tokens;
         }
+        em.setUsage(u);
       }
       const d = j.choices?.[0]?.delta;
       if (!d) continue;
-      if (d.reasoning_content) {
-        reasoning += d.reasoning_content;
-        openReasoning(); // claims index 0 before any call/message
-      }
-      if (d.content) {
-        openMessage();
-        text += d.content;
-        emit("response.output_text.delta", {
-          type: "response.output_text.delta",
-          content_index: 0,
-          delta: d.content,
-          item_id: msgId,
-          output_index: msgIndex,
-          sequence_number: seq++,
-        });
-      }
+      if (d.reasoning_content) em.reasoning(d.reasoning_content);
+      if (d.content) em.text(d.content);
       if (Array.isArray(d.tool_calls)) {
-        for (const tc of d.tool_calls) openCall(tc.index ?? 0, tc);
+        for (const tc of d.tool_calls) {
+          em.call(tc.index ?? 0, { id: tc.id, name: tc.function?.name, args: tc.function?.arguments });
+        }
       }
     }
   });
-  upstream.on("end", finish);
-  upstream.on("error", () => {
-    try {
-            if (!stream) {
-        // Non-streaming: a JSON body, never a bare end (which would look like an
-        // empty success to the client).
-        if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "upstream stream error", type: "upstream_error" } }));
-        return;
-      }
-sse(res, "response.failed", { type: "response.failed", response: { ...base, status: "failed" } });
-      res.end();
-    } catch {}
-  });
+  upstream.on("end", () => em.finish());
+  upstream.on("error", () => em.fail());
 }
-export { bridgeChatStream, toChatBody, toChatMessages, toChatTools };
+
+// ---------------------------------------------------------------------------
+// anthropic SSE -> responses SSE
+// ---------------------------------------------------------------------------
+
+// Anthropic's stream names its blocks by index and sends the tool id/name in
+// content_block_start, so the block index doubles as the emitter's call key.
+// Thinking blocks map to the responses `reasoning` item; text and tool_use map
+// to the message and function_call items.
+function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = null) {
+  const em = createResponsesEmitter({ res, model, stream, onUsage });
+  let buf = "";
+  let inputTokens = 0;
+  let cachedTokens = 0;
+  let outputTokens = 0;
+  const applyUsage = () => {
+    em.setUsage({
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      total_tokens: inputTokens + outputTokens,
+      ...(cachedTokens ? { input_tokens_details: { cached_tokens: cachedTokens } } : {}),
+    });
+  };
+  upstream.on("data", (chunk) => {
+    buf += chunk.toString("utf8");
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (payload === "[DONE]") continue;
+      let j;
+      try {
+        j = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      switch (j.type) {
+        case "message_start": {
+          const u = j.message?.usage ?? {};
+          inputTokens = u.input_tokens ?? 0;
+          cachedTokens = (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+          applyUsage();
+          break;
+        }
+        case "content_block_delta": {
+          const d = j.delta ?? {};
+          if (d.type === "thinking_delta") em.reasoning(d.thinking ?? "");
+          else if (d.type === "text_delta") em.text(d.text ?? "");
+          else if (d.type === "input_json_delta") em.call(j.index ?? 0, { args: d.partial_json ?? "" });
+          // signature_delta carries the thinking signature, which has no
+          // responses-side representation - dropping it is intentional.
+          break;
+        }
+        case "content_block_start": {
+          const b = j.content_block ?? {};
+          // Only tool_use needs the start event: it carries the id/name that the
+          // later input_json_delta fragments do not repeat.
+          if (b.type === "tool_use") em.call(j.index ?? 0, { id: b.id, name: b.name });
+          break;
+        }
+        case "message_delta": {
+          outputTokens = j.usage?.output_tokens ?? outputTokens;
+          applyUsage();
+          break;
+        }
+        case "error": {
+          const msg = j.error?.message ?? "anthropic stream error";
+          process.stdout.write(`[anthropic-bridge] upstream error event: ${msg}\n`);
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  });
+  upstream.on("end", () => em.finish());
+  upstream.on("error", () => em.fail());
+}
+
+export {
+  bridgeAnthropicStream,
+  bridgeChatStream,
+  createResponsesEmitter,
+  toAnthropicBody,
+  toChatBody,
+  toChatMessages,
+  toChatTools,
+};
