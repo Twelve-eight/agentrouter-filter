@@ -17,12 +17,31 @@ function toChatMessages(body) {
   if (body.instructions) sys.push(body.instructions);
   const items = Array.isArray(body.input) ? body.input : [{ role: "user", content: body.input }];
   const tail = [];
+  // Reasoning text waiting to be attached to the next assistant message.
+  const pendingReasoning = [];
   for (const it of items) {
     if (typeof it === "string") {
       tail.push({ role: "user", content: it });
       continue;
     }
-    if (it.type === "reasoning") continue;
+    if (it.type === "reasoning") {
+      // DeepSeek's thinking mode rejects a follow-up turn whose previous
+      // assistant turn lacks its reasoning: code 11155 "the reasoning content
+      // from the previous turn must be passed back in thinking mode", which
+      // wb2api surfaces as the misleading 503 "all accounts are temporarily
+      // unavailable". Dropping these items entirely is what caused it.
+      //
+      // chat/completions has no separate reasoning item: the text rides on the
+      // assistant message as `reasoning_content`. So collect it here and attach
+      // it to the next assistant message produced below.
+      const parts = Array.isArray(it.content) ? it.content : [];
+      const text = parts
+        .map((c) => (typeof c === "string" ? c : c?.text ?? ""))
+        .join("")
+        .trim();
+      if (text) pendingReasoning.push(text);
+      continue;
+    }
     if (it.type === "function_call") {
       // Consecutive function_calls are ONE assistant turn with several tool_calls,
       // not one assistant message each. Emitting them separately produced
@@ -38,7 +57,9 @@ function toChatMessages(body) {
       if (last && last.role === "assistant" && Array.isArray(last.tool_calls) && !last.content) {
         last.tool_calls.push(call);
       } else {
-        tail.push({ role: "assistant", content: null, tool_calls: [call] });
+        const msg = { role: "assistant", content: null, tool_calls: [call] };
+        if (pendingReasoning.length) msg.reasoning_content = pendingReasoning.splice(0).join("\n\n");
+        tail.push(msg);
       }
       continue;
     }
@@ -61,7 +82,14 @@ function toChatMessages(body) {
       })
       .join("");
     if (role === "system" || role === "developer") sys.push(text);
-    else tail.push({ role, content: text });
+    else {
+      const msg = { role, content: text };
+      // Attach accumulated reasoning to the assistant turn it belongs to.
+      if (role === "assistant" && pendingReasoning.length) {
+        msg.reasoning_content = pendingReasoning.splice(0).join("\n\n");
+      }
+      tail.push(msg);
+    }
   }
   return [{ role: "system", content: sys.filter(Boolean).join("\n\n") || "You are a coding agent." }, ...tail];
 }
