@@ -280,11 +280,48 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
       }
       const items2 = items.filter(Boolean);
       const msg = items2.find((it) => it.type === "message");
-      const output = msg ? [msg, ...out] : out;
+            const output = msg ? [msg, ...out] : out;
+      if (reasoning.trim()) {
+        output.unshift({
+          type: "reasoning",
+          id: "rs_" + Math.random().toString(36).slice(2, 14),
+          summary: [],
+          content: [{ type: "reasoning_text", text: reasoning }],
+        });
+      }
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
       if (onUsage) try { onUsage(usage); } catch {}
       res.end(JSON.stringify({ ...base, status: "completed", output, usage }));
       return;
+    }
+    // Emit the accumulated reasoning as a real `reasoning` item. Without this,
+    // codex never records reasoning for a bridged (wb2api) turn, so the next
+    // request replays a history with tool_calls but no reasoning and DeepSeek
+    // rejects it: code 11155 "the reasoning content from the previous turn must
+    // be passed back in thinking mode" (wb2api surfaces it as 503). The variable
+    // was already being accumulated from the upstream deltas but never emitted.
+    if (reasoning.trim()) {
+      const rIdx = openItem();
+      const rId = "rs_" + Math.random().toString(36).slice(2, 14);
+      emit("response.output_item.added", {
+        type: "response.output_item.added",
+        output_index: rIdx,
+        item: { type: "reasoning", id: rId, summary: [] },
+        sequence_number: seq++,
+      });
+      const rItem = {
+        type: "reasoning",
+        id: rId,
+        summary: [],
+        content: [{ type: "reasoning_text", text: reasoning }],
+      };
+      emit("response.output_item.done", {
+        type: "response.output_item.done",
+        output_index: rIdx,
+        item: rItem,
+        sequence_number: seq++,
+      });
+      placeItem(rIdx, rItem);
     }
     closeMessage();
     for (const c of calls.values()) {
