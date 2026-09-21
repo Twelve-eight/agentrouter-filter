@@ -161,5 +161,5 @@
       "p": "wb2api"
     }
   },
-  "_removed_comment": "claude-opus-4-8 / claude-opus-5 were removed: agentrouter registers them only on the anthropic-messages face (messages=402 quota, responses=503 while a nonexistent model is 503 on both), and codex speaks only responses, so selecting them always failed. Re-add if a responses->messages bridge is built."
+  "_claude_comment": "claude-opus-4-8 is served by justwoker over the anthropic-messages wire (see the anthropic bridge in bridge.mjs). It was briefly removed when only agentrouter offered it: agentrouter registers the claude ids on its anthropic-messages face only (messages=402 quota, responses=503, while a nonexistent model is 503 on both) and codex speaks only responses, so selecting them always failed. That is why the responses->messages bridge exists. claude-opus-5 is still unavailable on every provider we route."
 }
