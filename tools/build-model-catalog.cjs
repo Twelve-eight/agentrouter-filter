@@ -274,9 +274,12 @@ for (const m of merged.models) {
 //    260k, everything else at 500k" - the global key has to stay unset and every
 //    entry carries its own value. Defaults > global > per-entry is the precedence.
 //
-//    WHY astra IS LOWER: the agentrouter astra route starts failing once a thread
-//    grows past roughly a quarter million tokens, so it compacts earlier than the
-//    models that tolerate more.
+//    WHY astra IS LOWER: this is the USER'S CHOICE, not a measured failure
+//    threshold - do not "correct" it back to COMPACT_DEFAULT after seeing astra
+//    work past 260k. astra's agentrouter quota is the scarcest resource in the
+//    pool (it exhausts and only resets at 10:00 / 19:00 Beijing time), and a
+//    long thread re-sends its whole context on every turn, so a smaller window
+//    keeps the per-turn burn down. It is a cost/quota decision.
 const COMPACT_ASTRA = 260000;
 const COMPACT_DEFAULT = 500000;
 // Reply headroom. The limit counts input only, so the threshold has to sit far
