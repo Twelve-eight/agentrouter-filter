@@ -361,6 +361,22 @@ const server = http.createServer(async (req, res) => {
     "Content-Type": upstream.headers["content-type"] ?? "application/json",
     "Cache-Control": "no-cache",
   });
+  // Without this, an upstream that drops mid-response emits an unhandled 'error'
+  // on the IncomingMessage. The process-level guards then swallow it and this
+  // socket is never ended, so the client waits for its own timeout instead of
+  // seeing a clear failure. Reproduced: headers + one chunk, then silence for the
+  // full 12s probe window. The bridge path already had an error handler; this
+  // passthrough path (agentrouter/relaycat/anyrouter - most traffic) did not.
+  upstream.on("error", (e) => {
+    log(`!! upstream error after ${upstream.statusCode} (${route.name}): ${e?.code ?? e?.message ?? e}`);
+    try {
+      res.destroy();
+    } catch {}
+  });
+  res.on("close", () => {
+    // Client went away (or we finished): stop pulling from the upstream.
+    if (!upstream.destroyed) upstream.destroy();
+  });
   upstream.pipe(res);
   } catch (e) {
     // Last-resort guard: keep the process alive and tell the client what broke.
