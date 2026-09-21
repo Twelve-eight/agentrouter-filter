@@ -326,3 +326,23 @@ codex debug models        -> 29 条,24 条可见(含我们的)
 
 **收尾**:`config.toml` 已还原(`model = "gpt-6-astra"`,effort `max`),
 与测试前基线 `diff` **完全一致**.
+
+### 2026-09-21 补:内置条目的默认档也必须归一(advisor 第二条)
+
+上一轮只给**我们自己的 18 条**设了 `DEFAULT_EFFORT`,**内置条目仍是 codex 原默认档**
+-- 而用户的模型 `gpt-6-astra` 恰恰是 `low`.由于 picker 按目录默认档预选并写回
+config.toml,**用户在选择器里点回自己的模型仍会被静默降成 `low`**.只归一一半
+等于把陷阱留在了每个内置条目上.
+
+现改为**合并后统一归一**:按偏好 `max > xhigh > high` 与该条目 `supported_reasoning_levels`
+**取交集**.交集是必要的:`max` 并非普适 -- `gpt-5.5` / `gpt-5.4` 只到 `xhigh`,
+给出模型不支持的档位会把一次点击变成上游 422.
+
+**实测(驱动真实 picker)**:
+- `gpt-6-astra` 现在显示 `5. More reasoning.. (current)` -> `1. Max (current)`
+  (修复前默认是 Low).
+- 选中它后 config.toml 与测试前基线 **逐字节相同**
+  (`model = "gpt-6-astra"`,`model_reasoning_effort = "max"`).
+- `gpt-5.5` / `gpt-5.4` 归一为 `xhigh`,与其支持集一致.
+
+**归一后全目录默认档**:24 条为 `max`,2 条(`gpt-5.5`/`gpt-5.4`)为 `xhigh`.
