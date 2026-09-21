@@ -135,6 +135,28 @@ const added = ours.filter((m) => !have.has(m.slug));
 const collisions = ours.filter((m) => have.has(m.slug));
 
 const merged = { models: [...builtin.models, ...added] };
+
+// 4) Normalize the default reasoning level across the WHOLE catalog, built-ins
+//    included.
+//
+//    The picker pre-selects an entry's default and writes it back to config.toml
+//    as the global `model_reasoning_effort`. Codex's built-in defaults are
+//    low/medium (gpt-6-astra is `low`), so picking the user's own model would
+//    silently downgrade their configured `max` - verified with cn:kimi-k3-1
+//    before this was fixed. Normalizing only our own entries would leave that
+//    trap on every built-in entry the user might click.
+//
+//    Respect each entry's supported set: max is not universal (gpt-5.5 and
+//    gpt-5.4 stop at xhigh), and a level the model rejects would turn a picker
+//    click into an upstream 422.
+const PREFERENCE = ['max', 'xhigh', 'high'];
+for (const m of merged.models) {
+  const supported = (m.supported_reasoning_levels ?? []).map((l) => l.effort);
+  if (!supported.length) continue;
+  const best = PREFERENCE.find((e) => supported.includes(e));
+  if (!best) continue;
+  m.default_reasoning_level = best;
+}
 fs.writeFileSync(OUT, JSON.stringify(merged, null, 2) + '\n');
 
 console.log(`built-in: ${builtin.models.length}`);
