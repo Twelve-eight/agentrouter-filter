@@ -46,12 +46,21 @@ if (ours_present) {
 fs.writeFileSync(TMP, JSON.stringify(builtin));
 
 const LEVELS = {
+  minimal: 'Minimal reasoning for the fastest responses',
   low: 'Fast responses with lighter reasoning',
   medium: 'Balances speed and reasoning depth for everyday tasks',
   high: 'Greater reasoning depth for complex problems',
+  xhigh: 'Extra high reasoning depth for complex problems',
   max: 'Maximum reasoning depth for the hardest problems',
 };
-const levels = (...names) => names.map((e) => ({ effort: e, description: LEVELS[e] }));
+const levels = (...names) =>
+  names.map((e) => ({
+    effort: e,
+    // codex rejects the catalog if a level has no description, so never emit an
+    // undefined one for a level we did not anticipate (minimal/xhigh came from
+    // wb2api's published set).
+    description: LEVELS[e] ?? `${e} reasoning depth`,
+  }));
 const BASE = 'You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user\'s goals.';
 
 // 2) our models. `slug` must equal the upstream model id.
@@ -105,6 +114,7 @@ const REGISTRY = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "provider
 // marked unverified rather than presented as measured.
 const CTX_DEFAULT = 200000; // UNVERIFIED for providers that publish no context size
 const CTX = {};
+const EFF = {};
 try {
   const raw = require("node:child_process").execFileSync(
     "curl",
@@ -113,16 +123,22 @@ try {
   );
   for (const m of JSON.parse(raw).data ?? []) {
     if (m.context_length > 0) CTX[m.id] = m.context_length;
+    // Same payload also carries the authoritative effort set. Guessing it gave
+    // models levels they reject (gpt-5.3-codex is medium-only; deepseek-v4-pro is
+    // high/xhigh) and hid levels they accept (minimal, xhigh).
+    if (Array.isArray(m.reasoning_supported_efforts) && m.reasoning_supported_efforts.length) {
+      EFF[m.id] = m.reasoning_supported_efforts;
+    }
   }
-  console.log(`context windows: ${Object.keys(CTX).length} from wb2api`);
+  console.log(`context windows: ${Object.keys(CTX).length}, effort sets: ${Object.keys(EFF).length} from wb2api`);
 } catch (e) {
   console.log(`context windows: wb2api unreachable (${e?.message?.slice(0, 40)}); using defaults`);
 }
 
-// Reasoning levels offered per provider. agentrouter/wb2api accept all four
-// (probed); relaycat's entries keep their own built-in sets and are excluded
-// here anyway (they collide with built-in slugs and the built-in entry wins).
-const EFFORTS = ["low", "medium", "high", "max"];
+// Fallback only: agentrouter and relaycat publish no effort metadata, so their
+// entries keep this set. wb2api publishes `reasoning_supported_efforts` per model
+// and that wins (see EFF above).
+const EFFORTS_DEFAULT = ["low", "medium", "high", "max"];
 
 const ours = Object.entries(REGISTRY.models)
   .filter(([, v]) => v && typeof v === "object")
@@ -133,7 +149,7 @@ const ours = Object.entries(REGISTRY.models)
       slug,
       `${slug} (via ${prov})`,
       `${upstream} served by ${prov} through the local gateway`,
-      EFFORTS,
+      EFF[slug] ?? EFFORTS_DEFAULT,
       CTX[slug] ?? CTX_DEFAULT,
     );
   })
@@ -184,8 +200,11 @@ const PREFERENCE = ['max', 'xhigh', 'high'];
 for (const m of merged.models) {
   const supported = (m.supported_reasoning_levels ?? []).map((l) => l.effort);
   if (!supported.length) continue;
-  const best = PREFERENCE.find((e) => supported.includes(e));
-  if (!best) continue;
+  // If none of the preferred levels is offered (gpt-5.3-codex is medium-only),
+  // fall back to the model's highest supported level rather than leaving the
+  // entry's construction default in place - that default may not be supported at
+  // all, and the picker writes whatever is here straight into config.toml.
+  const best = PREFERENCE.find((e) => supported.includes(e)) ?? supported[supported.length - 1];
   m.default_reasoning_level = best;
 }
 fs.writeFileSync(OUT, JSON.stringify(merged, null, 2) + '\n');
