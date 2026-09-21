@@ -118,13 +118,41 @@ const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", w
 const STATS_HTML_PATH = new URL("./stats.html", import.meta.url);
 const statsHtml = () => fs.readFileSync(STATS_HTML_PATH, "utf8");
 
-const REGISTRY = JSON.parse(fs.readFileSync(new URL("./providers.json", import.meta.url), "utf8"));
+const REGISTRY_PATH = new URL("./providers.json", import.meta.url);
+
+// Read per request, not at module load - same reasoning as statsHtml above. A
+// module-load read meant adding a model to providers.json silently required a
+// gateway restart, and the failure mode is nasty: the model is already in the
+// picker (the catalog builder reads the same file directly) so selecting it
+// returns "unknown model" from the gateway while everything looks configured.
+// Re-parsing a ~5 KB file per request is far cheaper than that class of bug.
+//
+// The parsed object is cached against the file's mtime+size, so a request pays
+// one stat() and only re-parses when the file actually changed.
+let registryCache = { key: null, value: null };
+function registry() {
+  let st;
+  try {
+    st = fs.statSync(REGISTRY_PATH);
+  } catch {
+    // File missing/unreadable: keep serving the last good copy rather than
+    // dropping every route.
+    if (registryCache.value) return registryCache.value;
+    throw new Error("providers.json is unreadable");
+  }
+  const key = `${st.mtimeMs}:${st.size}`;
+  if (registryCache.key !== key) {
+    registryCache = { key, value: JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8")) };
+  }
+  return registryCache.value;
+}
 
 /** Resolve a client model id to the upstream that serves it. */
 function providerFor(model) {
-  const spec = REGISTRY.models[model];
+  const reg = registry();
+  const spec = reg.models[model];
   if (!spec || typeof spec !== "object") return null;
-  const p = REGISTRY.providers[spec.p];
+  const p = reg.providers[spec.p];
   if (!p) return null;
   return {
     name: spec.p,
@@ -153,7 +181,7 @@ function providerFor(model) {
 
 /** Every client-facing model id, for GET /u/v1/models. */
 function modelList() {
-  return Object.entries(REGISTRY.models)
+  return Object.entries(registry().models)
     .filter(([, v]) => v && typeof v === "object")
     .map(([id, v]) => ({ id, object: "model", owned_by: v.p }));
 }
@@ -645,5 +673,5 @@ server.on("error", (e) => {
 // must not start a second gateway.
 const isEntryPoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isEntryPoint) {
-  server.listen(PORT, HOST, () => log(`gateway listening on http://${HOST}:${PORT} (unified /u with ${modelList().length} models; routes: /ar /rc /wb /an)`));
+  server.listen(PORT, HOST, () => log(`gateway listening on http://${HOST}:${PORT} (unified /u with ${modelList().length} models; routes: /ar /rc /wb /an /jw)`));
 }
