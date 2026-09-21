@@ -294,3 +294,35 @@ codex debug models        -> 29 条,24 条可见(含我们的)
 - `codex --strict-config` 对 `debug` 子命令**不支持**(报
   `--strict-config is not supported for codex debug`);对 `exec` 可用,实测通过无
   unknown-field 错误.
+
+### 2026-09-21 选择器验证 + 两个我造成的回归(已修)
+
+**先回答 advisory 的质疑**:此前只验到 `debug models`(数据源)与 `codex exec`
+(请求路径),**没有验选择器界面**.本轮用 PTY 驱动真实 TUI(`hub start` + 按键)
+补齐:
+
+- `/model` 选择器**确实渲染**我们的 18 条(编号 5-18),内置的在 19-24.
+- 选中后进入推理档位选择,列表读的是**我们条目**的
+  `supported_reasoning_levels`(实测 `cn:kimi-k3-1` 显示 Low(default)/Medium/
+  High/Max).
+- 选择会写回 `config.toml` 的 `model` 行.
+
+**回归 1(严重,我造成的):选择器把 `model_reasoning_effort` 从 `max` 改成 `low`.**
+机制:codex 选中模型时会把目录条目的 `default_reasoning_level` 写进 config.toml,
+而生成器原本用 `efforts[0]`(= `low`)当默认档.后果:**用户每点一次选择器就静默降档一次**.
+已改为显式 `DEFAULT_EFFORT = 'max'`(与用户配置一致,选中我们的模型不改变其任何设置).
+复测:再驱动一次选择器选 `global:gpt-5.5`,config.toml **只有 `model` 行变化**,
+`model_reasoning_effort` 保持 `max`.
+
+**回归 2(设计限制,非本次引入):选择器是全局的,不按 provider 过滤.**
+在默认(`agentrouter`)provider 下选 `cn:kimi-k3-1` 会发到 agentrouter 并 503
+(实测 `当前分组 default 下对于模型 cn:kimi-k3-1 无可用渠道`).目录 schema
+**不支持**每模型绑定 provider(`model_provider`/`provider` 字段被丢弃,实测),
+这是 codex 的限制,不是目录能修的.命名上按 provider 加后缀以便察觉.
+
+**顺带**:codex 在 TUI 里自动升级 `0.154.0 -> 0.155.1`,内置目录从 **11 条变 9 条**
+(`gpt-5.2`/`gpt-5.4-mini` 等被移除).生成器已重新取用新内置目录,总数 29 -> 27.
+这正是"必须从 scratch CODEX_HOME 读内置目录"的价值:升级后能自动跟进.
+
+**收尾**:`config.toml` 已还原(`model = "gpt-6-astra"`,effort `max`),
+与测试前基线 `diff` **完全一致**.
