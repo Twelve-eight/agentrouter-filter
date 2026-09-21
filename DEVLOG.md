@@ -397,8 +397,18 @@ node tools/diff-test.mjs -> 0 mismatches;test-bridge-indices.mjs -> PASS
 ```
 
 ### 未验证
-- `claude-opus-4-8/5`、`glm-5.3`(agentrouter)仍 503/402,是**上游侧**;两处 DEVLOG
-  记录已按实测统一(两者在 responses 面均为 503,与不存在的模型同码,故
-  "仅 anthropic-messages 面"一说**不成立**,已更正).
+- `claude-opus-4-8/5`(agentrouter)**只在 anthropic-messages 面注册**,codex 无法接入
+  (codex 仅走 responses).判据是 **402 vs 503**:
+  ```
+  claude-opus-4-8    messages=402  responses=503
+  claude-opus-5      messages=402  responses=503
+  no-such-model-xyz  messages=503  responses=503
+  ```
+  402 只在模型真实存在时出现(配额耗尽),不存在的模型两面都 503 -- 所以
+  "仅 messages 面"**成立**.早先我用"responses 面也是 503"去否定它,是拿弱证据
+  (503 与不存在模型同码)否定强证据(402),**那次更正是错的,已撤回**.
+  这两个 slug 已从 providers.json 移除(选了必然 503),待做 responses->messages
+  桥接后再加回.
+- `glm-5.3`(agentrouter)503 是上游无渠道,与面无关.
 - relaycat 的 `gpt-5.4`/`gpt-5.2`/`gpt-5.6-luna`/`gpt-5.3-codex` 当前 502/503,
   直连与经网关状态码一致.

@@ -24,17 +24,22 @@ function toChatMessages(body) {
     }
     if (it.type === "reasoning") continue;
     if (it.type === "function_call") {
-      tail.push({
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            id: it.call_id ?? it.id,
-            type: "function",
-            function: { name: it.name, arguments: it.arguments ?? "{}" },
-          },
-        ],
-      });
+      // Consecutive function_calls are ONE assistant turn with several tool_calls,
+      // not one assistant message each. Emitting them separately produced
+      // A{a} A{b} T(a) T(b), which strict upstreams reject with
+      // code 11148 "tool calls and tool results do not match" (wb2api surfaces it
+      // as the misleading 503 "all accounts are temporarily unavailable").
+      const call = {
+        id: it.call_id ?? it.id,
+        type: "function",
+        function: { name: it.name, arguments: it.arguments ?? "{}" },
+      };
+      const last = tail[tail.length - 1];
+      if (last && last.role === "assistant" && Array.isArray(last.tool_calls) && !last.content) {
+        last.tool_calls.push(call);
+      } else {
+        tail.push({ role: "assistant", content: null, tool_calls: [call] });
+      }
       continue;
     }
     if (it.type === "function_call_output") {
@@ -109,7 +114,7 @@ function sse(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function bridgeChatStream(upstream, res, model, effort, stream = true) {
+function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage = null) {
   const respId = "resp_" + Math.random().toString(36).slice(2, 14);
   const created = Math.floor(Date.now() / 1000);
   const base = { id: respId, object: "response", created_at: created, model, status: "in_progress", output: [] };
@@ -249,6 +254,7 @@ function bridgeChatStream(upstream, res, model, effort, stream = true) {
       const msg = items2.find((it) => it.type === "message");
       const output = msg ? [msg, ...out] : out;
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
+      if (onUsage) try { onUsage(usage); } catch {}
       res.end(JSON.stringify({ ...base, status: "completed", output, usage }));
       return;
     }
@@ -271,6 +277,7 @@ function bridgeChatStream(upstream, res, model, effort, stream = true) {
       });
       placeItem(c.outIndex, item);
     }
+    if (onUsage) try { onUsage(usage); } catch {}
     emit("response.completed", {
       type: "response.completed",
       response: { ...base, status: "completed", output: items.filter(Boolean), usage },

@@ -26,6 +26,8 @@ import https from "node:https";
 import { pathToFileURL } from "node:url";
 import { filterBody } from "./filter.mjs";
 import { bridgeChatStream, toChatBody } from "./bridge.mjs";
+import { record as recordUsage, read as readUsage, summarize as summarizeUsage } from "./usage.mjs";
+import { priceInfo } from "./pricing.mjs";
 
 const PORT = Number(process.env.AR_GATEWAY_PORT ?? 7878);
 const HOST = "127.0.0.1";
@@ -46,19 +48,23 @@ const HOST = "127.0.0.1";
 //            identity rewrite is an unconditional user requirement.
 const ROUTES = {
   ar: {
+    name: "agentrouter",
     base: process.env.AR_UPSTREAM_AR ?? "https://ps.air-outer.com",
     chat: false,
     filter: true,
   },
+  // Two key groups share this host; the route cannot tell them apart, so the
+  // name covers both. Usage rows still separate them by model.
   rc: {
+    name: "relaycat",
     base: process.env.AR_UPSTREAM_RC ?? "https://api.relaycat.top",
     chat: false,
   },
-  wb: { base: process.env.AR_UPSTREAM_WB ?? "http://127.0.0.1:7863", chat: true },
+  wb: { name: "wb2api", base: process.env.AR_UPSTREAM_WB ?? "http://127.0.0.1:7863", chat: true },
   // anyrouter.top is TLS-blocked on a direct connection (omp reports "unknown
   // certificate verification error"); it needs the local HTTP proxy. The proxy
   // is applied per-route so agentrouter (which hangs through it) stays direct.
-  an: { base: process.env.AR_UPSTREAM_AN ?? "https://anyrouter.top", chat: false, proxy: process.env.AR_PROXY_AN ?? "http://127.0.0.1:7897" },
+  an: { name: "anyrouter", base: process.env.AR_UPSTREAM_AN ?? "https://anyrouter.top", chat: false, proxy: process.env.AR_PROXY_AN ?? "http://127.0.0.1:7897" },
 };
 
 // ---------------------------------------------------------------------------
@@ -70,6 +76,11 @@ const ROUTES = {
 // disagree about which models exist or where they go.
 // ---------------------------------------------------------------------------
 const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", wb2api: "WB", anyrouter: "AN" };
+
+// Read per request, not at module load: the dashboard is a local file that gets
+// edited, and caching it here meant every HTML fix required a gateway restart.
+const STATS_HTML_PATH = new URL("./stats.html", import.meta.url);
+const statsHtml = () => fs.readFileSync(STATS_HTML_PATH, "utf8");
 
 const REGISTRY = JSON.parse(fs.readFileSync(new URL("./providers.json", import.meta.url), "utf8"));
 
@@ -177,6 +188,31 @@ function request(url, { method, headers, body, proxy }) {
 
 const server = http.createServer(async (req, res) => {
   try {
+  // Usage dashboard. Served from this process so there is no second thing to
+  // start; it reads the same JSONL the accounting writes.
+  if (req.method === "GET" && (req.url === "/stats" || req.url === "/stats/")) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
+    res.end(statsHtml());
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/stats/data")) {
+    const q = new URL(req.url, "http://127.0.0.1");
+    const days = Math.min(Math.max(Number(q.searchParams.get("days")) || 7, 1), 365);
+    const rows = readUsage(days);
+    const summary = summarizeUsage(rows);
+    // Most recent first, capped: the table is for inspection, not pagination.
+    // read() returns [today oldest->newest, yesterday oldest->newest, ..], so
+    // neither end of the array is "most recent". Sort explicitly rather than
+    // relying on the iteration order - slicing the tail showed the oldest rows.
+    const recent = rows
+      .slice()
+      .sort((a, b) => String(b.ts ?? "").localeCompare(String(a.ts ?? "")))
+      .slice(0, 200);
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-cache" });
+    res.end(JSON.stringify({ days, summary, recent, pricing: priceInfo() }));
+    return;
+  }
+
   const m = req.url.match(/^\/(ar|rc|wb|an|u)(\/.*)$/);
   if (!m) {
     res.writeHead(404, { "Content-Type": "text/plain" });
@@ -259,6 +295,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   const isChatUpstream = route.chat;
+
+  // The model the client asked for. On the unified route `route.upstreamModel` is
+  // set by the registry; on the per-prefix routes the registry is not consulted,
+  // so read it from the body we already hold. Without this, usage rows from /ar
+  // /rc /wb /an had no model (null) and no provider (undefined -> "unknown").
+  let requestModel = route.upstreamModel ?? null;
+  if (!requestModel && body !== undefined && isResponses) {
+    try {
+      requestModel = JSON.parse(body)?.model ?? null;
+    } catch {}
+  }
   // Substitute the upstream's own credential (see providerFor). Only for the
   // unified route: the per-provider routes keep forwarding the client's key
   // verbatim so their behaviour is unchanged.
@@ -343,7 +390,21 @@ const server = http.createServer(async (req, res) => {
       res.end(text);
       return;
     }
-    bridgeChatStream(upstream, res, parsed.model, parsed.reasoning?.effort, parsed.stream !== false);
+    const t0 = Date.now();
+    bridgeChatStream(upstream, res, parsed.model, parsed.reasoning?.effort, parsed.stream !== false, (u) => {
+      recordUsage({
+        route: prefix,
+        provider: route.name,
+        model: parsed.model,
+        effort: parsed.reasoning?.effort ?? null,
+        ok: true,
+        duration_ms: Date.now() - t0,
+        input_tokens: u?.input_tokens ?? 0,
+        output_tokens: u?.output_tokens ?? 0,
+        reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
+        cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
+      });
+    });
     return;
   }
 
@@ -376,6 +437,72 @@ const server = http.createServer(async (req, res) => {
   res.on("close", () => {
     // Client went away (or we finished): stop pulling from the upstream.
     if (!upstream.destroyed) upstream.destroy();
+  });
+
+  // Passthrough (agentrouter / relaycat / anyrouter) usage. The upstream's own
+  // `usage` object is the only source; nothing is estimated. A streamed response
+  // carries usage in its final event, so the body is sniffed rather than buffered
+  // wholesale (buffering would defeat streaming).
+  const t0 = Date.now();
+  const ct = String(upstream.headers["content-type"] ?? "");
+  if (!ct.includes("event-stream")) {
+    const parts = [];
+    upstream.on("data", (c) => parts.push(c));
+    upstream.on("end", () => {
+      const text = Buffer.concat(parts).toString("utf8");
+      res.end(text);
+      let u = null;
+      try {
+        u = JSON.parse(text)?.usage ?? null;
+      } catch {}
+      recordUsage({
+        route: prefix,
+        provider: route.name,
+        model: requestModel,
+        effort: null,
+        ok: upstream.statusCode < 400,
+        status: upstream.statusCode,
+        duration_ms: Date.now() - t0,
+        input_tokens: u?.input_tokens ?? 0,
+        output_tokens: u?.output_tokens ?? 0,
+        reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
+        cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
+      });
+    });
+    return;
+  }
+
+  // Streamed passthrough: watch for the final usage-bearing event without
+  // altering the bytes the client receives.
+  let tail = "";
+  let captured = null;
+  upstream.on("data", (c) => {
+    tail += c.toString("utf8");
+    if (tail.length > 65536) tail = tail.slice(-65536);
+  });
+  upstream.on("end", () => {
+    for (const line of tail.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      try {
+        const j = JSON.parse(t.slice(5).trim());
+        if (j?.response?.usage) captured = j.response.usage;
+        else if (j?.usage) captured = j.usage;
+      } catch {}
+    }
+    recordUsage({
+      route: prefix,
+      provider: route.name,
+      model: requestModel,
+      effort: null,
+      ok: upstream.statusCode < 400,
+      status: upstream.statusCode,
+      duration_ms: Date.now() - t0,
+      input_tokens: captured?.input_tokens ?? 0,
+      output_tokens: captured?.output_tokens ?? 0,
+      reasoning_tokens: captured?.output_tokens_details?.reasoning_tokens ?? 0,
+      cached_tokens: captured?.input_tokens_details?.cached_tokens ?? 0,
+    });
   });
   upstream.pipe(res);
   } catch (e) {
