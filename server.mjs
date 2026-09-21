@@ -142,7 +142,19 @@ function registry() {
   }
   const key = `${st.mtimeMs}:${st.size}`;
   if (registryCache.key !== key) {
-    registryCache = { key, value: JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8")) };
+    try {
+      const value = JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8"));
+      registryCache = { key, value };
+    } catch (e) {
+      // Torn read (the file is mid-rewrite) or a syntax error from a bad edit.
+      // Serving the last good copy is the whole point of the stat fallback above,
+      // so this must not throw - an unguarded parse would 500 every request in
+      // exactly the window the fallback exists to cover. `key` is deliberately
+      // NOT updated, so the next request re-stats and retries instead of caching
+      // the failure until a restart.
+      if (registryCache.value) return registryCache.value;
+      throw e;
+    }
   }
   return registryCache.value;
 }
