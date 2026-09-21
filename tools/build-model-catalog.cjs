@@ -107,12 +107,29 @@ function entry(slug, display, description, efforts, contextWindow) {
 // derived from the provider so the origin stays visible in the picker.
 const REGISTRY = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "providers.json"), "utf8"));
 
-// Context windows. wb2api publishes a real `context_length` per model, so it is
-// queried rather than guessed (a fabricated 1M would stop codex compacting in
-// time and long sessions would hit the upstream limit - a short test cannot
-// show that). Providers that publish nothing fall back to CTX_DEFAULT, which is
-// marked unverified rather than presented as measured.
-const CTX_DEFAULT = 200000; // UNVERIFIED for providers that publish no context size
+// Context windows come from omp's models.yml - the same file the user's other
+// tooling is configured from, and the only place the real limits are recorded
+// (agentrouter/relaycat publish no context_length). wb2api publishes its own per
+// model and is queried below. Anything still unknown falls back to CTX_DEFAULT,
+// marked UNVERIFIED rather than presented as measured.
+const MODELS_YML = process.env.OMP_MODELS_YML ?? "C:/Users/o_Obl/.omp/agent/models.yml";
+const CTX_DEFAULT = 200000; // UNVERIFIED for providers that publish nothing
+const CTX_YML = {};
+try {
+  // Minimal parse: `- id: <model>` followed by `contextWindow: <n>` in the same
+  // entry. A YAML dependency is not worth it for two keys.
+  const text = fs.readFileSync(MODELS_YML, "utf8");
+  let current = null;
+  for (const line of text.split(/\r?\n/)) {
+    const idm = line.match(/^\s*-\s*id:\s*(\S+)/);
+    if (idm) { current = idm[1]; continue; }
+    const cwm = line.match(/^\s*contextWindow:\s*(\d+)/);
+    if (cwm && current) { CTX_YML[current] = Number(cwm[1]); current = null; }
+  }
+  console.log(`context windows: ${Object.keys(CTX_YML).length} from models.yml`);
+} catch (e) {
+  console.log(`context windows: models.yml unreadable (${e?.message?.slice(0, 40)}); using defaults`);
+}
 const CTX = {};
 const EFF = {};
 try {
@@ -150,7 +167,7 @@ const ours = Object.entries(REGISTRY.models)
       `${spec.m ?? slug} (via ${prov})`,
       `${upstream} served by ${prov} through the local gateway`,
       EFF[slug] ?? EFFORTS_DEFAULT,
-      CTX[slug] ?? CTX_DEFAULT,
+      CTX[slug] ?? CTX_YML[spec.m ?? slug] ?? CTX_YML[slug] ?? CTX_DEFAULT,
     );
   })
   // The registry also lists codex's built-in slugs (the gateway must route them),
@@ -207,6 +224,18 @@ for (const m of merged.models) {
   const best = PREFERENCE.find((e) => supported.includes(e)) ?? supported[supported.length - 1];
   m.default_reasoning_level = best;
 }
+// Prefer the recorded context limit over codex's built-in value. Codex ships
+// conservative numbers for the built-in slugs (gpt-6-astra: 272000), while
+// models.yml records what the upstream actually accepts (1050000). Leaving the
+// smaller value makes codex compact long before it has to.
+for (const m of merged.models) {
+  const real = CTX_YML[m.slug];
+  if (real && real > (m.context_window ?? 0)) {
+    m.context_window = real;
+    m.max_context_window = Math.max(real, m.max_context_window ?? 0);
+  }
+}
+
 // Name the upstream on every entry. The built-in entries are taken verbatim from
 // codex, so their display names are bare ("GPT-6-Astra") - ambiguous here, where
 // relaycat / agentrouter / anyrouter / wb2api all serve the same model id. Entries
