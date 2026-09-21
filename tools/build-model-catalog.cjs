@@ -55,13 +55,23 @@ const levels = (...names) => names.map((e) => ({ effort: e, description: LEVELS[
 const BASE = 'You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user\'s goals.';
 
 // 2) our models. `slug` must equal the upstream model id.
+//
+// `default_reasoning_level` is NOT cosmetic: when the TUI picker is used, codex
+// writes the chosen model AND this default level into config.toml, overwriting the
+// user's global `model_reasoning_effort`. Deriving it from the effort list (the
+// original `efforts[0]`) made every picker click silently downgrade the user's
+// `max` to `low`. Default to `max`: it matches the level the user has configured,
+// so picking one of our models changes nothing they did not ask for. `max` is
+// verified accepted by both the agentrouter and wb2api paths.
+const DEFAULT_EFFORT = 'max';
+
 function entry(slug, display, description, efforts, contextWindow) {
   return {
     slug,
     display_name: display,
     description,
     base_instructions: BASE,
-    default_reasoning_level: efforts[0],
+    default_reasoning_level: DEFAULT_EFFORT,
     supported_reasoning_levels: levels(...efforts),
     shell_type: 'shell_command',
     visibility: 'list',
