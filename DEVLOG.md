@@ -412,3 +412,79 @@ node tools/diff-test.mjs -> 0 mismatches;test-bridge-indices.mjs -> PASS
 - `glm-5.3`(agentrouter)503 是上游无渠道,与面无关.
 - relaycat 的 `gpt-5.4`/`gpt-5.2`/`gpt-5.6-luna`/`gpt-5.3-codex` 当前 502/503,
   直连与经网关状态码一致.
+
+## 2026-09-22:reasoning_content 503 风暴根因(桥接把 reasoning 挂错 assistant 消息)
+
+### 症状
+- 11:21 起 wb2api 日志连续 503(`global:deepseek-v4.1-flash`),每条前置
+  `[upstream] chat_stream .. upstream 400 .. code 11155 "the reasoning content from the
+  previous turn must be passed back in thinking mode" extError=reasoning_content_missing`;
+  当日该 400 累计 793 条(#2075 前每条 503 都对应一次).
+- 客户端是 Codex Desktop 会话(rollout-2026-09-22T11-24-09-..jsonl,cwd `G:\agentworks`),
+  约 3s 一次重试.首发是同一 wb2api 路由上的 omp 会话(11:19-11:20).
+- wb2api 把上游 400 统一表达成 503 `no_healthy_account`/`all accounts are temporarily
+  unavailable`,所以现场看起来像账号池故障;真实原因是请求体不满足上游 thinking 模式契约.
+
+### 定位方法(可复用)
+1. 先读上游原文与错误码(11155 / `reasoning_content_missing`):它唯一地指向
+   "上一轮 assistant 消息缺 `reasoning_content`".
+2. 在客户端侧取真实 item 顺序,不要凭猜测:codex rollout jsonl 里 response_item 序列是
+   `reasoning -> message(assistant, output_text) -> function_call x2 -> function_call_output x2`.
+3. 本地仿真桥接转换(不碰运行态):
+   `node "G:\omp works\.tmp\reasoning-repro-20260922\simulate.mjs" <rollout.jsonl>`
+   修复前输出 `#3 assistant content_len=33 reasoning_content_len=1823` 紧跟
+   `#4 assistant tool_calls=2 reasoning_content=MISSING`,统计 2/2 个 tool-call assistant 缺 reasoning.
+
+### 根因
+`bridge.mjs` 的 `function_call` 分支只在"尾部 assistant 的 content 为空"时才并入 tool_calls.
+codex 0.155 会把同一轮自己的文本作为 `message` item **先**回放,于是这一轮被拆成
+`A{content, reasoning_content}` + `A{tool_calls}`:reasoning 已被前一条消费,而上游检查的是
+产生 tool 结果的那一轮 -> 缺 `reasoning_content` -> 400/503.
+(早期 codex 只发 function_call,所以这条路径长期没被触发.)
+
+### 修复
+`function_call` 一律并入"仍处于打开状态"的尾部 assistant 消息(没有则新建),并把后到的
+reasoning 合并进同一条而不是覆盖.回归检查 3 条写入 `tools/test-bridge-request.mjs`
+(22 checks 全绿,`node tools/test-bridge-request.mjs`).
+
+### 验证(真实上游,不是单测)
+- 修复后隔离实例(`AR_GATEWAY_PORT=7879` 起同一份代码)对真实会话重建的同形态请求:
+  `HTTP 200`,返回 reasoning + message + function_call.
+- 线上重启后同形态请求(`.tmp\reasoning-repro-20260922\probe-ab.mjs` 指向 7878):`HTTP 200`;
+  wb2api 侧 `| #2087 | 11:35:05 | global:deep | stream | 200 | uid=f3ac894d | tok=132 |`.
+- 修复前同一形态的证据链:仿真显示 reasoning_content 缺失 + 线上 11155 原文(见上).
+
+### omp 侧同一错误码的另一来源(已处理)
+- `OMP_NO_REPLAY_REASONING=1` 是 omp-zh 补丁 5 的**全局总闸**(用户级环境变量),它对所有
+  provider 关闭 reasoning 回放 -> 同样的 11155/503.主会话已删除(用户范围 + 进程),
+  并用 omp `-p` 两轮实测:wb2api `#2088-#2090` 全 200.
+- 源码层移除补丁 5 的 c..h 门控与 compat 键、重建交付 omp-zh.exe:由子代理完成
+  (harness = Codex 原生子代理;model = `global:deepseek-v4.1-flash`;provider route = wb2api
+  经本网关).细节与产物摘要见 `Tools/omp-zh/DEVLOG.md` 同日条目.
+- 用户侧配置 `C:\Users\o_Obl\.omp\agent\models.yml` 的
+  `agentrouter-responses/gpt-6-astra.compat.replayResponsesReasoning: false` 已移除
+  (备份 `G:\omp works\.tmp\omp-config-backup-20260922-1140\`).
+- 注意:参考对照实验只在子进程里重新打开该环境变量**没有**复现 11155(短会话路径),
+  所以"该总闸是长会话/压缩路径的触发器"仍是推断,不是已证结论;本次修复不依赖该推断
+  (Codex 侧根因已由 A/B 探针闭环).
+
+### 运维:新增可回滚重启脚本
+`restart-gateway.ps1`:node --check 全模块 -> 快照到 `.tmp\gateway-restart-<stamp>\` ->
+只停"监听该端口且命令行匹配本目录 server.mjs"的进程 -> `cmd /c .. >> log 2>&1` 后台启动
+(与 services.ps1 同方案,日志只追加)-> 等端口 + `GET /u/v1/models` 自检.
+本次:`pid 30092 -> 16860`,`/u/v1/models` = 33 models,快照
+`G:\omp works\.tmp\gateway-restart-2026-09-22-113455`.
+回滚一条命令:`git checkout HEAD -- bridge.mjs tools/test-bridge-request.mjs` 后重跑脚本.
+
+### 同日查明、未修的相邻问题(交给后续)
+- wb2api 账号池:`50e6cfd8` `disabled=true`(reason "429 rate limit",until 07:07 已过期但不复活),
+  其余 6 个账号 `credits=0`;全局域请求落在无额度账号上(每次 400 都记一次错),
+  唯一有余额的 `5e2854ae` 只服务 cn 域.`uid=-` 与冷却不复活这条线未改.
+- "网关日志里有 wb2api 调用"不是路由串台:`server.mjs` 的 `/u` 只按请求体 `model` 分发,
+  没有 fallback;实际来源是其它客户端 —— omp(直连 7863)与若干 Codex 会话
+  (`codex exec -m cn:deepseek-v4-pro` 于 11:12 起,父进程是 `G:\agentworks\gaokao-math\high1`
+  下的 pwsh;另有 `~/.codex/config.toml` 的持久默认 `model = "global:deepseek-v4.1-flash"`,
+  即任何未带会话级覆盖的 codex 面都会落到 wb2api).
+- omp 会话正文出现大块 `<analysis>..` 文本(报告问题 3)尚未定位:现有证据只是 omp 自身的
+  checkpoint/compaction 文本块与 `[shaken .. artifact://374]` 占位,以及 8 处 `data: {` 形态字符串,
+  未确认是否异常.待续.

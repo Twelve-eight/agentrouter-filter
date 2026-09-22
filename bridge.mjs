@@ -51,18 +51,34 @@ function toChatMessages(body) {
       // A{a} A{b} T(a) T(b), which strict upstreams reject with
       // code 11148 "tool calls and tool results do not match" (wb2api surfaces it
       // as the misleading 503 "all accounts are temporarily unavailable").
+      //
+      // Codex 0.155 additionally replays a turn's own text as a `message` item
+      // BEFORE the function_calls of that same turn. Creating a second assistant
+      // message for the calls split one turn into A{content} + A{tool_calls}, and
+      // the reasoning item - which the branch below attaches to the FIRST
+      // assistant message it meets - never reached the tool-call message. The
+      // turn that produced the tool results then had no `reasoning_content` and
+      // DeepSeek rejected the follow-up with code 11155 "the reasoning content
+      // from the previous turn must be passed back in thinking mode" (again
+      // surfaced as 503). So append to the assistant message that is still open.
       const call = {
         id: it.call_id ?? it.id,
         type: "function",
         function: { name: it.name, arguments: it.arguments ?? "{}" },
       };
-      const last = tail[tail.length - 1];
-      if (last && last.role === "assistant" && Array.isArray(last.tool_calls) && !last.content) {
-        last.tool_calls.push(call);
-      } else {
-        const msg = { role: "assistant", content: null, tool_calls: [call] };
-        if (pendingReasoning.length) msg.reasoning_content = pendingReasoning.splice(0).join("\n\n");
-        tail.push(msg);
+      let target = tail[tail.length - 1];
+      if (!target || target.role !== "assistant") {
+        target = { role: "assistant", content: null, tool_calls: [] };
+        tail.push(target);
+      }
+      if (!Array.isArray(target.tool_calls)) target.tool_calls = [];
+      target.tool_calls.push(call);
+      // Reasoning that arrives AFTER the turn's text still belongs to this
+      // assistant message; merge instead of overwriting.
+      if (pendingReasoning.length) {
+        target.reasoning_content = [target.reasoning_content, ...pendingReasoning.splice(0)]
+          .filter(Boolean)
+          .join("\n\n");
       }
       continue;
     }

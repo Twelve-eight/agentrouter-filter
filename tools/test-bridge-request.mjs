@@ -8,6 +8,11 @@
 //   2. reasoning items were dropped entirely, so DeepSeek's thinking mode
 //      rejected the follow-up turn with code 11155 "the reasoning content from
 //      the previous turn must be passed back in thinking mode".
+//   3. codex 0.155 replays a turn's own text (message/assistant/output_text)
+//      BEFORE that turn's function_calls, so the calls opened a SECOND assistant
+//      message and the reasoning - attached to the text one - never reached it.
+//      The upstream then saw the tool-call turn without reasoning_content and
+//      rejected the follow-up with 11155 as well (2026-09-22 live 503 storm).
 // wb2api reports both as the misleading 503 "all accounts are temporarily
 // unavailable", so a passing PONG probe (msgs=2 tools=0) proves nothing here.
 //
@@ -102,6 +107,60 @@ check("every assistant carrying tool_calls in a real-shaped turn has reasoning",
     assert.strictEqual(a.reasoning_content, `step ${i}`, `turn ${i} lost its reasoning`);
     assert.strictEqual(a.tool_calls.length, 2, `turn ${i} must merge both calls`);
   }
+});
+
+// --- codex 0.155 turn shape: the turn's own text precedes its calls -----------
+// Real session evidence (rollout-2026-09-22T11-24-09-..jsonl), one assistant turn:
+//   reasoning -> message(assistant, output_text) -> function_call x2 -> output x2
+// The text item used to consume the pending reasoning and the calls opened a
+// second assistant message, so the turn the upstream validates had none.
+const textMsg = (text) => ({ type: "message", role: "assistant", content: [{ type: "output_text", text }] });
+
+check("codex 0.155 shape: text + calls stay ONE assistant turn carrying reasoning", () => {
+  const msgs = toChatMessages({
+    input: [
+      reasoning("turn 1 reasoning"),
+      textMsg("turn 1 text"),
+      call("c1", "exec"),
+      call("c2", "list"),
+      out("c1"),
+      out("c2"),
+    ],
+  });
+  const assistants = msgs.filter((m) => m.role === "assistant");
+  assert.strictEqual(assistants.length, 1, `expected 1 assistant turn, got ${assistants.length}`);
+  assert.strictEqual(assistants[0].content, "turn 1 text", "the turn's own text must survive");
+  assert.strictEqual(assistants[0].reasoning_content, "turn 1 reasoning");
+  assert.strictEqual(assistants[0].tool_calls.length, 2, "both calls belong to that one turn");
+});
+
+check("codex 0.155 shape: every tool-call turn of a repeated session has reasoning", () => {
+  const input = [];
+  for (let i = 0; i < 3; i++) {
+    input.push(
+      reasoning(`step ${i}`),
+      textMsg(`text ${i}`),
+      call(`a${i}`, "exec"),
+      call(`b${i}`, "list"),
+      out(`a${i}`),
+      out(`b${i}`),
+    );
+  }
+  const msgs = toChatMessages({ input });
+  const assistants = msgs.filter((m) => m.role === "assistant");
+  assert.strictEqual(assistants.length, 3, `expected 3 assistant turns, got ${assistants.length}`);
+  for (const [i, a] of assistants.entries()) {
+    assert.strictEqual(a.reasoning_content, `step ${i}`, `turn ${i} lost its reasoning`);
+    assert.strictEqual(a.content, `text ${i}`, `turn ${i} lost its text`);
+    assert.strictEqual(a.tool_calls.length, 2, `turn ${i} must carry both calls`);
+  }
+});
+
+check("a final text answer after tool results stays its own assistant turn", () => {
+  const msgs = toChatMessages({ input: [call("c1", "exec"), out("c1"), textMsg("done")] });
+  const assistants = msgs.filter((m) => m.role === "assistant");
+  assert.strictEqual(assistants.length, 2, "the closing text answer is a separate assistant message");
+  assert.ok(!assistants[1].tool_calls, "the closing answer must not inherit the turn's calls");
 });
 
 // --- the surrounding contract still holds -------------------------------------
