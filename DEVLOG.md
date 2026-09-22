@@ -690,3 +690,41 @@ Codex 0.155 把多智能体/MCP 工具作为**命名空间工具**下发:`{type:
   已实测观察到该形态 (`cn:deepseek` 连续 503 `uid=-`)。是否需要网关侧信号量待用户决定。
 - `global:deepseek-v4.1-flash-sg` 未配 fallback (待确认与 cn 同族是否可互相替代)。
 - 线上 7878 需重启才会加载新代码。
+
+## 2026-09-22 (19:40) 重启后清点与收尾
+
+### 状态确认
+- 17:32:06 开机 autostart 拉起全部服务 (7878/7863/7901/8787)。
+- **7878 已加载跨域降级代码** (进程 17:32:06 晚于 server.mjs 17:13:23), 且实测生效:
+  对 `global:deepseek-v4.1-flash` 的请求返回 200 + `X-Gateway-Realm: cn` +
+  `X-Gateway-Retry-At: 2026-09-22T20:00:00.000Z` (= 09/23 04:00 CST)。
+- 重启后 wb2api 日志中 `11155 reasoning_content_missing` **0 次** (此前 10:21-10:22 密集出现)。
+  说明 bridge.mjs 的 reasoning_content 回传在重启后正常。
+
+### 修复: 恢复时间的精度标签会虚标 (本日 64ad7aa 引入)
+- 症状: `globalRealmState` 用**跨账号粘性标志**判定 `modelLevel`, 只要任一账号有模型级冷却,
+  最终标签就写成 `status-model` (宣称上游权威)。
+- 实测反例 (真实数据): 最早恢复的是 `53c8d24c` 的**账号级** hard_credit `09-23 04:00`,
+  而模型级最早是 `0c5c5d59` 的 `09-23 07:37`。最早者决定返回值, 故正确标签是
+  `status-account` (本地估算), 但线上代码报的是 `status-model` —— 把估算说成权威。
+- 修复: 标签改为**逐账号**跟踪, 由真正决定 `minAt` 的那个账号决定
+  (`minLevel`)。另修: 模型级判定用 `>=` 而非 `>`, 因为未截断时 wb2api 的
+  `Until == ResetAt` (`pool/entry.go`), 该相等本身就是权威情形。
+- 新增 4 个断言锁死: "最早者决定标签"(account 胜) 与 "模型级确实标为权威"(model 胜) 双向覆盖。
+- 门禁: `test-realm-fallback.mjs` **25/25 PASS**; check-syntax / filter-failopen / bridge-request(32) /
+  bridge-indices / usage-pricing 全绿。
+
+### 一并提交的既有未提交工作
+- `oc-zen-proxy.mjs`: 缺 `NODE_USE_ENV_PROXY` 时**显式告警**(此前是难以定位的 502 挂起)。
+- `services.ps1`: 导出 `NODE_USE_ENV_PROXY=1` + `HTTPS_PROXY=127.0.0.1:7897` 供服务子进程继承
+  (Node 只在启动前读该变量); 顺手把顶格注释的缩进与多余空行整理掉。
+- `tools/build-model-catalog.cjs`: `OVERRIDE_SLUGS` 白名单 (spawn_agent 覆盖列表)
+  + 两条启动期护栏 (内置项若改用负 priority、或白名单超过 5 条, 直接构建失败)。
+- `start-zen-proxy.ps1`: 手动拉起 zen 反代 (带代理环境变量, 幂等)。
+
+### 未完成 / 待办
+- **D1 国内版并发预算仍未实现**。重启后实测 `cn 503 count = 0` / `global 503 count = 1`,
+  即当前流量下国内版没被打满; 但降级洪峰场景仍未设信号量。
+- **zen mimo 仍 429** (实测, 配额未恢复)。子代理仍只能用 wb2api 的 ds。
+- 线上 7878 需要重启才能加载本次的标签修复 (旧标签虚标不影响可用性, 只影响
+  `X-Gateway-Realm-Source` 的准确度)。

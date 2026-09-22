@@ -552,25 +552,43 @@ function globalRealmState(status, bareModel) {
   if (!accounts.length) return { ok: false, at: null, source: "no-account" };
   const now = Date.now();
   let minAt = null;
-  let modelLevel = false;
+  // Which KIND of blocker produced minAt. This must be tracked per-account, not
+  // as a sticky any-account flag: an account with a truncated account-level
+  // `until` can expire EARLIER than another account's upstream-authoritative
+  // model reset, and then it is the one that decides the reported time. A sticky
+  // flag would label that estimate "status-model" and overstate its precision.
+  let minLevel = null;
   for (const a of accounts) {
     if (a.disabled) continue;
+    // Account-level block: `until` is a LOCAL estimate (soft_rate_max can
+    // truncate it, and hard_credit parks the account until the 04:00 re-probe,
+    // not until credits actually return).
     let at = 0;
+    let level = "account";
     const until = Date.parse(a.until ?? "");
     if (Number.isFinite(until)) at = Math.max(at, until);
     for (const m of a.rate_limited_models ?? []) {
       if (m.model !== bareModel) continue;
       const reset = Date.parse(m.reset_at ?? "") || Date.parse(m.until ?? "");
-      if (Number.isFinite(reset)) {
-        at = Math.max(at, reset);
-        modelLevel = true;
+      // `>=` rather than `>` matters: when the cooldown was NOT truncated,
+      // wb2api reports Until == ResetAt (see pool/entry.go: ResetAt is the raw
+      // upstream wall clock and equals Until in the untruncated case). That
+      // equality IS the authoritative case, so it must still label as "model".
+      if (Number.isFinite(reset) && reset >= at) {
+        // Model-level 6004 reset from the upstream's own wall clock: the most
+        // authoritative signal available, so it wins the label for THIS account.
+        at = reset;
+        level = "model";
       }
     }
     if (at <= now) return { ok: true, at: null, source: "status" };
-    if (minAt === null || at < minAt) minAt = at;
+    if (minAt === null || at < minAt) {
+      minAt = at;
+      minLevel = level;
+    }
   }
   if (minAt === null) return { ok: false, at: null, source: "all-disabled" };
-  return { ok: false, at: minAt, source: modelLevel ? "status-model" : "status-account" };
+  return { ok: false, at: minAt, source: minLevel === "model" ? "status-model" : "status-account" };
 }
 
 /**

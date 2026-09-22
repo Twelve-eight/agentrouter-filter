@@ -74,6 +74,17 @@ const BASE = 'You are Codex, a coding agent. You and the user share the same wor
 // verified accepted by both the agentrouter and wb2api paths.
 const DEFAULT_EFFORT = 'max';
 
+// The models a sub-agent may be spawned with: these are the only entries offered in
+// spawn_agent's "Available model overrides" list (see the priority note inside
+// entry()). User decision 2026-09-22: the wb2api deepseek-v4.1-flash family plus the
+// opencode zen mimo. Everything else stays spawnable through inheritance only.
+const OVERRIDE_SLUGS = new Set([
+  'global:deepseek-v4.1-flash',
+  'global:deepseek-v4.1-flash-sg',
+  'cn:deepseek-v4.1-flash',
+  'mimo-v2.6-flash-free',
+  'zen:mimo-v2.6-flash',
+]);
 function entry(slug, display, description, efforts, contextWindow) {
   return {
     slug,
@@ -85,7 +96,17 @@ function entry(slug, display, description, efforts, contextWindow) {
     shell_type: 'shell_command',
     visibility: 'list',
     supported_in_api: true,
-    priority: 0,
+    // `priority` has TWO independent meanings, both verified on 2026-09-22 by
+    // capturing the request body with a local proxy:
+    //   priority > 0  - ordering among the built-in entries in the picker list.
+    //   priority < 0  - the entry is offered in spawn_agent's "Available model
+    //                   overrides" list. The list is capped at 5 entries and only
+    //                   negative priorities qualify; built-ins (1..43) and every
+    //                   other entry stay out of it. So 0 (default) keeps an entry
+    //                   routable and pickable while leaving the override list alone.
+    // OVERRIDE_SLUGS below is the single place that decides which models a
+    // sub-agent may be spawned with.
+    priority: OVERRIDE_SLUGS.has(slug) ? -1 : 0,
     supports_reasoning_summaries: true,
     default_reasoning_summary: 'none',
     support_verbosity: false,
@@ -213,6 +234,21 @@ const collisions = ours.filter((m) => have.has(m.slug));
 // Only built-ins the registry can route: the picker must never offer a model
 // that /u would answer 404 for. (codex-auto-review, gpt-daybreak-* were listed
 // by codex but served by nobody; codex-auto-review is now in the registry.)
+// Guard: the spawn_agent override list is capped at 5 entries and is filled in
+// catalog order, built-ins first. A built-in entry with a negative priority would
+// therefore silently evict one of OVERRIDE_SLUGS. Today every built-in uses a
+// positive value (astra 1 .. codex-auto-review 43) - fail loudly if that changes,
+// rather than shipping a sub-agent list that quietly lost a model.
+const builtinNegative = builtin.models.filter((m) => typeof m.priority === "number" && m.priority < 0);
+if (builtinNegative.length) {
+  throw new Error(
+    `refusing to build: built-in entries now use a negative priority (${builtinNegative.map((m) => `${m.slug}=${m.priority}`).join(', ')}); ` +
+      'they would occupy slots in the spawn_agent override list - re-check that list before proceeding',
+  );
+}
+if (OVERRIDE_SLUGS.size > 5) {
+  throw new Error(`refusing to build: OVERRIDE_SLUGS has ${OVERRIDE_SLUGS.size} entries but the spawn_agent override list only shows 5`);
+}
 const ROUTED = new Set(Object.keys(REGISTRY.models).filter((k) => REGISTRY.models[k] && typeof REGISTRY.models[k] === "object"));
 const droppedBuiltins = builtin.models.filter((m) => !ROUTED.has(m.slug)).map((m) => m.slug);
 const keptBuiltins = builtin.models.filter((m) => ROUTED.has(m.slug));

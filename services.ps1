@@ -1,3 +1,11 @@
+# The zen free tier is reached through the local HTTP proxy: a direct TLS
+# handshake to opencode.ai hangs (curl HTTP 000 after 20s) while the same GET
+# through 127.0.0.1:7897 answers 200 in ~1.3s. Node only honours HTTPS_PROXY for
+# its built-in fetch when NODE_USE_ENV_PROXY is set BEFORE the process starts,
+# so export both here and let run-service-tab.ps1 inherit them.
+$env:NODE_USE_ENV_PROXY = '1'
+if (-not $env:HTTPS_PROXY) { $env:HTTPS_PROXY = 'http://127.0.0.1:7897' }
+
 # Service table shared by autostart.ps1 (port probe + tab launch) and
 # run-service-tab.ps1 (actual execution). Keeping the paths here means the only
 # argument that crosses a process boundary is the space-free service key, which

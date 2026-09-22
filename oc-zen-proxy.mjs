@@ -16,6 +16,21 @@
 import fs from "node:fs";
 import http from "node:http";
 
+// This box reaches opencode.ai only through the local HTTP proxy: a direct TLS
+// handshake to opencode.ai hangs (curl: HTTP 000 after 20s) while the same GET
+// through 127.0.0.1:7897 answers 200 in ~1.3s. Node 24 needs NODE_USE_ENV_PROXY
+// for its built-in fetch to honour HTTPS_PROXY, so enable it here rather than
+// depending on the launcher having exported it. Set OC_PROXY_NO_TUNNEL=1 to
+// keep fetch direct (for a network that does not need the tunnel).
+// NOTE: Node reads NODE_USE_ENV_PROXY only at STARTUP; setting it in-process has
+// no effect on the built-in fetch (verified: same script, same assignment, still
+// ERR fetch failed). The launcher must export it with HTTPS_PROXY - see
+// services.ps1. When it is missing we say so loudly instead of an opaque 502.
+if (!process.env.NODE_USE_ENV_PROXY && !process.env.OC_PROXY_NO_TUNNEL) {
+  console.error("oc zen proxy: NODE_USE_ENV_PROXY is not set; fetch will go direct, " +
+    "and opencode.ai is expected to hang. Start with NODE_USE_ENV_PROXY=1 and " +
+    "HTTPS_PROXY=http://127.0.0.1:7897 (see services.ps1).");
+}
 const PORT = Number(process.env.OC_PROXY_PORT || 7901);
 const UPSTREAM = process.env.OC_PROXY_UPSTREAM || "https://opencode.ai";
 const SESSION_FILE = process.env.OC_PROXY_SESSION_FILE || "G:/omp works/Tools/agentrouter-filter/.oc-session";

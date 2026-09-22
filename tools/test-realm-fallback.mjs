@@ -265,6 +265,74 @@ check("no-fallback: never redirected to another realm", () => {
 });
 check("no-fallback: no realm header added", () => eq(res.headers["x-gateway-realm"], undefined, "realm header"));
 
+// --- 5. the precision label follows the account that sets the time ----------
+// Real observation (2026-09-22): one global account was cooling with a local
+// account-level until of 16:41 while another carried the upstream's
+// model-level reset_at of the NEXT DAY. The earliest of those (16:41) is a
+// local estimate that soft_rate_max may have truncated, so it must NOT be
+// labelled "status-model" - that would claim upstream authority for a guess.
+// This case pins the label to whichever account actually decided the time.
+{
+  const restore = {
+    status: localStatus,
+    health: localHealth,
+    script: script,
+  };
+  // Clear the armed window first so the next request re-enters global and
+  // re-arms it against this mixed /status.
+  localStatus = globalStatus("2020-01-01T00:00:00+08:00"); // already expired
+  localHealth = { healthy: 1, realm_servable: { cn: true, global: true } };
+  script = [ok()]; // one global attempt that SUCCEEDS, clearing the window
+  chatCalls.length = 0;
+  await post(reqBody(GLOBAL));
+
+  // Now: account A = soon local estimate, account B = upstream model reset.
+  const soon = new Date(Date.now() + 60_000).toISOString();          // local estimate
+  const far = new Date(Date.now() + 24 * 3600_000).toISOString();    // upstream model reset
+  localStatus = {
+    accounts: [
+      { uid: "gA", realm: "global", disabled: false, cooling: true, until: soon },
+      { uid: "gB", realm: "global", disabled: false, cooling: true, until: soon, rate_limited_models: [
+        { model: "deepseek-v4.1-flash", reset_at: far },
+      ] },
+    ],
+    realm_totals: { cn: { healthy: 1 }, global: { healthy: 0 } },
+  };
+  localHealth = { healthy: 1, realm_servable: { cn: true, global: false } };
+  script = [...globalExhausted(), ok()];
+  chatCalls.length = 0;
+  res = await post(reqBody(GLOBAL));
+  check("label: earliest blocker decides, not the most authoritative one", () =>
+    eq(res.headers["x-gateway-realm-source"], "status-account", "source header"));
+  check("label: time is that earliest blocker", () =>
+    eq(res.headers["x-gateway-retry-at"], new Date(soon).toISOString(), "retry-at"));
+
+  // And when the MODEL reset is the earliest blocker, the label flips.
+  const soon2 = new Date(Date.now() + 120_000).toISOString();
+  const far2 = new Date(Date.now() + 48 * 3600_000).toISOString();
+  localStatus = {
+    accounts: [
+      { uid: "gA", realm: "global", disabled: false, cooling: true, until: far2 },
+      { uid: "gB", realm: "global", disabled: false, cooling: true, until: soon2, rate_limited_models: [
+        { model: "deepseek-v4.1-flash", reset_at: soon2 },
+      ] },
+    ],
+    realm_totals: { cn: { healthy: 1 }, global: { healthy: 0 } },
+  };
+  script = [...globalExhausted(), ok()];
+  chatCalls.length = 0;
+  res = await post(reqBody(GLOBAL));
+  check("label: a model-level blocker IS labelled authoritative", () =>
+    eq(res.headers["x-gateway-realm-source"], "status-model", "source header"));
+  check("label: and carries the upstream reset time", () =>
+    eq(res.headers["x-gateway-retry-at"], new Date(soon2).toISOString(), "retry-at"));
+
+  // Leave the module in a sane state for the summary below.
+  localStatus = restore.status;
+  localHealth = restore.health;
+  script = restore.script;
+}
+
 out("");
 out(failed ? `${failed} check(s) FAILED\n` : "all checks passed\n");
 process.exitCode = failed ? 1 : 0;
