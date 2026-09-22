@@ -3,6 +3,20 @@
 // The hook is TypeScript with an `import type`; node 24 strips types natively,
 // imports, so it can be loaded directly. Both sides get identical inputs and
 // must agree byte-for-byte, which is what proves the generator lost no rule.
+//
+// SCOPE - read this before trusting a green run. This is a COPY-FIDELITY test,
+// not a correctness test for the rules. Both sides are the SAME rule set: the
+// generated file is derived from the hook core, and the reference below is that
+// same hook core. It therefore cannot fail because a rule is wrong, obsolete,
+// or no longer matches what the upstream blocks - it can only fail when the
+// generator drops or alters something during the copy. Whether the rules are
+// still correct or still needed is a separate question answered by probing the
+// upstream (see the README section on whether this layer is still required),
+// never by this file. A "0 mismatches" line must not be read as "the filter is
+// correct".
+//
+// The samples below are also drawn from the same ruleset, so they exercise the
+// copy, not the rules' coverage of real upstream behaviour.
 import { sanitize as genSanitize, deepStrip as genDeepStrip } from "../filter-core.ts";
 import fs from "node:fs";
 

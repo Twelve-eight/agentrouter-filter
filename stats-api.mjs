@@ -12,7 +12,7 @@
 // Endpoints with no backing data in a proxy (sessions/transcripts, snapcompact
 // gain, message-content behavior) return empty results rather than throwing, so
 // those panels render empty instead of taking the whole page down.
-import { read as readUsage } from "./usage.mjs";
+import { read as readUsage, costOf } from "./usage.mjs";
 
 // Range table, verbatim from omp's aggregator (aggregator.ts `TTo`).
 const HOUR = 3600 * 1000;
@@ -51,9 +51,19 @@ const tsOf = (r) => {
 };
 const n = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
-/** One of our rows -> the flat shape omp's client reads. */
+/**
+ * One of our rows -> the flat shape omp's client reads.
+ *
+ * 口径: "unpriced" must not be reported as "free". `costUnpriced` is the ONLY
+ * signal for that distinction, because the cost object below is zero-filled for
+ * the client (`cost: null` would blank its arithmetic) - so a row that is
+ * genuinely priced at zero and a row with no published price both surface as
+ * total 0 and are told apart solely by this flag. It is derived with usage.mjs's
+ * costOf() so both modules agree on what "priced" means; a truthiness test would
+ * disagree on a malformed cost value.
+ */
 function toOmpRow(r) {
-  const cost = r?.cost ?? null;
+  const cost = costOf(r);
   const input = n(r.input_tokens);
   const output = n(r.output_tokens);
   const cacheRead = n(r.cached_tokens);
@@ -89,9 +99,9 @@ function toOmpRow(r) {
       },
     },
     agentType: "main",
-    // cost:null means "no published price" - omp uses this flag to exclude the
-    // request from cost averages instead of counting it as free.
-    costUnpriced: !cost,
+    // null here means "no published price" - omp excludes these from cost
+    // averages instead of counting them as free.
+    costUnpriced: cost === null,
   };
 }
 
@@ -173,8 +183,12 @@ function groupBy(rows, keyOf) {
 
 function byModel(rows) {
   const out = [];
-  for (const [model, list] of groupBy(rows, (r) => `${r.model}\u0000${r.provider}`)) {
-    out.push({ model, provider: list[0].provider, ...aggregate(list) });
+  // The group key is composite (model + provider) because the same model id is
+  // served by several upstreams and must stay separate - but it is only a KEY.
+  // Pushing it as `model` leaked a literal NUL into the API (the client rendered
+  // "deepseek-v4.1-flash\u0000relaycat-cn"), so take the fields off the row.
+  for (const [, list] of groupBy(rows, (r) => `${r.model}\u0000${r.provider}`)) {
+    out.push({ model: list[0].model, provider: list[0].provider, ...aggregate(list) });
   }
   return out.sort((a, b) => b.totalInputTokens + b.totalOutputTokens - (a.totalInputTokens + a.totalOutputTokens));
 }

@@ -18,7 +18,21 @@
 //   /ar/*  -> https://ps.air-outer.com/v1     (native responses upstream)
 //   /wb/*  -> http://127.0.0.1:7863/v1        (chat upstream, bridged)
 //   /rc/*  -> https://api.relaycat.top/v1     (native responses upstream)
-// Everything posted is sanitised by filter.mjs first.
+//   /u/*   -> whichever registry provider serves the request's `model`
+//
+// filter.mjs does NOT run on every route: it is opt-in per route, and only the
+// routes flagged `filter: true` below (plus registry entries with `filter: true`
+// in providers.json, reached through /u) are sanitised. Today that is
+// agentrouter only - the other upstreams forward the body verbatim, so their
+// emoji/non-approved characters are preserved. The README route table is the
+// authoritative list; it is kept in sync with this flag rather than restated
+// here, because a second copy is what drifts.
+//
+// The listener is a LOCAL TRUST component: it binds 127.0.0.1 and performs no
+// authentication of its own, and the unified /u route substitutes the upstream
+// credential from the environment. Anything that can reach 127.0.0.1:7878 can
+// therefore spend the configured upstream keys and read the usage log. See the
+// README's "本地信任边界" note.
 
 import fs from "node:fs";
 import http from "node:http";
@@ -470,8 +484,15 @@ const server = http.createServer(async (req, res) => {
       const next = filterBody(body, { injectInstructions: true });
       changed = next !== body;
       body = next;
-    } catch {
-      /* fail-open, matching the omp hook */
+    } catch (e) {
+      // Fail-open, matching the omp hook (README: "失败时放行不阻断"). The request
+      // still goes out, but UNFILTERED - and this route's whole purpose is to
+      // sanitise before the body leaves the machine, so the bypass must at least
+      // be visible in the log. Silent here would mean an unsanitised body is
+      // indistinguishable from a clean one.
+      log(
+        `!! filter threw on ${prefix}${rest}; forwarding UNFILTERED (${raw.length} bytes): ${e?.message ?? e}`,
+      );
     }
   }
   if (changed && route.filter) log(`filter rewrote ${prefix}${rest} body (${raw.length} -> ${Buffer.byteLength(body)})`);

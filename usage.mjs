@@ -13,6 +13,10 @@
 // Cost is NOT computed here: provider prices are not published in a machine
 // readable form and inventing a table would be a fabrication. Credits are shown
 // only where an upstream reports them (wb2api publishes `credits` per model).
+//
+// Two things that must never be conflated in the aggregate: `cost: null`
+// ("no published price") and a priced-at-zero cost object (`total: 0`). See
+// costOf() and summarize() for how they are kept apart.
 import fs from "node:fs";
 import path from "node:path";
 import { priceFor } from "./pricing.mjs";
@@ -86,7 +90,34 @@ function read(days = 7) {
   return out;
 }
 
-/** Aggregate rows into the shapes the UI needs. */
+// The row's cost object, or null when no price is known for it.
+//
+// Existence + shape, never truthiness: `{ total: 0 }` is a real price of zero
+// and must stay distinguishable from `null`. Historical rows can also carry a
+// non-object in this field (an earlier writer put a bare number/string there);
+// those are malformed and must not be counted as priced either.
+function costOf(row) {
+  const c = row?.cost;
+  return c !== null && typeof c === "object" && !Array.isArray(c) ? c : null;
+}
+
+// A finite numeric total, else 0. A malformed `total` (string, null, NaN) must
+// contribute nothing rather than turn the running sum into a string.
+function totalOf(cost) {
+  const t = cost?.total;
+  return typeof t === "number" && Number.isFinite(t) ? t : 0;
+}
+
+/**
+ * Aggregate rows into the shapes the UI needs.
+ *
+ * Priced vs unpriced is decided by costOf(): a row with `cost: null` is not
+ * counted in `priced_requests` and adds nothing to `cost_usd`, while a row with
+ * a `total: 0` cost object IS counted and adds 0. Callers must therefore read
+ * `priced_requests` to interpret the sum - `cost_usd === 0` with
+ * `priced_requests === 0` means "nothing was priced", not "it was all free".
+ * Only `priced_requests === requests` makes a zero sum a real zero bill.
+ */
 function summarize(rows) {
   const byProvider = new Map();
   const byModel = new Map();
@@ -130,8 +161,9 @@ function summarize(rows) {
     e.output_tokens += r.output_tokens ?? 0;
     e.reasoning_tokens += r.reasoning_tokens ?? 0;
     e.cached_tokens += r.cached_tokens ?? 0;
-    if (r.cost) {
-      e.cost_usd += r.cost.total ?? 0;
+    const cost = costOf(r);
+    if (cost) {
+      e.cost_usd += totalOf(cost);
       e.priced_requests++;
     }
     e.duration_ms += r.duration_ms ?? 0;
@@ -145,8 +177,9 @@ function summarize(rows) {
     totals.output_tokens += r.output_tokens ?? 0;
     totals.reasoning_tokens += r.reasoning_tokens ?? 0;
     totals.cached_tokens += r.cached_tokens ?? 0;
-    if (r.cost) {
-      totals.cost_usd += r.cost.total ?? 0;
+    const cost = costOf(r);
+    if (cost) {
+      totals.cost_usd += totalOf(cost);
       totals.priced_requests++;
     }
     totals.duration_ms += r.duration_ms ?? 0;
@@ -169,4 +202,4 @@ function summarize(rows) {
   };
 }
 
-export { record, read, summarize, dayKey };
+export { record, read, summarize, dayKey, costOf };
