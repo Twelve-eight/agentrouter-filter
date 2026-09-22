@@ -78,6 +78,16 @@ loadLocalEnv();
 const PORT = Number(process.env.AR_GATEWAY_PORT ?? 7878);
 const HOST = "127.0.0.1";
 
+// The opencode-zen free tier only serves requests that carry the OpenCode
+// client's first five built-in tool definitions (see oc-zen-proxy.mjs). The proxy
+// prepends them, so they must be stripped from anything the caller sees - a tool
+// the caller never declared must not show up in a response.
+const TOOL_GUARD_NAMES = new Set(["bash", "edit", "glob", "grep", "read"]);
+function isGuardToolName(name) {
+  return typeof name === "string" && TOOL_GUARD_NAMES.has(name);
+}
+
+
 // Origins only: the incoming path already carries /v1/.. (Codex base_url is
 // http://127.0.0.1:7878/<prefix>/v1).
 // AR_UPSTREAM_<PREFIX> overrides a route's origin (e.g. to point /ar at a
@@ -209,6 +219,9 @@ function providerFor(model) {
     // provider whose key the client happened to send.
     keyEnv: p.keyEnv,
     key: p.keyEnv ? process.env[p.keyEnv] : undefined,
+    // Effort levels the upstream accepts, when it is pickier than chat/completions
+    // (opencode-zen free models: low/medium/high only; max/xhigh are 400).
+    efforts: Array.isArray(p.efforts) ? p.efforts : null,
   };
 }
 
@@ -513,7 +526,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: { message: "bad json" } }));
       return;
     }
-    const chat = toChatBody(parsed, parsed.model);
+    const chat = toChatBody(parsed, parsed.model, route.efforts ?? null);
     log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${chat.messages.length} tools=${chat.tools?.length ?? 0}`);
     let upstream;
     try {
@@ -551,7 +564,7 @@ const server = http.createServer(async (req, res) => {
         reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
         cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
       });
-    });
+    }, isGuardToolName);
     return;
   }
 

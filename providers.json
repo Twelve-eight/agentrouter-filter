@@ -46,6 +46,16 @@
       "base": "https://api.justwoker.icu",
       "wire": "anthropic",
       "keyEnv": "JUSTWOKER_API_KEY"
+    },
+    "opencode-zen": {
+      "base": "http://127.0.0.1:7901/zen",
+      "wire": "chat",
+      "keyEnv": "OPENCODE_API_KEY",
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ]
     }
   },
   "_models_comment": [
@@ -159,6 +169,13 @@
     },
     "cn:minimax-m3": {
       "p": "wb2api"
+    },
+    "mimo-v2.6-flash-free": {
+      "p": "opencode-zen"
+    },
+    "zen:mimo-v2.6-flash": {
+      "p": "opencode-zen",
+      "m": "mimo-v2.6-flash-free"
     }
   },
   "_claude_comment": "claude-opus-4-8 is served by justwoker over the anthropic-messages wire (see the anthropic bridge in bridge.mjs). It was briefly removed when only agentrouter offered it: agentrouter registers the claude ids on its anthropic-messages face only (messages=402 quota, responses=503, while a nonexistent model is 503 on both) and codex speaks only responses, so selecting them always failed. That is why the responses->messages bridge exists. claude-opus-5 is still unavailable on every provider we route."

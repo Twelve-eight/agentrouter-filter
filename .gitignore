@@ -8,3 +8,6 @@ node_modules/
 # Runtime usage accounting (per-request JSONL). Not source: it grows with use and
 # is machine-local. Kept on disk for the /stats dashboard.
 data/
+
+# opencode zen free-tier session id (machine-local, minted by the opencode client)
+.oc-session

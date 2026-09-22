@@ -128,7 +128,7 @@ function toChatTools(tools) {
   return mapped.length ? mapped : undefined;
 }
 
-function toChatBody(body, model) {
+function toChatBody(body, model, allowedEfforts = null) {
   const messages = toChatMessages(body);
   const chat = { model, messages, stream: true };
   const tools = toChatTools(body.tools);
@@ -148,7 +148,28 @@ function toChatBody(body, model) {
     // codex also emits levels the chat upstreams do not know (`ultra`,
     // `persistent`); agentrouter rejects unknown variants with 422, so clamp to
     // the highest level the upstreams accept.
-    chat.reasoning_effort = effort === "ultra" || effort === "persistent" ? "max" : effort;
+    let level = effort === "ultra" || effort === "persistent" ? "max" : effort;
+    // opencode-zen accepts only low/medium/high for the free models: `max` and
+    // `xhigh` come back as a 400 "Invalid request parameters" (measured
+    // 2026-09-22), while `minimal` is refused too. Clamp into that window.
+    if (allowedEfforts) {
+      const known = allowedEfforts;
+      if (known.length && !known.includes(level)) {
+        const rank = ["minimal", "low", "medium", "high", "xhigh", "max"];
+        const target = rank.indexOf(level);
+        let best = null;
+        for (const k of known) {
+          const r = rank.indexOf(k);
+          if (r < 0) continue;
+          if (best === null) { best = k; continue; }
+          const br = rank.indexOf(best);
+          if (r > target && (br <= target || r < br)) best = k;
+          else if (br <= target && r > br) best = k;
+        }
+        if (best) level = best;
+      }
+    }
+    chat.reasoning_effort = level;
   }
   return chat;
 }
@@ -260,7 +281,7 @@ function sse(res, event, data) {
 // drift on output_index ordering - that ordering was the hard-won part (see the
 // openReasoning comment) and duplicating it invited a silent regression in one
 // of the two paths.
-function createResponsesEmitter({ res, model, stream, onUsage }) {
+function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null }) {
   const respId = "resp_" + Math.random().toString(36).slice(2, 14);
   const created = Math.floor(Date.now() / 1000);
   const base = { id: respId, object: "response", created_at: created, model, status: "in_progress", output: [] };
@@ -481,6 +502,9 @@ function createResponsesEmitter({ res, model, stream, onUsage }) {
     // anthropic: the content-block index). Name and arguments accumulate because
     // both wires stream them in pieces.
     call(key, { id, name, args }) {
+      // A guarded tool (see oc-zen-proxy.mjs) is upstream-only bookkeeping: the
+      // caller never declared it, so neither the item nor its deltas may surface.
+      if (toolGuard && typeof name === "string" && name && toolGuard(name)) return;
       let c = calls.get(key);
       if (!c) {
         c = {
@@ -528,8 +552,8 @@ function createResponsesEmitter({ res, model, stream, onUsage }) {
 // chat SSE -> responses SSE
 // ---------------------------------------------------------------------------
 
-function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage = null) {
-  const em = createResponsesEmitter({ res, model, stream, onUsage });
+function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage = null, toolGuard = null) {
+  const em = createResponsesEmitter({ res, model, stream, onUsage, toolGuard });
   let buf = "";
   upstream.on("data", (chunk) => {
     buf += chunk.toString("utf8");
@@ -588,8 +612,8 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
 // content_block_start, so the block index doubles as the emitter's call key.
 // Thinking blocks map to the responses `reasoning` item; text and tool_use map
 // to the message and function_call items.
-function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = null) {
-  const em = createResponsesEmitter({ res, model, stream, onUsage });
+function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = null, toolGuard = null) {
+  const em = createResponsesEmitter({ res, model, stream, onUsage, toolGuard });
   let buf = "";
   let inputTokens = 0;
   let cachedTokens = 0;

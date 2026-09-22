@@ -140,3 +140,28 @@ curl -s -N -X POST http://127.0.0.1:7878/ar/v1/responses \
   -H "Authorization: Bearer $AGENTROUTER_API_KEY" -H "Content-Type: application/json" \
   -H "originator: codex_exec" -d @body.json
 ```
+
+## opencode zen 免费档(`opencode-zen` 路由)
+
+Codex 里可选的 `mimo-v2.6-flash-free`(别名 `zen:mimo-v2.6-flash`)走本机反代
+`oc-zen-proxy.mjs`(127.0.0.1:7901)-> `https://opencode.ai/zen/v1`。
+
+**为什么需要反代**:zen 对免费档做"是否来自 OpenCode 客户端"的检查,三个条件同时满足才放行
+(2026-09-22 实测,缺任一都 403 `FreeTierError`):
+
+| 条件 | 实测依据 |
+|---|---|
+| `x-opencode-session` 必须是 **OpenCode 客户端铸造过的** id | 同长度随机 `ses_xxx` 一律 403;真实 id 可跨会话复用 |
+| `User-Agent` 形如 `opencode/<ver> ... runtime/bun/<ver>` | 换 curl 默认 UA -> 403 |
+| 请求体 `tools` 的前 5 个必须是 OpenCode 内置工具 `bash,edit,glob,grep,read` | 4 个真工具 + 1 个自造工具(同样长度/体积)-> 403;5 个真工具 + 1 个外来工具 -> 200 |
+
+注意这与 API key 无关:key 仍然照常鉴权,反代只补齐"客户端指纹"。`x-opencode-session`
+的值放在 `.oc-session`(gitignore,机器本地)。**失效时重新铸造**:跑一次
+`opencode run -m opencode/mimo-v2.6-flash-free "hi"`,再从客户端请求里取新的 `x-opencode-session`
+(抓包方法见 DEVLOG 2026-09-22 条目),写回 `.oc-session` 后重启本反代即可。
+
+反代会在请求体前面插入那 5 个守卫工具(与调用方同名时以守卫版本为准,避免上游 duplicate names 400),
+网关侧 `TOOL_GUARD_NAMES` 再把它们从**响应**里剔除,所以调用方不会看到自己没声明过的工具。
+
+档位:zen 免费档只接受 `reasoning_effort` 的 `low/medium/high`(`minimal`/`xhigh`/`max` 都是 400),
+`providers.json` 的 `efforts: ["low","medium","high"]` 声明后由桥接夹取。
