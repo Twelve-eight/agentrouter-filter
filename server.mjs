@@ -526,7 +526,8 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: { message: "bad json" } }));
       return;
     }
-    const chat = toChatBody(parsed, parsed.model, route.efforts ?? null);
+    const toolMap = { byWire: new Map(), byPair: new Map() };
+    const chat = toChatBody(parsed, parsed.model, route.efforts ?? null, toolMap);
     log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${chat.messages.length} tools=${chat.tools?.length ?? 0}`);
     let upstream;
     try {
@@ -564,7 +565,7 @@ const server = http.createServer(async (req, res) => {
         reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
         cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
       });
-    }, isGuardToolName);
+    }, isGuardToolName, toolMap);
     return;
   }
 
@@ -577,7 +578,8 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: { message: "bad json" } }));
       return;
     }
-    const msg = toAnthropicBody(parsed, parsed.model);
+    const toolMap = { byWire: new Map(), byPair: new Map() };
+    const msg = toAnthropicBody(parsed, parsed.model, toolMap);
     log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${msg.messages.length} tools=${msg.tools?.length ?? 0}`);
     let upstream;
     try {

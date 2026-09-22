@@ -20,7 +20,7 @@
 // (rollout-2026-09-21T09-51-10-...jsonl): 73 reasoning, 121 function_call,
 // 121 function_call_output.
 import assert from "node:assert";
-import { toChatMessages, toChatBody } from "../bridge.mjs";
+import { toChatMessages, toChatBody, toChatTools, toAnthropicBody, bridgeChatStream, bridgeAnthropicStream } from "../bridge.mjs";
 
 let pass = 0;
 function check(name, fn) {
@@ -191,7 +191,7 @@ check("tool_call ids and arguments are preserved verbatim", () => {
 // put it after the calls, so the replayed assistant turn had no
 // reasoning_content and DeepSeek rejected it (code 11155).
 import { Readable } from "node:stream";
-import { bridgeChatStream } from "../bridge.mjs";
+// (bridgeChatStream already imported at the top of this file)
 
 function runStream(chunks, stream = true) {
   const out = [];
@@ -210,7 +210,10 @@ const RC_CHUNKS = [
 await (async () => {
   const { text } = await runStream(RC_CHUNKS);
   check("streaming: reasoning output_index precedes function_call", () => {
-    const order = [...text.matchAll(/"output_index":(\d+),"item":\{"type":"([a-z_]+)"/g)].map((m) => m[2] + "#" + m[1]);
+    // Only output_item.added claims an index; the matching .done events repeat the
+    // same index (and are emitted for reasoning/message before the calls are
+    // announced), so filter to added or the order is unreadable.
+    const order = [...text.matchAll(/data: \{"type":"response\.output_item\.added".*?"output_index":(\d+),"item":\{"type":"([a-z_]+)"/g)].map((m) => m[2] + "#" + m[1]);
     assert.ok(order.length >= 2, "expected at least two items, got " + order.length);
     assert.strictEqual(order[0], "reasoning#0", "reasoning must open first, got " + order.join(" -> "));
     assert.ok(order.some((o) => o.startsWith("function_call")), "function_call missing");
@@ -239,7 +242,6 @@ await (async () => {
 // are silent: a mis-shaped request is a 400 from the upstream, and a mis-ordered
 // stream makes codex drop the turn (observed as repeated identical resends)
 // rather than error.
-import { toAnthropicBody, bridgeAnthropicStream } from "../bridge.mjs";
 
 check("anthropic: system is top-level, not a message", () => {
   const b = toAnthropicBody(
@@ -352,7 +354,7 @@ const AN_CHUNKS = [
 await (async () => {
   const { text } = await runAnthropic(AN_CHUNKS);
   check("anthropic streaming: reasoning opens before message and function_call", () => {
-    const order = [...text.matchAll(/"output_index":(\d+),"item":\{"type":"([a-z_]+)"/g)].map((m) => m[2] + "#" + m[1]);
+    const order = [...text.matchAll(/data: \{"type":"response\.output_item\.added".*?"output_index":(\d+),"item":\{"type":"([a-z_]+)"/g)].map((m) => m[2] + "#" + m[1]);
     assert.strictEqual(order[0], "reasoning#0", "reasoning must claim index 0, got " + order.join(" -> "));
     assert.strictEqual(order[1], "message#1", "message must follow reasoning, got " + order.join(" -> "));
     assert.strictEqual(order[2], "function_call#2", "function_call must follow the message, got " + order.join(" -> "));
@@ -381,6 +383,141 @@ await (async () => {
     assert.deepStrictEqual(types, ["reasoning", "message", "function_call"], "got " + types.join(","));
     assert.strictEqual(j.output[1].content[0].text, "hello");
     assert.strictEqual(j.output[2].name, "get_weather");
+  });
+})();
+
+
+// --- namespace tools (multi-agent / MCP) -------------------------------------
+// Codex 0.155 declares multi_agent_v1 and the MCP servers as NAMESPACE tools: one
+// entry of type "namespace" whose `tools` array holds the real sub-tools. Neither
+// chat/completions nor anthropic/messages has that shape, so the bridge expands
+// them into `<namespace>__<subtool>` and collapses the call back into
+// {name, namespace} - the shape Codex stores. Shapes below are copied from a
+// captured request body (multi_agent_v1: close_agent/resume_agent/send_input/
+// spawn_agent/wait_agent).
+// A plain flat tool, as the client declares them alongside namespaces.
+const flatTool = { type: "function", name: "exec_command", description: "Run a command", parameters: { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"] } };
+
+const nsTool = {
+  type: "namespace",
+  name: "multi_agent_v1",
+  description: "Tools for spawning and managing sub-agents.",
+  tools: [
+    { type: "function", name: "spawn_agent", description: "Spawn a new agent", parameters: { type: "object", properties: { message: { type: "string" } }, required: ["message"] } },
+    { type: "function", name: "wait_agent", description: "Wait for agents", parameters: { type: "object", properties: { targets: { type: "array" } } } },
+    { type: "function", name: "close_agent", description: "Close an agent", parameters: { type: "object", properties: { target: { type: "string" } } } },
+  ],
+};
+// Two namespaces can own the same bare sub-tool name (the real request has `js`
+// in both mcp__cua_repl and mcp__node_repl), so every sub-tool is prefixed.
+const nsTool2 = {
+  type: "namespace",
+  name: "mcp__node_repl",
+  description: "node repl",
+  tools: [{ type: "function", name: "js", description: "run js", parameters: { type: "object", properties: { code: { type: "string" } } } }],
+};
+
+check("namespace: sub-tools are expanded and keep their schemas (chat)", () => {
+  const out = toChatTools([nsTool, flatTool]);
+  const names = out.map((t) => t.function.name);
+  assert.deepStrictEqual(names, ["multi_agent_v1__spawn_agent", "multi_agent_v1__wait_agent", "multi_agent_v1__close_agent", "exec_command"]);
+  const spawn = out[0].function;
+  assert.strictEqual(spawn.description, "Spawn a new agent");
+  assert.deepStrictEqual(spawn.parameters.required, ["message"], "sub-tool schema must survive");
+  assert.ok(!names.includes("multi_agent_v1"), "the empty-shell namespace entry must be gone");
+});
+
+check("namespace: identical sub-tool names in two namespaces stay distinct", () => {
+  const a = { type: "namespace", name: "mcp__cua_repl", description: "cua", tools: nsTool2.tools };
+  const out = toChatTools([a, nsTool2]);
+  const names = out.map((t) => t.function.name);
+  assert.deepStrictEqual(names, ["mcp__cua_repl__js", "mcp__node_repl__js"]);
+});
+
+check("namespace: inputSchema is accepted as well as parameters", () => {
+  const t = { type: "namespace", name: "ns", description: "", tools: [{ type: "function", name: "x", description: "", inputSchema: { type: "object", properties: { a: { type: "string" } } } }] };
+  const out = toChatTools([t]);
+  assert.deepStrictEqual(out[0].function.parameters.properties, { a: { type: "string" } });
+});
+
+check("namespace: flat tools convert byte-identically (no regression)", () => {
+  const out = toChatTools([flatTool]);
+  assert.deepStrictEqual(out, [{ type: "function", function: { name: "exec_command", description: flatTool.description, parameters: flatTool.parameters } }]);
+});
+
+check("namespace: history replay rebuilds the wire name from name + namespace", () => {
+  const toolMap = { byWire: new Map(), byPair: new Map() };
+  const body = { instructions: "i", input: [{ type: "function_call", call_id: "c1", name: "spawn_agent", namespace: "multi_agent_v1", arguments: "{}" }], tools: [nsTool] };
+  const chat = toChatBody(body, "m", null, toolMap);
+  const call = chat.messages.find((m) => m.tool_calls)?.[0] ?? chat.messages.at(-1).tool_calls?.[0];
+  assert.strictEqual(call.function.name, "multi_agent_v1__spawn_agent", "upstream only knows the flattened name");
+});
+
+check("namespace: a replayed name outside this request's tools still flattens", () => {
+  const msgs = toChatMessages({ input: [{ type: "function_call", call_id: "c1", name: "resume_agent", namespace: "multi_agent_v1", arguments: "{}" }] });
+  const call = msgs.at(-1).tool_calls[0];
+  assert.strictEqual(call.function.name, "multi_agent_v1__resume_agent");
+});
+
+check("namespace: anthropic declares the expanded tools with full schemas", () => {
+  const out = toAnthropicBody({ model: "m", instructions: "i", input: [], tools: [nsTool, flatTool] }, "m");
+  const names = out.tools.map((t) => t.name);
+  assert.deepStrictEqual(names, ["multi_agent_v1__spawn_agent", "multi_agent_v1__wait_agent", "multi_agent_v1__close_agent", "exec_command"]);
+  assert.deepStrictEqual(out.tools[0].input_schema.required, ["message"]);
+});
+
+check("namespace: anthropic history replay rebuilds the wire name", () => {
+  const toolMap = { byWire: new Map(), byPair: new Map() };
+  const out = toAnthropicBody({ model: "m", instructions: "i", tools: [nsTool], input: [{ type: "function_call", call_id: "c1", name: "close_agent", namespace: "multi_agent_v1", arguments: "{}" }] }, "m", toolMap);
+  const use = out.messages.flatMap((m) => m.content).find((b) => b.type === "tool_use");
+  assert.strictEqual(use.name, "multi_agent_v1__close_agent");
+});
+
+// --- return direction: upstream calls the flattened name -> Codex gets name+namespace
+const CHAT_CALL_CHUNKS = [
+  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"multi_agent_v1__spawn_agent","arguments":""}}]}}]}\n\n',
+  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\\"message\\\":\\\"hi\\\"}"}}]}}]}\n\n',
+  'data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{}}]}\n\n',
+  'data: [DONE]\n\n',
+];
+
+await (async () => {
+  const toolMap = { byWire: new Map(), byPair: new Map() };
+  toChatTools([nsTool], toolMap);
+  const out = [];
+  const res = { writeHead() {}, write(s) { out.push(s); }, end() {} };
+  bridgeChatStream(Readable.from(CHAT_CALL_CHUNKS), res, "m", null, true, null, null, toolMap);
+  await new Promise((r) => setTimeout(r, 60));
+  const text = out.join("");
+  check("namespace: return direction splits name + namespace for Codex", () => {
+    const added = [...text.matchAll(/data: (\{"type":"response\.output_item\.added".*?\})\n\n/g)].map((m) => JSON.parse(m[1]));
+    const call = added.find((e) => e.item.type === "function_call");
+    assert.ok(call, "function_call item missing");
+    assert.strictEqual(call.item.name, "spawn_agent", "Codex must see the bare sub-tool name");
+    assert.strictEqual(call.item.namespace, "multi_agent_v1", "and the namespace it belongs to");
+    const done = [...text.matchAll(/data: (\{"type":"response\.output_item\.done".*?\})\n\n/g)].map((m) => JSON.parse(m[1])).find((e) => e.item.type === "function_call");
+    assert.strictEqual(done.item.name, "spawn_agent");
+    assert.strictEqual(done.item.namespace, "multi_agent_v1");
+    assert.strictEqual(done.item.arguments, '{"message":"hi"}');
+  });
+
+  check("namespace: a flat tool still reports namespace: null (no regression)", () => {
+    const toolMap2 = { byWire: new Map(), byPair: new Map() };
+    toChatTools([flatTool], toolMap2);
+    const chunks = [
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_2","function":{"name":"exec_command","arguments":"{}"}}]}}]}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    const out2 = [];
+    const res2 = { writeHead() {}, write(s) { out2.push(s); }, end() {} };
+    bridgeChatStream(Readable.from(chunks), res2, "m", null, true, null, null, toolMap2);
+    return new Promise((r) => setTimeout(() => {
+      const added = [...out2.join("").matchAll(/data: (\{"type":"response\.output_item\.added".*?\})\n\n/g)].map((m) => JSON.parse(m[1]));
+      const call = added.find((e) => e.item.type === "function_call");
+      assert.strictEqual(call.item.name, "exec_command");
+      assert.strictEqual(call.item.namespace, null);
+      r();
+    }, 60));
   });
 })();
 

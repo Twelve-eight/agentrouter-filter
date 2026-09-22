@@ -545,3 +545,43 @@ zen 对免费档返回 403 `FreeTierError: OpenCode's free tier can only be used
   响应侧由网关剔除,不影响调用方语义。
 - 只验证了 `mimo-v2.6-flash-free`;同档其它 free 模型(如 `mimo-v2.5-free`)未逐一验证,
   若要加入,直接加 models 条目即可(同一 provider/efforts)。
+
+## 2026-09-22(下午):命名空间工具(子代理/MCP)在 chat+anthropic 桥接里丢失
+
+### 症状
+走 chat(wb2api/opencode-zen)或 anthropic(justwoker)线路的模型**无法使用 Codex 原生子代理**:
+工具面里 `multi_agent_v1` 的 schema 是空 `{}`,调用返回 `unsupported call`,`spawn_agent` 等子工具完全不可见;
+responses 线路(agentrouter/relaycat/anyrouter)正常。缺陷报告见
+`REPORT-subagent-tools-lost-in-chat-bridge.md`。
+
+### 根因
+Codex 0.155 把多智能体/MCP 工具作为**命名空间工具**下发:`{type:"namespace", name, tools:[...]}`。
+`toChatTools` 与 `toAnthropicBody` 只读 `t.name`/`t.parameters`,从不读子数组 `tools`:
+命名空间条目因有 `name` 而通过过滤,schema 回落到空对象,子工具全部消失。
+全文检索确认 `bridge.mjs` 里此前**没有任何** `namespace` 字样。
+
+### 抓包补全的三个未知项(报告 5.3)
+用一次性捕获代理(`127.0.0.1:7880` -> 7878)抓 Codex 真实请求体:
+1. 子工具 schema 字段是 **`parameters`**(model-facing);`inputSchema` 是 app-server 协议字段。实现两者兼容。
+2. 命名空间**不止一个**:`multi_agent_v1`(5 个子工具)+ `mcp__cua_repl`(2)+ `mcp__node_repl`(3)。
+   且命名空间 id 自带 `__`、两个命名空间都有 `js` —— 所以**不能用分隔符拆名字**,必须用映射表。
+3. 回放确实需要还原:会话存储里的 function_call 带 `namespace`(实盘见下)。
+
+### 实现
+`bridge.mjs` 新增共享的 `flattenTools()`(展开 + 产出 byWire/byPair 两张表)、`joinWireName()`(入程)、
+`splitWireName()`(回程);`toChatTools`/`toAnthropicBody`/`toChatMessages`/`toChatBody` 与
+`createResponsesEmitter` 全部接入;`server.mjs` 两条桥接路径各自持有 toolMap 并贯通到流式 emitter。
+为了让拆分精确,function_call 的 `output_item.added` 从"首个名字 delta"推迟到 `finish()`
+(名字可能仍在拼接);`output_index` 顺序与既有事件序保持不变(已用事件转储核对)。
+
+### 验证
+- `tools/test-bridge-request.mjs`:**32 checks passed**(新增 8 条命名空间断言)。
+- `tools/repro-namespace-tools.mjs`:由"打印缺陷"改写为"断言修复后形态",全部通过(保留为回归脚本)。
+- 实机:`codex exec -c model_provider=gateway -c model=global:deepseek-v4.1-flash "spawn one sub-agent ..."`
+  -> **exit 0 / SUBOK**;主会话记录出现 `name:"spawn_agent", namespace:"multi_agent_v1"` 与
+  `wait_agent` 同形态,子代理线程落盘。
+- 回归:`test-bridge-indices.mjs` PASS;`restart-gateway.ps1` 语法门+自检通过(35 models)。
+
+### 未验证
+- anthropic 线路只做单元/往返验证,未做真实上游端到端(需要 justwoker 可用模型与凭证)。
+- 上游若调回一个**未在本请求声明**且非已知命名空间的工具名,按扁平名透传(`namespace: null`),不猜归属。

@@ -13,7 +13,82 @@
 // responses -> chat/completions conversion (for chat-only upstreams)
 // ---------------------------------------------------------------------------
 
-function toChatMessages(body) {
+// Codex 0.155 declares multi-agent / MCP tools as NAMESPACE tools: one entry of
+// type "namespace" whose `tools` array holds the real sub-tools (verified against
+// a captured request body: multi_agent_v1 with close_agent/resume_agent/send_input/
+// spawn_agent/wait_agent, plus mcp__cua_repl and mcp__node_repl). Neither
+// chat/completions nor anthropic/messages has that shape, so a namespace is
+// EXPANDED into flat functions named `<namespace>__<subtool>` on the way out, and
+// COLLAPSED back on the way in - what Codex sees stays
+// `{name: "spawn_agent", namespace: "multi_agent_v1"}`, which is what its
+// app-server protocol stores (FunctionCallResponseItem.namespace).
+//
+// The wire name is resolved through a MAP, never by splitting on the separator:
+// namespace ids legitimately contain it (mcp__cua_repl), so parsing would be
+// ambiguous. Every sub-tool is prefixed even when its bare name is unique - two
+// namespaces can both own a `js` tool (mcp__cua_repl / mcp__node_repl).
+const NS_SEP = "__";
+
+// Expand the client's tool list into flat wire tools plus the lookup maps.
+//   byWire : wire name -> { namespace, name }   (return direction)
+//   byPair : "ns\0name" -> wire name             (history-replay direction)
+function flattenTools(tools) {
+  const flat = [];
+  const byWire = new Map();
+  const byPair = new Map();
+  const addNamespace = (ns, subs, prefix) => {
+    for (const sub of Array.isArray(subs) ? subs : []) {
+      if (!sub || !sub.name) continue;
+      const path = prefix ? prefix + NS_SEP + sub.name : sub.name;
+      if (sub.type === "namespace" || Array.isArray(sub.tools)) {
+        // Nested namespaces exist in principle; keep flattening rather than
+        // silently dropping the inner tools.
+        addNamespace(ns, sub.tools, path);
+        continue;
+      }
+      const wire = ns + NS_SEP + path;
+      byWire.set(wire, { namespace: ns, name: sub.name });
+      byPair.set(ns + "\u0000" + sub.name, wire);
+      flat.push({
+        type: "function",
+        name: wire,
+        description: sub.description ?? "",
+        // Captured bodies use `parameters` (camelCase `inputSchema` is the
+        // app-server protocol field, not the model-facing one); accept both.
+        parameters: sub.parameters ?? sub.inputSchema ?? { type: "object", properties: {} },
+      });
+    }
+  };
+  for (const t of Array.isArray(tools) ? tools : []) {
+    if (!t) continue;
+    if (t.type === "namespace" && Array.isArray(t.tools)) {
+      addNamespace(t.name, t.tools, "");
+      continue;
+    }
+    if (t.type === "function" || t.name) flat.push(t);
+  }
+  return { flat, byWire, byPair };
+}
+
+// Return direction: wire name -> { name, namespace }. Unknown names pass through
+// untouched, so a provider that renames a tool cannot turn into a wrong namespace.
+function splitWireName(wireName, toolMap) {
+  const hit = toolMap && toolMap.byWire ? toolMap.byWire.get(wireName) : null;
+  if (hit) return hit;
+  return { name: wireName, namespace: null };
+}
+
+// History-replay direction: a replayed function_call may carry `namespace`
+// (session storage does; the wire form is verified end to end by the same fix).
+// Rebuild the wire name the upstream was taught, falling back to the documented
+// convention when the pair is not in this request's tool list.
+function joinWireName(name, namespace, toolMap) {
+  if (!namespace) return name;
+  const hit = toolMap && toolMap.byPair ? toolMap.byPair.get(namespace + "\u0000" + name) : null;
+  return hit || namespace + NS_SEP + name;
+}
+
+function toChatMessages(body, toolMap = null) {
   const out = [];
   // wb2api requires the first message to be a system message (400 code 11-128).
   const sys = [];
@@ -64,7 +139,9 @@ function toChatMessages(body) {
       const call = {
         id: it.call_id ?? it.id,
         type: "function",
-        function: { name: it.name, arguments: it.arguments ?? "{}" },
+        // Replayed history may carry `namespace` (Codex stores it that way); the
+        // upstream only knows the flattened wire name.
+        function: { name: joinWireName(it.name, it.namespace, toolMap), arguments: it.arguments ?? "{}" },
       };
       let target = tail[tail.length - 1];
       if (!target || target.role !== "assistant") {
@@ -113,25 +190,36 @@ function toChatMessages(body) {
   return [{ role: "system", content: sys.filter(Boolean).join("\n\n") || "You are a coding agent." }, ...tail];
 }
 
-function toChatTools(tools) {
+function toChatTools(tools, toolMap = null) {
   if (!Array.isArray(tools) || tools.length === 0) return undefined;
-  const mapped = tools
-    .filter((t) => t && (t.type === "function" || t.name))
-    .map((t) => ({
-      type: "function",
-      function: {
-        name: t.name,
-        description: t.description ?? "",
-        parameters: t.parameters ?? { type: "object", properties: {} },
-      },
-    }));
+  // Namespace tools are expanded into flat functions; flat ones pass through the
+  // same mapping as before, byte for byte.
+  const { flat, byWire, byPair } = flattenTools(tools);
+  if (toolMap) {
+    toolMap.byWire = byWire;
+    toolMap.byPair = byPair;
+  }
+  const mapped = flat.map((t) => ({
+    type: "function",
+    function: {
+      name: t.name,
+      description: t.description ?? "",
+      parameters: t.parameters ?? { type: "object", properties: {} },
+    },
+  }));
   return mapped.length ? mapped : undefined;
 }
 
-function toChatBody(body, model, allowedEfforts = null) {
-  const messages = toChatMessages(body);
+function toChatBody(body, model, allowedEfforts = null, toolMap = null) {
+  // The tool map must come from the same list the messages were built with:
+  // history replay can reference a tool the client no longer declares.
+  // Caller owns the map so the response stream can split wire names back into
+  // name + namespace; without one the body still builds, just without the maps.
+  if (!toolMap) toolMap = { byWire: new Map(), byPair: new Map() };
+  // Tools first: that fills the map the message builder needs for replayed calls.
+  const tools = toChatTools(body.tools, toolMap);
+  const messages = toChatMessages(body, toolMap);
   const chat = { model, messages, stream: true };
-  const tools = toChatTools(body.tools);
   if (tools) chat.tools = tools;
   if (body.tool_choice && body.tool_choice !== "none") {
     chat.tool_choice = body.tool_choice === "required" ? "required" : body.tool_choice;
@@ -190,7 +278,7 @@ function pushBlocks(messages, role, blocks) {
   else messages.push({ role, content: blocks });
 }
 
-function toAnthropicBody(body, model) {
+function toAnthropicBody(body, model, toolMap = null) {
   const messages = [];
   const items = Array.isArray(body.input) ? body.input : [{ role: "user", content: body.input }];
   for (const it of items) {
@@ -214,7 +302,9 @@ function toAnthropicBody(body, model) {
         {
           type: "tool_use",
           id: it.call_id ?? it.id,
-          name: it.name,
+          // Same reason as the chat bridge: replay carries namespace, the wire
+          // only knows the flattened name.
+          name: joinWireName(it.name, it.namespace, toolMap),
           input: safeParse(it.arguments),
         },
       ]);
@@ -243,13 +333,16 @@ function toAnthropicBody(body, model) {
   // `system` is a top-level string here, not a message (unlike chat).
   if (body.instructions) out.system = body.instructions;
 
-  const tools = (body.tools ?? [])
-    .filter((t) => t && (t.type === "function" || t.name))
-    .map((t) => ({
-      name: t.name,
-      description: t.description ?? "",
-      input_schema: t.parameters ?? { type: "object", properties: {} },
-    }));
+  const { flat, byWire, byPair } = flattenTools(body.tools ?? []);
+  if (toolMap) {
+    toolMap.byWire = byWire;
+    toolMap.byPair = byPair;
+  }
+  const tools = flat.map((t) => ({
+    name: t.name,
+    description: t.description ?? "",
+    input_schema: t.parameters ?? { type: "object", properties: {} },
+  }));
   if (tools.length) out.tools = tools;
 
   // tool_choice is an object here: "required" has no direct equivalent, the
@@ -281,7 +374,7 @@ function sse(res, event, data) {
 // drift on output_index ordering - that ordering was the hard-won part (see the
 // openReasoning comment) and duplicating it invited a silent regression in one
 // of the two paths.
-function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null }) {
+function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null, toolMap = null }) {
   const respId = "resp_" + Math.random().toString(36).slice(2, 14);
   const created = Math.floor(Date.now() / 1000);
   const base = { id: respId, object: "response", created_at: created, model, status: "in_progress", output: [] };
@@ -404,7 +497,7 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null 
       const out = [];
       for (const c of calls.values()) {
         if (!c.added) continue;
-        out.push({ type: "function_call", id: c.itemId, status: "completed", arguments: c.args || "{}", call_id: c.id, name: c.name });
+        out.push({ type: "function_call", id: c.itemId, status: "completed", arguments: c.args || "{}", call_id: c.id, ...splitWireName(c.name, toolMap) });
       }
       const items2 = items.filter(Boolean);
       const msg = items2.find((it) => it.type === "message");
@@ -439,6 +532,17 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null 
     closeMessage();
     for (const c of calls.values()) {
       if (!c.added) continue;
+      // One announcement per call, now that the wire name is final. A namespace
+      // sub-tool becomes {name: "spawn_agent", namespace: "multi_agent_v1"} - the
+      // shape Codex's app-server protocol stores - while flat tools keep exactly
+      // the item they had before (namespace: null).
+      const split = splitWireName(c.name, toolMap);
+      emit("response.output_item.added", {
+        type: "response.output_item.added",
+        output_index: c.outIndex,
+        item: { type: "function_call", id: c.itemId, status: "in_progress", arguments: "", call_id: c.id, ...split },
+        sequence_number: seq++,
+      });
       emit("response.function_call_arguments.done", {
         type: "response.function_call_arguments.done",
         arguments: c.args || "{}",
@@ -446,7 +550,7 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null 
         output_index: c.outIndex,
         sequence_number: seq++,
       });
-      const item = { type: "function_call", id: c.itemId, status: "completed", arguments: c.args || "{}", call_id: c.id, name: c.name };
+      const item = { type: "function_call", id: c.itemId, status: "completed", arguments: c.args || "{}", call_id: c.id, ...split };
       emit("response.output_item.done", {
         type: "response.output_item.done",
         output_index: c.outIndex,
@@ -519,15 +623,15 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null 
       }
       if (id) c.id = id;
       if (name) c.name += name;
+      // The item is only ANNOUNCED at finish(), never here: a namespace sub-tool is
+      // split into {name, namespace} then (see splitWireName), and the name may
+      // still be streaming when the first delta arrives (anthropic sends the name
+      // in content_block_start, but nothing guarantees it stays atomic). Nothing
+      // else depends on the index before finish(), so claiming it late keeps
+      // output_index ordering intact while making the split exact.
       if (!c.added && c.name) {
         c.added = true;
         c.outIndex = openItem();
-        emit("response.output_item.added", {
-          type: "response.output_item.added",
-          output_index: c.outIndex,
-          item: { type: "function_call", id: c.itemId, status: "in_progress", arguments: "", call_id: c.id, name: c.name },
-          sequence_number: seq++,
-        });
       }
       if (args) {
         c.args += args;
@@ -552,8 +656,8 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null 
 // chat SSE -> responses SSE
 // ---------------------------------------------------------------------------
 
-function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage = null, toolGuard = null) {
-  const em = createResponsesEmitter({ res, model, stream, onUsage, toolGuard });
+function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage = null, toolGuard = null, toolMap = null) {
+  const em = createResponsesEmitter({ res, model, stream, onUsage, toolGuard, toolMap });
   let buf = "";
   upstream.on("data", (chunk) => {
     buf += chunk.toString("utf8");
@@ -612,8 +716,8 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
 // content_block_start, so the block index doubles as the emitter's call key.
 // Thinking blocks map to the responses `reasoning` item; text and tool_use map
 // to the message and function_call items.
-function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = null, toolGuard = null) {
-  const em = createResponsesEmitter({ res, model, stream, onUsage, toolGuard });
+function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = null, toolGuard = null, toolMap = null) {
+  const em = createResponsesEmitter({ res, model, stream, onUsage, toolGuard, toolMap });
   let buf = "";
   let inputTokens = 0;
   let cachedTokens = 0;
