@@ -77,7 +77,22 @@
       "p": "relaycat-cn"
     },
     "global:deepseek-v4.1-flash": {
-      "p": "wb2api"
+      "p": "wb2api",
+      "_fallback_comment": [
+        "Cross-realm fallback: when the global pool answers 429/503 for this model",
+        "(i.e. every global account is cooling down), the gateway retries the SAME",
+        "request against the CN pool instead of failing the client turn.",
+        "",
+        "Why CN is the fallback and not the other way round: global accounts refill",
+        "every day, while CN credits are the scarce, hard-to-regenerate resource.",
+        "So we spend global by default and only touch CN when global is exhausted.",
+        "",
+        "Restore-to-global is probe-driven (GET /healthz realm_servable.global),",
+        "never inferred from /status healthy counts - the pool has an all-cooling",
+        "fallback that keeps soft-cooled accounts selectable, so a healthy=0 domain",
+        "can still serve. See PLAN-realm-fallback.md."
+      ],
+      "fallback": "cn:deepseek-v4.1-flash"
     },
     "global:deepseek-v4.1-flash-sg": {
       "p": "wb2api"
@@ -126,7 +141,8 @@
       "p": "relaycat"
     },
     "gpt-5.6-luna": {
-      "p": "relaycat"
+      "p": "wb2api",
+      "m": "global:gpt-5.6-luna"
     },
     "gpt-5.5": {
       "p": "relaycat"

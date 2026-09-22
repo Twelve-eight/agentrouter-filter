@@ -222,6 +222,9 @@ function providerFor(model) {
     // Effort levels the upstream accepts, when it is pickier than chat/completions
     // (opencode-zen free models: low/medium/high only; max/xhigh are 400).
     efforts: Array.isArray(p.efforts) ? p.efforts : null,
+    // Cross-realm fallback target for this model (providers.json "fallback"),
+    // e.g. "global:deepseek-v4.1-flash" -> "cn:deepseek-v4.1-flash".
+    fallback: typeof spec.fallback === "string" ? spec.fallback : null,
   };
 }
 
@@ -312,6 +315,317 @@ function request(url, { method, headers, body, proxy }) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// 429 retry
+// ---------------------------------------------------------------------------
+//
+// wb2api answers 429 when the account its pool picked cannot serve the request
+// (the pool holds several accounts and picks again on the next attempt). A 429
+// that reaches Codex aborts the whole turn, so a transient account exhaustion
+// used to kill a live session. Retrying here keeps that from happening.
+//
+// Only 429 is retried. A 400/401/403/404/422 describes the request itself and
+// would fail identically on a replay; 5xx is deliberately left alone so a
+// genuinely broken upstream stays visible instead of being hidden behind three
+// silent retries. The backoff is bounded (<= ~3s by default) so a real outage
+// still fails fast enough for the client to react.
+const RETRY_STATUS = 429;
+const RETRY_MAX = 3; // extra attempts after the first
+const RETRY_BASE_MS = 400;
+
+function retryAfterMs(res, attempt) {
+  const raw = res?.headers?.["retry-after"];
+  const secs = Number(raw);
+  if (Number.isFinite(secs) && secs > 0) return Math.min(secs * 1000, 10000);
+  const at = Date.parse(String(raw ?? ""));
+  if (Number.isFinite(at)) return Math.min(Math.max(at - Date.now(), 0), 10000);
+  return RETRY_BASE_MS * 2 ** attempt; // 400, 800, 1600
+}
+
+async function requestWithRetry(url, opts, label) {
+  const retry = opts.retry !== false;
+  let res;
+  for (let attempt = 0; ; attempt++) {
+    res = await request(url, opts);
+    if (res.statusCode !== RETRY_STATUS || !retry || attempt >= RETRY_MAX) return res;
+    const wait = retryAfterMs(res, attempt);
+    // Drain the discarded attempt; an unconsumed response keeps its socket open.
+    res.resume();
+    log(`!! ${label} answered 429; retrying (${attempt + 1}/${RETRY_MAX}) in ${wait}ms`);
+    await new Promise((r) => setTimeout(r, wait));
+  }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// cross-realm fallback (global -> cn)
+// ---------------------------------------------------------------------------
+//
+// Why this exists
+// ---------------
+// wb2api keeps the CN and global account pools strictly separate: a `global:`
+// request only ever picks a global account, and vice versa
+// (internal/pool/pick.go: `realmOK` filters candidates AND the all-cooling
+// fallback `pickEarliestExpiryLocked`). There is no cross-realm degradation on
+// that side, upstream or locally, and the pool's own regression test asserts
+// the separation. So when every global account is rate-limited, the client turn
+// dies on a 429 - which is exactly what was killing Codex sessions.
+//
+// The direction is deliberately one-way, global -> cn:
+//   * global accounts get their allowance refreshed on their own;
+//   * cn credits are the scarce, hard-to-regenerate resource.
+// So global is spent by default and cn only covers the exhausted window.
+//
+// Two rules keep this honest:
+//   1. ENTERING the fallback requires an OBSERVED upstream failure - never a
+//      health probe. A domain can report healthy=0/not-servable and still
+//      serve: the pool re-selects soft-cooled accounts in the all-cooling
+//      fallback and really does send them. Routing on the probe alone would
+//      abandon global while it can still answer, which is the opposite of the
+//      intent.
+//   2. LEAVING the fallback requires POSITIVE evidence that global can serve
+//      this model again - a selectable account in GET /status. The window
+//      therefore never sticks to cn longer than global is actually down.
+//
+// Everything here is inert for models that declare no `fallback` in
+// providers.json, so other models' behaviour is unchanged.
+
+// client model id -> epoch ms until which we should stay on the fallback id.
+const fallbackUntil = new Map();
+
+// provider base -> { at, value } for GET /status. Kept short: the recovery
+// time only matters at arm time, and a stale answer only costs one extra probe.
+const statusCache = new Map();
+// Env-overridable so tests can observe cache transitions without sleeping.
+const STATUS_TTL_MS = Number(process.env.AR_REALM_STATUS_TTL_MS ?? 30_000);
+const STATUS_TIMEOUT_MS = Number(process.env.AR_REALM_STATUS_TIMEOUT_MS ?? 3_000);
+
+// provider base -> { at, value } for GET /healthz realm_servable.
+const healthCache = new Map();
+const HEALTH_TTL_MS = Number(process.env.AR_REALM_HEALTH_TTL_MS ?? 30_000);
+const HEALTH_TIMEOUT_MS = Number(process.env.AR_REALM_HEALTH_TIMEOUT_MS ?? 2_000);
+
+// Used when the recovery time is unknown (no /status, or the key is missing).
+// The window is a guard against hammering global; the positive-evidence check
+// above normally clears it long before this fires.
+const FALLBACK_UNKNOWN_WINDOW_MS = 15 * 60_000;
+// Hard ceiling so a bogus far-future reset_at cannot pin us to cn forever.
+const FALLBACK_MAX_WINDOW_MS = 24 * 3600_000;
+
+// resolveFallback results, keyed by "<provider>::<target model id>".
+const fallbackCache = new Map();
+
+/** Mirror of wb2api's resolve_model.go: strip a leading `cn:` / `global:`. */
+function bareModelOf(id) {
+  if (typeof id !== "string") return "";
+  const i = id.indexOf(":");
+  if (i < 0) return id;
+  const prefix = id.slice(0, i);
+  return prefix === "cn" || prefix === "global" ? id.slice(i + 1) : id;
+}
+
+/** Which realm a model id belongs to, by the same prefix convention. */
+function realmOfModel(id) {
+  return typeof id === "string" && id.startsWith("global:") ? "global" : "cn";
+}
+
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("timeout after " + ms + "ms")), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Resolve a client model id's configured fallback, if it is safe to use.
+ *
+ * Returns { id, upstreamModel } or null. Null covers three cases that must all
+ * be visible rather than silent: no fallback configured; the target is not in
+ * the registry; the target is served by a DIFFERENT provider (it would need
+ * another credential and base URL, so honouring it through the current route
+ * object would send the wrong key to the wrong host).
+ */
+function resolveFallback(clientModel, route) {
+  if (!route || typeof route.fallback !== "string" || !route.fallback) return null;
+  const cacheKey = route.name + "::" + route.fallback;
+  if (fallbackCache.has(cacheKey)) return fallbackCache.get(cacheKey);
+  let out = null;
+  const target = providerFor(route.fallback);
+  if (!target) {
+    log(`!! cross-realm: fallback target '${route.fallback}' is not in providers.json; fallback disabled for '${clientModel}'`);
+  } else if (target.name !== route.name) {
+    log(`!! cross-realm: fallback target '${route.fallback}' is served by '${target.name}', not '${route.name}'; refusing (different credential/base)`);
+  } else {
+    out = { id: route.fallback, upstreamModel: target.upstreamModel };
+  }
+  fallbackCache.set(cacheKey, out);
+  return out;
+}
+
+/**
+ * Publish which realm actually answered, and when the next good chance to
+ * leave the fallback is. Both headers are informational: the gateway still
+ * answers the request normally, so a client that ignores them is unaffected.
+ *
+ * Only sent when the model has a fallback configured - models without one
+ * keep byte-identical responses.
+ */
+function setRealmHeaders(res, realm, retryAt, source) {
+  if (!realm) return;
+  try {
+    res.setHeader("X-Gateway-Realm", realm);
+    if (retryAt) res.setHeader("X-Gateway-Retry-At", new Date(retryAt).toISOString());
+    if (source) res.setHeader("X-Gateway-Realm-Source", source);
+  } catch {
+    // Headers already flushed (a streaming bridge wrote its head first).
+    // The body is unaffected; losing the hint beats failing the request.
+  }
+}
+/** GET a local JSON endpoint with a bounded timeout; null on any failure. */
+async function fetchLocalJSON(url, headers, timeoutMs) {
+  try {
+    const res = await withTimeout(request(url, { method: "GET", headers }), timeoutMs);
+    const chunks = [];
+    for await (const c of res) chunks.push(c);
+    if (res.statusCode !== 200) return null;
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Cached GET /status. null when the key is missing or the call fails. */
+async function fetchStatus(route) {
+  if (!route || !route.key) return null;
+  const hit = statusCache.get(route.base);
+  if (hit && Date.now() - hit.at < STATUS_TTL_MS) return hit.value;
+  const value = await fetchLocalJSON(
+    route.base + "/status",
+    { authorization: `Bearer ${route.key}` },
+    STATUS_TIMEOUT_MS,
+  );
+  statusCache.set(route.base, { at: Date.now(), value });
+  return value;
+}
+
+/** Cached GET /healthz (no auth). null when the call fails. */
+async function fetchHealth(route) {
+  if (!route) return null;
+  const hit = healthCache.get(route.base);
+  if (hit && Date.now() - hit.at < HEALTH_TTL_MS) return hit.value;
+  const value = await fetchLocalJSON(route.base + "/healthz", {}, HEALTH_TIMEOUT_MS);
+  healthCache.set(route.base, { at: Date.now(), value });
+  return value;
+}
+
+/**
+ * Can any global account serve `bareModel` right now, and if not, when is the
+ * earliest one expected back?
+ *
+ * Returns { ok, at, source } where at is epoch ms or null:
+ *   source "status"        ok=true  - at least one account is selectable now
+ *   source "status-model"  ok=false - the only blocker is a MODEL-level 6004
+ *                                     cooldown whose reset_at is upstream's own
+ *                                     wall clock (authoritative)
+ *   source "status-account" ok=false - blocked at account level; `until` is a
+ *                                     LOCAL estimate and may be truncated to
+ *                                     soft_rate_max, so it can be earlier than
+ *                                     the real recovery. Labelled separately so
+ *                                     callers are not misled by the precision.
+ *   source "health"        - /status unavailable; realm_servable is a boolean
+ *                             with no time, so at=null
+ *   source "unknown"       - nothing usable
+ *
+ * Disabled accounts are skipped, not treated as "recovering": they need a
+ * human re-login, so counting them would produce a recovery time that never
+ * arrives.
+ */
+function globalRealmState(status, bareModel) {
+  const accounts = Array.isArray(status?.accounts)
+    ? status.accounts.filter((a) => a && a.realm === "global")
+    : null;
+  if (!accounts) return null;
+  if (!accounts.length) return { ok: false, at: null, source: "no-account" };
+  const now = Date.now();
+  let minAt = null;
+  let modelLevel = false;
+  for (const a of accounts) {
+    if (a.disabled) continue;
+    let at = 0;
+    const until = Date.parse(a.until ?? "");
+    if (Number.isFinite(until)) at = Math.max(at, until);
+    for (const m of a.rate_limited_models ?? []) {
+      if (m.model !== bareModel) continue;
+      const reset = Date.parse(m.reset_at ?? "") || Date.parse(m.until ?? "");
+      if (Number.isFinite(reset)) {
+        at = Math.max(at, reset);
+        modelLevel = true;
+      }
+    }
+    if (at <= now) return { ok: true, at: null, source: "status" };
+    if (minAt === null || at < minAt) minAt = at;
+  }
+  if (minAt === null) return { ok: false, at: null, source: "all-disabled" };
+  return { ok: false, at: minAt, source: modelLevel ? "status-model" : "status-account" };
+}
+
+/**
+ * Combined check used both to arm and to leave the fallback window.
+ * Prefers /status (per-model, absolute times); falls back to /healthz, which
+ * only answers "is any account of that realm selectable at all".
+ */
+async function globalAvailability(route, bareModel) {
+  const status = await fetchStatus(route);
+  if (status) {
+    const st = globalRealmState(status, bareModel);
+    if (st) return st;
+  }
+  const health = await fetchHealth(route);
+  if (health?.realm_servable) {
+    const ok = health.realm_servable.global === true;
+    return { ok, at: null, source: ok ? "health" : "health-negative" };
+  }
+  return { ok: true, at: null, source: "unknown" };
+}
+
+/**
+ * Arm the fallback window for `clientModel` after an observed failure, and work
+ * out when global is expected back. Returns { retryAt: Date|null, source }.
+ *
+ * The window is always armed, even when the recovery time is unknown - staying
+ * on the fallback briefly is strictly better than hammering a dead domain on
+ * every request. It is cleared early the moment globalAvailability reports a
+ * selectable account.
+ */
+async function armFallback(clientModel, route, status, errText) {
+  const bare = bareModelOf(route.upstreamModel);
+  let retryAt = null;
+  let source = "unknown";
+  const rec = await globalAvailability(route, bare);
+  if (rec.at) {
+    retryAt = new Date(rec.at);
+    source = rec.source;
+  } else if (rec.ok) {
+    // /status already shows a selectable global account, yet the upstream just
+    // answered 429/503. Treat it as transient: keep the fallback for this
+    // request, but re-try global on the very next one.
+    retryAt = new Date(Date.now() + 5_000);
+    source = "transient";
+  } else {
+    source = rec.source;
+  }
+  const now = Date.now();
+  const until = retryAt ? retryAt.getTime() : now + FALLBACK_UNKNOWN_WINDOW_MS;
+  fallbackUntil.set(clientModel, Math.min(until, now + FALLBACK_MAX_WINDOW_MS));
+  const body = String(errText ?? "").replace(/\s+/g, " ").slice(0, 160);
+  log(`!! cross-realm: ${clientModel} exhausted (upstream ${status}); fallback armed until ` +
+      `${new Date(fallbackUntil.get(clientModel)).toISOString()} source=${source}; upstream said: ${body}`);
+  return { retryAt, source };
+}
 
 // ---------------------------------------------------------------------------
 // server
@@ -526,31 +840,111 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: { message: "bad json" } }));
       return;
     }
-    const toolMap = { byWire: new Map(), byPair: new Map() };
-    const chat = toChatBody(parsed, parsed.model, route.efforts ?? null, toolMap);
-    log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${chat.messages.length} tools=${chat.tools?.length ?? 0}`);
-    let upstream;
-    try {
-      upstream = await request(route.base + "/v1/chat/completions", {
-        method: "POST",
-        headers,
-        body: JSON.stringify(chat),
-        proxy: route.proxy,
-      });
-    } catch (e) {
+
+    // Cross-realm fallback (see the helpers section above). `clientModel` is
+    // the id the client asked for and is the key the window is stored under;
+    // the id actually sent upstream is tracked separately, because the
+    // registry may map them differently (`spec.m`).
+    const clientModel = parsed.model;
+    const fb = resolveFallback(clientModel, route);
+    let realmUsed = fb ? realmOfModel(clientModel) : null;
+    let realmRetryAt = null;
+    let realmSource = null;
+
+    if (fb) {
+      const armed = fallbackUntil.get(clientModel);
+      if (armed !== undefined) {
+        if (Date.now() >= armed) {
+          // Window expired: try global again, unconditionally.
+          fallbackUntil.delete(clientModel);
+          log(`cross-realm: ${clientModel} fallback window expired; back on global`);
+        } else {
+          // Inside the window. Leaving it requires POSITIVE evidence that
+          // global can serve again - never a bare healthy count.
+          const avail = await globalAvailability(route, bareModelOf(clientModel));
+          if (avail.ok) {
+            fallbackUntil.delete(clientModel);
+            log(`cross-realm: ${clientModel} global recovered early (source=${avail.source}); leaving fallback`);
+          } else {
+            parsed.model = fb.upstreamModel;
+            realmUsed = "cn";
+            realmSource = avail.source;
+            realmRetryAt = avail.at ? new Date(avail.at) : new Date(armed);
+            log(`cross-realm: ${clientModel} served from ${fb.id} (window armed, source=${avail.source})`);
+          }
+        }
+      }
+    }
+
+    // One upstream attempt. A fresh toolMap per attempt: it is built from the
+    // tools sent in THAT request and is used to split wire names back on the
+    // response, so a retry must never reuse the failed attempt's map.
+    const sendChat = async (modelId) => {
+      const toolMap = { byWire: new Map(), byPair: new Map() };
+      const chat = toChatBody(parsed, modelId, route.efforts ?? null, toolMap);
+      log(`bridge ${prefix}${rest} -> ${route.name} model=${modelId} msgs=${chat.messages.length} tools=${chat.tools?.length ?? 0}`);
+      try {
+        const upstream = await requestWithRetry(route.base + "/v1/chat/completions", {
+          method: "POST",
+          headers,
+          body: JSON.stringify(chat),
+          proxy: route.proxy,
+        }, `${prefix}${rest} -> ${route.name} model=${modelId}`);
+        return { upstream, toolMap };
+      } catch (e) {
+        return { error: e };
+      }
+    };
+
+    const fail502 = (e) => {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: { message: String(e?.message ?? e) } }));
+    };
+
+    let attempt = await sendChat(parsed.model);
+    if (attempt.error) {
+      fail502(attempt.error);
       return;
     }
+    let upstream = attempt.upstream;
+    let toolMap = attempt.toolMap;
+
+    // The retry fires only on an OBSERVED exhaustion of the source realm, and
+    // only while the request is still on global (a request already served from
+    // cn must not bounce back). 429 is what wb2api answers when every account of
+    // the realm is cooling; 503 when none is selectable at all.
+    if (fb && realmUsed === "global" && (upstream.statusCode === 429 || upstream.statusCode === 503)) {
+      const errChunks = [];
+      for await (const c of upstream) errChunks.push(c);
+      const text = Buffer.concat(errChunks).toString("utf8");
+      log(`bridge upstream ${upstream.statusCode}: ${text.slice(0, 200)}`);
+      const armed = await armFallback(clientModel, route, upstream.statusCode, text);
+      realmRetryAt = armed.retryAt;
+      realmSource = armed.source;
+      parsed.model = fb.upstreamModel;
+      realmUsed = "cn";
+      attempt = await sendChat(fb.upstreamModel);
+      if (attempt.error) {
+        fail502(attempt.error);
+        return;
+      }
+      upstream = attempt.upstream;
+      toolMap = attempt.toolMap;
+    }
+
     if (upstream.statusCode >= 400) {
       const errChunks = [];
       for await (const c of upstream) errChunks.push(c);
       const text = Buffer.concat(errChunks).toString("utf8");
       log(`bridge upstream ${upstream.statusCode}: ${text.slice(0, 200)}`);
+      setRealmHeaders(res, realmUsed, realmRetryAt, realmSource);
       res.writeHead(upstream.statusCode, { "Content-Type": "application/json" });
       res.end(text);
       return;
     }
+    // setHeader before the bridge writes its own head: writeHead merges
+    // previously-set headers, so bridge.mjs needs no change.
+    setRealmHeaders(res, realmUsed, realmRetryAt, realmSource);
     const t0 = Date.now();
     bridgeChatStream(upstream, res, parsed.model, parsed.reasoning?.effort, parsed.stream !== false, (u) => {
       recordUsage({
@@ -583,12 +977,12 @@ const server = http.createServer(async (req, res) => {
     log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${msg.messages.length} tools=${msg.tools?.length ?? 0}`);
     let upstream;
     try {
-      upstream = await request(route.base + "/v1/messages", {
+      upstream = await requestWithRetry(route.base + "/v1/messages", {
         method: "POST",
         headers: anthropicHeaders(headers),
         body: JSON.stringify(msg),
         proxy: route.proxy,
-      });
+      }, `${prefix}${rest} -> ${route.name} model=${parsed.model}`);
     } catch (e) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: { message: String(e?.message ?? e) } }));
@@ -625,7 +1019,12 @@ const server = http.createServer(async (req, res) => {
   log(`proxy ${prefix}${rest} -> ${target} (${route.name}) bytes=${raw.length}`);
   let upstream;
   try {
-    upstream = await request(target, { method: req.method, headers, body, proxy: route.proxy });
+    upstream = await requestWithRetry(
+      target,
+      // Retrying a GET is pointless and would only add latency to /models.
+      { method: req.method, headers, body, proxy: route.proxy, retry: req.method === "POST" },
+      `${prefix}${rest} (${route.name})`,
+    );
   } catch (e) {
     res.writeHead(502, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: String(e?.message ?? e) } }));

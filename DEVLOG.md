@@ -585,3 +585,108 @@ Codex 0.155 把多智能体/MCP 工具作为**命名空间工具**下发:`{type:
 ### 未验证
 - anthropic 线路只做单元/往返验证,未做真实上游端到端(需要 justwoker 可用模型与凭证)。
 - 上游若调回一个**未在本请求声明**且非已知命名空间的工具名,按扁平名透传(`namespace: null`),不猜归属。
+
+## 2026-09-22(傍晚):标题生成 503 修复 + 子代理可覆盖模型白名单
+
+### 1) gpt-5.6-luna 的 503 风暴:根因是标题生成,不是用户在用 Luna
+来自高考会话的报告(`G:\agentworks\gaokao-math\reports\REPORT-luna-title-model-503.md`)结论成立,已复核:
+- Codex 桌面版每新建一个线程(含子代理线程)就调一次"任务标题生成",提示词固定以
+  `You are a helpful assistant. You will be presented with a user prompt, and your job to provide a short title for a task` 开头;
+- 它用的是**内置 slug `gpt-5.6-luna`(不带 `global:` 前缀)**;`providers.json` 当时把它指向 relaycat,
+  而 relaycat/relaycat-cn 都没有 luna 渠道 -> 503 -> Codex 重试 5 次;
+- 这解释了"51201 字节完全相同的请求":提示词固定,字节数恒定。
+- 今日用量日志里 luna 共 501 条**全部失败**(413x503 / 79x502 / 9x429),`input_tokens=0`、`cost=null`,**零计费**。
+
+上游探针(2026-09-22):
+- `relaycat` /v1/responses + gpt-5.6-luna -> **502**;`relaycat-cn` -> **404 model_not_found**;
+- `wb2api` /v1/chat/completions + `global:gpt-5.6-luna` -> **200 "PONG"**。
+
+修复:`providers.json` 把内置 slug `gpt-5.6-luna` 从 `relaycat` 改指 `wb2api` 并加 `"m": "global:gpt-5.6-luna"`
+(wb2api 只认带 `global:` 前缀的 id)。改 providers.json 不需要重启网关(每请求按 stat 读取)。
+
+实测验收:走标题生成器同一条路径(7878 `/u/v1/responses`,model=`gpt-5.6-luna`) ->
+**HTTP 200**,标题 `Fix Gateway Functionality`;用量日志新增 `wb2api / global:gpt-5.6-luna / ok=true`。
+注意:标题生成按**线程创建**触发,所以 503 是否彻底消失要在下次建线程时才算最终确认。
+
+### 2) spawn_agent 的 "Available model overrides" 块换成指定模型
+"那个块"= `spawn_agent` 工具描述里的 `Available model overrides (optional; inherited parent model is preferred)`
+列表(在 `input[0].additional_tools` 里,由 catalog 生成)。
+
+规则(2026-09-22 用一次性抓包代理 7880 实测,`priority` 有**两个独立含义**):
+- `priority > 0` = 在内置条目之间的**排序**;
+- `priority < 0` = 该条目**进入 spawn_agent 的覆盖列表**;该列表**上限 5 条**,只收负值,
+  内置条目(1..43)与其余条目都不会进;`priority: 0`(默认)= 仍可路由可选,但不进覆盖列表。
+
+先把所有我们侧条目设成 100:排序生效但列表被内置 5 条占满 -> **证实上限与排序语义**。
+再只给目标 5 条设 -1 -> 列表变成目标 5 条,**证实负值白名单语义**。
+
+实现:`tools/build-model-catalog.cjs` 新增 `OVERRIDE_SLUGS`(唯一决定"子代理能用哪些模型"的地方)+
+`priority: OVERRIDE_SLUGS.has(slug) ? -1 : 0`,替换原先写死的 `priority: 0`。
+白名单(用户 2026-09-22 指定):`global:deepseek-v4.1-flash`、`global:deepseek-v4.1-flash-sg`、
+`cn:deepseek-v4.1-flash`、`mimo-v2.6-flash-free`、`zen:mimo-v2.6-flash`。
+
+验收:重新生成目录(35 models)后抓包,`spawn_agent` 描述里的列表**恰好是上述 5 条**。
+
+### 3) zen 免费档回归:session 失效(进行中)
+`zen:mimo-v2.6-flash` 经网关返回 **403 FreeTierError**。已隔离:带旧 session(11:55 铸造)+ 规定 UA +
+5 个守卫工具**直连上游仍 403**,随机 `ses_xxx` 也 403 -> `.oc-session` 已失效,需按 README 重新铸造。
+已派子代理执行重铸与验收,结果见 `.tmp/zen-session-refresh-report.md`。
+
+### 4) reasoning 回放门:确认全工作区已无残留
+- omp-zh:`patch-zh.js` 中 `OMP_NO_REPLAY_REASONING` / `replayResponsesReasoning` **0 处引用**,已由
+  提交 `0c6fc53`("drop the reasoning-replay gate; deliver only verified bytes")交付并推送;
+- 网关侧:`bridge.mjs` 只**保留** reasoning(把同一轮的 reasoning 挂回对应 assistant 消息,见
+  `pendingReasoning` 与 `target.reasoning_content`),**没有任何"丢弃 reasoning"的分支** —— 与用户要求一致。
+
+## 2026-09-22 跨域降级 (global -> cn) 实现与验证
+
+方案: `PLAN-realm-fallback.md` (本目录). 触发需求: 只要有任何国际版账号可用就优先国际版;
+国际版全耗尽时自动改用国内版, 并明确最近恢复时间.
+
+### 为什么必须在网关做
+- wb2api **严格域隔离**: `internal/pool/pick.go:48-51` realm 谓词,
+  `:238-240` 全冷却兜底同样过滤跨域; `internal/server/handler.go:649-652` 选号按 realm 过滤。
+- `origin/master` 无此实现, 且有回归测试 `handler_global_test.go:153-155` 明确锁定"不跨 realm 用 CN 号顶上"。
+- wb2api 不向客户端暴露恢复时间: 全仓 `Retry-After` 0 命中; 客户端可见响应头仅 `X-Service` 与 `Content-Type`。
+
+### 关键设计决策 (有实测依据, 不是拍脑袋)
+1. **进入降级只认实际失败, 不认健康计数**。实测证据: 本次 global `realm_totals.healthy=4`,
+   但该模型在 4 个号上都有模型级 6004 冷却到次日 —— 即 healthy>0 与"该模型可用"是两件事。
+   反之全冷却兜底 (`pick.go:63-67`) 会让软冷却号仍被选中并真实出站, 所以 healthy=0 也不等于不可用。
+   故入口判据只有"上游回了 429/503"。
+2. **退出降级认正向证据** (`/healthz` 或 `/status` 显示 global 可取号), 靠 30s 探针, 不靠定时器硬等。
+3. **恢复时间分三级并标注来源** (`X-Gateway-Realm-Source`), 避免把低精度值当权威:
+   `status-model` (模型级 `rate_limited_models[].reset_at`, 上游权威) >
+   `status-account` (账号级 `until`, 本地推算, 可能被 soft_rate_max 截断) >
+   `health` / `transient` / `unknown`。
+4. 429 会先被 `requestWithRetry` 内部重试 3 次 (RETRY_MAX), 这是**有意保留**的:
+   每次重试池子会重新选号, 只是"忙"的域能在重试内自愈, 不浪费国内版积分。只有整域真的没号才落到降级。
+
+### 改动
+- `providers.json`: `global:deepseek-v4.1-flash` 增 `"fallback": "cn:deepseek-v4.1-flash"` (嵌在 model entry 内;
+  顶层加对象键会污染 `/u/v1/models` 与 catalog, 见 `server.mjs:230-232` / `build-model-catalog.cjs:200-201`)。
+  `-sg` 变体**未**登记 (无 cn 同族 id, 降级会改变模型语义)。
+- `server.mjs`: 新增跨域降级辅助区 (`resolveFallback` / `globalAvailability` / `armFallback` /
+  `globalRealmState` / `setRealmHeaders` / `fallbackUntil` 等), 重写 chat 桥分支支持二次发送;
+  `setRealmHeaders` 在 `bridge*Stream` 之前调用 (`writeHead` 会合并已设头, bridge.mjs 未改)。
+  TTL 可用环境变量覆盖 (`AR_REALM_STATUS_TTL_MS` 等), 便于测试观察缓存转换。
+- `tools/test-realm-fallback.mjs`: 新增零依赖自测 (照 `test-filter-failopen.mjs` 骨架, 桩 http 层)。
+
+### 验证
+- 单元: `node tools/test-realm-fallback.mjs` -> **21/21 PASS** (ENTER / STAY / LEAVE / 无 fallback 模型不受影响)。
+- 回归: `node tools/check-syntax.mjs` 干净; `test-filter-failopen` 6/6; `test-bridge-request` 32/32;
+  `test-bridge-indices` / `test-usage-pricing` 全 PASS。
+- **实机 (真实 wb2api, 临时实例端口 7879, 未碰线上 7878)**:
+  - global 真耗尽时: 4 次 global 尝试 (1+3 重试) -> `bridge upstream 503` -> `cross-realm exhausted
+    source=status-model` -> 改发 cn -> 客户端 **200**, 头 `X-Gateway-Realm: cn` /
+    `X-Gateway-Retry-At: 2026-09-22T20:00:00.000Z` / `X-Gateway-Realm-Source: status-model`。
+    恢复时刻与 `/status` 的 `reset_at` (09/23 04:00 CST) 精确一致。
+  - 窗口内第二次请求: **1 次上游调用**直达 cn, 8.56s。
+  - 对照: 未加载新代码的 **7878 同一请求返回 503** —— 这正是本修复消除的故障形态。
+- 临时实例已停止; 线上 7878 仍是 PID 3028 (15:43:57 启动), 未受影响。
+
+### 未做 / 待办
+- **D1 (国内版并发预算) 未实现**: 国内版仅 1 个号、`max_in_flight=3`, 降级洪峰仍可能把它打满成 503。
+  已实测观察到该形态 (`cn:deepseek` 连续 503 `uid=-`)。是否需要网关侧信号量待用户决定。
+- `global:deepseek-v4.1-flash-sg` 未配 fallback (待确认与 cn 同族是否可互相替代)。
+- 线上 7878 需重启才会加载新代码。
