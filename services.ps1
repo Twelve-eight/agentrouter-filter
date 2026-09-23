@@ -1,10 +1,16 @@
-# The zen free tier is reached through the local HTTP proxy: a direct TLS
-# handshake to opencode.ai hangs (curl HTTP 000 after 20s) while the same GET
-# through 127.0.0.1:7897 answers 200 in ~1.3s. Node only honours HTTPS_PROXY for
-# its built-in fetch when NODE_USE_ENV_PROXY is set BEFORE the process starts,
-# so export both here and let run-service-tab.ps1 inherit them.
-$env:NODE_USE_ENV_PROXY = '1'
-if (-not $env:HTTPS_PROXY) { $env:HTTPS_PROXY = 'http://127.0.0.1:7897' }
+# Per-service environment overrides.
+#
+# IMPORTANT: do NOT export NODE_USE_ENV_PROXY / HTTPS_PROXY for the whole file.
+# That was tried on 2026-09-22 and broke the gateway: with NODE_USE_ENV_PROXY=1
+# Node's own http(s) machinery adds a CONNECT on top of the tunnel server.mjs
+# already opens by hand for anyrouter (providers.json "proxy"), so the
+# double-proxied handshake fails with
+#   B0660000:error:0A000438:SSL routines:ssl3_read_bytes:tlsv1 alert internal error
+#   (SSL alert number 80)
+# and every anyrouter request 502s. The variables belong to the zen proxy ONLY,
+# which reaches opencode.ai through the same local proxy (a direct TLS handshake
+# to opencode.ai hangs: curl HTTP 000 after 20s, vs 200 in ~1.3s via the proxy).
+# Node reads NODE_USE_ENV_PROXY at STARTUP, so it must be set on that child.
 
 # Service table shared by autostart.ps1 (port probe + tab launch) and
 # run-service-tab.ps1 (actual execution). Keeping the paths here means the only
@@ -25,6 +31,11 @@ $ServiceTable = [ordered]@{
     Exe  = 'G:\nodejs\node.exe'
     Args = @('G:\omp works\Tools\agentrouter-filter\oc-zen-proxy.mjs')
     Log  = 'G:\omp works\.tmp\oc-zen-proxy.log'
+    # Scoped to this service only - see the note at the top of this file.
+    Env  = @{
+      NODE_USE_ENV_PROXY = '1'
+      HTTPS_PROXY        = 'http://127.0.0.1:7897'
+    }
   }
   'wb2api'         = @{
     Port = 7863

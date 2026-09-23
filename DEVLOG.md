@@ -773,3 +773,49 @@ Codex 0.155 把多智能体/MCP 工具作为**命名空间工具**下发:`{type:
 实际委派路由: Codex Desktop multi_agent_v1, 模型 gpt-6-astra-ar, session provider=gateway; 注册表另确认 agentrouter / gpt-6-astra 且无该模型 fallback. 实现与原同批监督均已完成 REV2 门禁复核. 路由原始摘录位于同证据目录 agent-routes.json 和 agent-routes-incremental.json.
 
 状态边界: 本次磁盘修复尚未加载到运行中的网关, 不重启, 不注入热更新, 不安排隐含重启. 真实上游兼容与 D1 国内并发预算仍未由本轮验收或决策. 定向 Git 备份的提交/远端核对见 G:\omp works\docs\WORKSPACE-AUDIT-2026-09-23.md.
+## 2026-09-23 (11:35) 修复: anyrouter 全部 502 (我昨天引入的回归)
+
+### 症状
+用户报: anyrouter 的 astra 返回
+`unexpected status 502 Bad Gateway: B0660000:error:0A000438:SSL routines:ssl3_read_bytes:
+tlsv1 alert internal error:openssl\ssl\record\rec_layer_s3.c:918:SSL alert number 80`。
+
+### 定位过程 (逐步排除, 结论唯一)
+1. 代理 mihomo(7897) 在跑, 且**早于**网关启动 (08:12:34 vs 08:13:10) -> 排除"代理未就绪"。
+2. `curl -x http://127.0.0.1:7897 https://anyrouter.top/v1/models` -> **401/403 (正常)**。
+   直连 -> `SEC_E_ILLEGAL_MESSAGE` (这正是当初加代理的原因)。
+3. 网关 `/an/v1/models` -> **502 x6 稳定复现**。
+4. 用网关的 CONNECT+TLS 代码**逐行复刻**成独立脚本 -> **HTTP 401 成功**。
+   同代码在独立进程成功、在网关进程失败 -> 差异在**进程环境**, 不在 TLS 参数
+   (已逐一验证 servername / minVersion / ALPN 均非因素)。
+5. 给复刻脚本加上 `NODE_USE_ENV_PROXY=1` + `HTTPS_PROXY` -> **复现同样的 SSL alert number 80**;
+   清掉 -> 恢复 401。**根因锁定**。
+
+### 根因
+`services.ps1` 在**文件顶部**导出了 `NODE_USE_ENV_PROXY=1` 与 `HTTPS_PROXY`。
+该文件被 `autostart.ps1` 与 `run-service-tab.ps1` 共同 dot-source, 于是**每个**服务子进程
+都继承了这两个变量 —— 包括网关。
+
+后果: `NODE_USE_ENV_PROXY=1` 让 Node 内建的 http(s) 机制**自己再加一层 CONNECT**,
+而 `server.mjs` 对 anyrouter 已经**手工**建立了 CONNECT 隧道 (`providers.json` 的 `proxy` 字段,
+见 `server.mjs` 的 "HTTP CONNECT tunnel through a local proxy")。两层代理叠加 ->
+隧道内 TLS 握手失败 -> 网关 catch 后回 502。
+
+**这是我 2026-09-22 为 zen 代理加固时引入的回归** (commit `013e433`)。当时只验证了 zen 通,
+没有回归 anyrouter。
+
+### 修复
+- `services.ps1`: 删除文件级导出; 改为在 **`opencode-zen-proxy` 这一条**上加 `Env` 映射。
+  顶部保留长注释说明为什么**不能**全局导出。
+- `run-service-tab.ps1`: 支持 `spec.Env` —— 用 `set "K=V" && ` 前缀只作用于该子进程
+  (含不安全字符校验)。
+- zen 的行为不变 (它仍拿到这两个变量); 其余服务不再被污染。
+
+### 验证
+- 干净环境起临时网关 7879: `/an/v1/models` -> **401 (正常)**; 真实 `gpt-6-astra-an` 请求 ->
+  **HTTP 500 "当前模型 gpt-6-astra 负载已经达到上限"** = TLS 通了、到达上游, 500 是真实业务状态。
+- 对照: 线上 7878 (未重启, 仍带污染环境) 同一请求 -> **502 SSL alert number 80**。
+- 临时实例已停止; 线上 7878 未动 (PID 27624)。
+
+### 待办
+- **线上 7878 需重启**才能加载修复 (重启前 anyrouter 一直 502)。

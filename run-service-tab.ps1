@@ -47,9 +47,22 @@ function Quote-Arg([string]$s) {
 $already = $null -ne (Get-NetTCPConnection -State Listen -LocalPort $spec.Port -ErrorAction SilentlyContinue)
 if (-not $already) {
   $exeLine = (Quote-Arg $spec.Exe) + ' ' + (($spec.Args | ForEach-Object { Quote-Arg $_ }) -join ' ')
+  # Per-service environment overrides (services.ps1 `Env`). Scoped deliberately:
+  # exporting NODE_USE_ENV_PROXY / HTTPS_PROXY for every service broke anyrouter,
+  # because Node then adds its own CONNECT on top of the tunnel server.mjs opens
+  # by hand. A `set "K=V" && ` prefix keeps it on this child only. Values here are
+  # plain URLs/booleans, so quoting them into the cmd line is safe.
+  $envPrefix = ''
+  if ($spec.Env) {
+    foreach ($k in $spec.Env.Keys) {
+      $v = [string]$spec.Env[$k]
+      if ($v -match '[&|<>^"%]') { throw "unsafe character in Env value for $k" }
+      $envPrefix += 'set "' + $k + '=' + $v + '" && '
+    }
+  }
   # cmd /c "<cmdline> >> <log> 2>&1": append (never truncate) and merge streams,
   # matching the `start /min cmd /c ".. >> log 2>&1"` launchers this replaces.
-  $cmdArgs = '/c ' + $exeLine + ' >> "' + $spec.Log + '" 2>&1'
+  $cmdArgs = '/c ' + $envPrefix + $exeLine + ' >> "' + $spec.Log + '" 2>&1'
   $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList $cmdArgs `
     -WorkingDirectory $spec.Dir -WindowStyle Hidden -PassThru
   Write-Host "[run-service-tab] started $Service via cmd wrapper (pid $($proc.Id)) in $($spec.Dir)"
