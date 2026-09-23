@@ -728,3 +728,31 @@ Codex 0.155 把多智能体/MCP 工具作为**命名空间工具**下发:`{type:
 - **zen mimo 仍 429** (实测, 配额未恢复)。子代理仍只能用 wb2api 的 ds。
 - 线上 7878 需要重启才能加载本次的标签修复 (旧标签虚标不影响可用性, 只影响
   `X-Gateway-Realm-Source` 的准确度)。
+
+## 2026-09-23 (09:25) 重启后复验与整理
+
+### 复验: 标签修复已上线并生效
+- 09-23 08:13:10 开机 autostart 重新拉起全部服务; 7878 进程 (08:13:10) **晚于**
+  `server.mjs` (09-22 19:36:43) -> **标签修复 `013e433` 已加载**。
+- 实机: `global:deepseek-v4.1-flash` 返回 **200 且 realm=global** —— 说明 global 已恢复,
+  走的是 LEAVE(正向证据)路径, 故不返回恢复时间头 (正确行为, 非缺陷)。
+- 今日 wb2api 日志: 请求 5 次全 200; `11155` / `reasoning_content_missing` / `503` / `429` / `6004`
+  **均为 0**。
+- 附带观察: 昨日唯一处于 `hard_credit` 的 `53c8d24c` 已自动复活并正常出话 (今日 5 次全部由它承接),
+  证实**每日额度会刷新**; 这与 scout-c 报告里"global 的 credits 在网关内不可回升"并不矛盾 ——
+  网关看不到刷新, 但上游确实刷新了, 且刷新后该号重新被选中。
+
+### 整理
+- 仓库内 4 个无引用的生成物移出到 `G:\omp works\.tmp\cleanup-agentrouter-filter-20260923\`
+  (`multi-agent-block.json`、`providers.json.bak-luna`、`retry.mjs`、`build-model-catalog.cjs.bak`)。
+  移动前已逐个解析绝对路径并校验仍在仓库内; **是移动不是删除**, 需要时可取回。
+  移动后 `git status` 干净。
+- 本次会话的取证产物归档到 `G:\omp works\.tmp\realm-fallback-work-20260923\`:
+  三份 scout 报告 + 三份任务书 + providers 改动前备份 + 17 个一次性打补丁脚本 (`patch-scripts/`)。
+  这些是历史证据, 保留而非删除。
+- 工作区级进度交接文档: `G:\omp works\docs\GATEWAY-REALM-FALLBACK-PROGRESS.md`。
+
+### 未完成 (不变)
+- **D1 国内版并发预算仍未做**(唯一功能缺口)。当前实测 `cn 503 = 0`, 但降级洪峰无保护。
+- `global:deepseek-v4.1-flash-sg` 未配 fallback (无 cn 同族 id)。
+- zen mimo 仍 429 (配额未恢复), 子代理只能用 wb2api 的 ds。
