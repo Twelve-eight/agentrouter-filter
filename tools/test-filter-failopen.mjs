@@ -30,6 +30,9 @@
 import http from "node:http";
 import https from "node:https";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { filterBody } from "../filter.mjs";
 
 let failed = 0;
@@ -77,7 +80,17 @@ const stubRequest = () => (_opts, onResponse) => {
 http.request = stubRequest();
 https.request = stubRequest();
 
+// Isolate usage before the real server (and its usage dependency) is imported.
+// Each run owns a new directory; keep its artifacts for post-run inspection.
+const testTmp = fileURLToPath(new URL("../.tmp/", import.meta.url));
+if (process.platform === "win32" && path.parse(testTmp).root.toLowerCase() !== "g:" + path.sep) {
+  throw new Error("Usage isolation tests must run from a project on G:");
+}
+fs.mkdirSync(testTmp, { recursive: true });
+process.env.AR_USAGE_DIR = fs.mkdtempSync(path.join(testTmp, "test-filter-failopen-usage-"));
+
 await import("../server.mjs");
+out(`测试账本目录: ${process.env.AR_USAGE_DIR}\n`);
 out("");
 
 const fakeRes = () => ({

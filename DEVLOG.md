@@ -756,3 +756,20 @@ Codex 0.155 把多智能体/MCP 工具作为**命名空间工具**下发:`{type:
 - **D1 国内版并发预算仍未做**(唯一功能缺口)。当前实测 `cn 503 = 0`, 但降级洪峰无保护。
 - `global:deepseek-v4.1-flash-sg` 未配 fallback (无 cn 同族 id)。
 - zen mimo 仍 429 (配额未恢复), 子代理只能用 wb2api 的 ds。
+
+## 2026-09-23 并行审查修复, 禁止重启线上实例
+
+用户明确要求与 STS mod 和知识库并行优化网关, 且禁止重启. 本轮契约在 G:\omp works\Tools\agentrouter-filter\DEVELOP.md. 仅修改 server.mjs, bridge.mjs, usage.mjs 和测试, 不修改 providers.json, .env.local, 模型/凭证/收费路由或 D1 国内并发预算.
+
+修复三面: 未知探针结果不再作为恢复证据; 本地 JSON 探针超时覆盖完整响应体并取消 I/O; Chat SSE 显式错误, 截断和异常终止不再伪报 completed, 终态幂等, 失败不记成功用量. 另增加 AR_USAGE_DIR 显式隔离目录, 默认生产路径不变, 两个导入真实 server 的测试改用独占项目 .tmp 账本. 这里只确认旧测试存在写生产账本风险, 尚未证实历史污染, 没有清洗或截断任何账本.
+
+中央验证证据在 G:\omp works\.tmp\workspace-audit-20260923-01a0cbfd\evidence:
+- gateway-before-stream/unknown/hang.log 为修复前失败; gateway-after-stream/unknown/hang.log 为修复后对照.
+- gateway-after-rev2.log 与 gateway-after-rev2-results.json: 七项检查脚本退出码均为 0. 新终态脚本实际输出 48 checks passed, 不复制其它文档的旧断言计数.
+- gateway-http-smoke.mjs 实际启动独立临时网关与本地假上游, 复制七份源码并记录哈希, 使用只含虚构本地路由的注册表及合成密钥. 不导入生产 .env.local, 不连真实收费上游. gateway-http-smoke.log 输出 21 HTTP checks passed, 14 isolated usage rows.
+- HTTP 检查覆盖正常 streaming/nonstreaming, 错误帧, EOF 截断, socket 中断, length 终止, unknown ENTER/STAY, 正向恢复, 两探针的响应头/响应体挂起及真实连接取消. 成功用量只写独立目录, 失败不增加成功记录. 临时进程已清理, 生产进程未操作.
+- gateway-process-before-smoke.json 与 gateway-process-after-smoke.json: 线上 PID 27624, 创建时间均为 2026-09-23T08:13:10.65922+08:00. 不用进程存在性冒充新代码已上线.
+
+实际委派路由: Codex Desktop multi_agent_v1, 模型 gpt-6-astra-ar, session provider=gateway; 注册表另确认 agentrouter / gpt-6-astra 且无该模型 fallback. 实现与原同批监督均已完成 REV2 门禁复核. 路由原始摘录位于同证据目录 agent-routes.json 和 agent-routes-incremental.json.
+
+状态边界: 本次磁盘修复尚未加载到运行中的网关, 不重启, 不注入热更新, 不安排隐含重启. 真实上游兼容与 D1 国内并发预算仍未由本轮验收或决策. 定向 Git 备份的提交/远端核对见 G:\omp works\docs\WORKSPACE-AUDIT-2026-09-23.md.

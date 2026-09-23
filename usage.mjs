@@ -25,7 +25,11 @@ import { priceFor } from "./pricing.mjs";
 // and the leading slash must go on Windows. Getting this wrong made every write
 // fail silently inside record()'s catch.
 import { fileURLToPath } from "node:url";
-const DIR_PATH = fileURLToPath(new URL("./data/usage/", import.meta.url));
+// Explicit per-process override for isolated runs; normal gateway storage stays
+// under the same module-relative data/usage directory when no override is set.
+const DIR_PATH = process.env.AR_USAGE_DIR
+  ? path.resolve(process.env.AR_USAGE_DIR)
+  : fileURLToPath(new URL("./data/usage/", import.meta.url));
 
 function ensureDir() {
   fs.mkdirSync(DIR_PATH, { recursive: true });

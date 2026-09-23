@@ -430,16 +430,6 @@ function realmOfModel(id) {
   return typeof id === "string" && id.startsWith("global:") ? "global" : "cn";
 }
 
-function withTimeout(promise, ms) {
-  let timer;
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("timeout after " + ms + "ms")), ms);
-    }),
-  ]).finally(() => clearTimeout(timer));
-}
-
 /**
  * Resolve a client model id's configured fallback, if it is safe to use.
  *
@@ -487,15 +477,60 @@ function setRealmHeaders(res, realm, retryAt, source) {
 }
 /** GET a local JSON endpoint with a bounded timeout; null on any failure. */
 async function fetchLocalJSON(url, headers, timeoutMs) {
-  try {
-    const res = await withTimeout(request(url, { method: "GET", headers }), timeoutMs);
-    const chunks = [];
-    for await (const c of res) chunks.push(c);
-    if (res.statusCode !== 200) return null;
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    return null;
-  }
+  // This deadline owns the entire exchange, not just receipt of the headers.
+  // Keep cancellation local to probes; normal upstream retry semantics stay put.
+  return new Promise((resolve) => {
+    let req;
+    let response;
+    let settled = false;
+    const deadline = Date.now() + timeoutMs;
+    const finish = (value, cancel = false) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (cancel) {
+        response?.destroy();
+        req?.destroy();
+      }
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null, true), timeoutMs);
+    try {
+      const u = new URL(url);
+      const mod = u.protocol === "https:" ? https : http;
+      req = mod.request({
+        protocol: u.protocol,
+        hostname: u.hostname,
+        port: u.port || (u.protocol === "https:" ? 443 : 80),
+        path: u.pathname + u.search,
+        method: "GET",
+        headers,
+      }, async (res) => {
+        response = res;
+        if (settled) { res.destroy(); return; }
+        try {
+          if (res.statusCode !== 200) { finish(null, true); return; }
+          const chunks = [];
+          for await (const c of res) {
+            if (settled) return;
+            if (Date.now() >= deadline) { finish(null, true); return; }
+            chunks.push(c);
+          }
+          if (settled) return;
+          const value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          // Parsing is synchronous, so also check the clock after it returns.
+          if (Date.now() >= deadline) finish(null, true);
+          else finish(value);
+        } catch {
+          finish(null, true);
+        }
+      });
+      req.on("error", () => finish(null, true));
+      req.end();
+    } catch {
+      finish(null, true);
+    }
+  });
 }
 
 /** Cached GET /status. null when the key is missing or the call fails. */
@@ -603,11 +638,11 @@ async function globalAvailability(route, bareModel) {
     if (st) return st;
   }
   const health = await fetchHealth(route);
-  if (health?.realm_servable) {
+  if (typeof health?.realm_servable?.global === "boolean") {
     const ok = health.realm_servable.global === true;
     return { ok, at: null, source: ok ? "health" : "health-negative" };
   }
-  return { ok: true, at: null, source: "unknown" };
+  return { ok: false, at: null, source: "unknown" };
 }
 
 /**

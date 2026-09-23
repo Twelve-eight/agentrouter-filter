@@ -1,3 +1,5 @@
+import { StringDecoder } from "node:string_decoder";
+
 // responses <-> chat/completions and responses <-> anthropic/messages
 // translation, plus the chat/anthropic SSE -> responses SSE bridges. Side-effect
 // free: this module binds no port and holds no global state, so tests can import
@@ -393,6 +395,7 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
   emit("response.created", { type: "response.created", response: base });
   emit("response.in_progress", { type: "response.in_progress", response: base });
 
+  let terminal = false;
   let seq = 2;
   let msgId = null;
   let msgOpen = false;
@@ -487,6 +490,8 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
   };
 
   const finish = () => {
+    if (terminal) return;
+    terminal = true;
     // Non-streaming request: the client asked for one JSON object, but this
     // bridge consumes the upstream's SSE. Accumulate and emit the completed
     // response as JSON instead of the event stream. Codex always streams, so
@@ -567,16 +572,24 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
     res.end();
   };
 
-  const fail = () => {
+  const fail = (message = "upstream stream error") => {
+    if (terminal) return;
+    terminal = true;
+    // Preserve partial output without publishing any successful item completion.
+    const output = items.slice();
+    if (rOpen) output[rIndex] = { type: "reasoning", id: rId, summary: [], content: [{ type: "reasoning_text", text: reasoning }] };
+    if (msgOpen) output[msgIndex] = { type: "message", id: msgId, role: "assistant", status: "in_progress", content: [{ type: "output_text", text, annotations: [] }] };
+    for (const c of calls.values()) {
+      if (c.added) output[c.outIndex] = { type: "function_call", id: c.itemId, status: "in_progress", arguments: c.args, call_id: c.id, ...splitWireName(c.name, toolMap) };
+    }
+    const response = { ...base, status: "failed", output: output.filter(Boolean), usage, error: { code: "upstream_error", message } };
     try {
       if (!stream) {
-        // Non-streaming: a JSON body, never a bare end (which would look like an
-        // empty success to the client).
         if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "upstream stream error", type: "upstream_error" } }));
+        res.end(JSON.stringify(response));
         return;
       }
-      sse(res, "response.failed", { type: "response.failed", response: { ...base, status: "failed" } });
+      sse(res, "response.failed", { type: "response.failed", response });
       res.end();
     } catch {}
   };
@@ -584,13 +597,13 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
   return {
     // Reasoning delta: opens the reasoning item on the first non-blank text.
     reasoning(chunk) {
-      if (!chunk) return;
+      if (terminal || !chunk) return;
       reasoning += chunk;
       openReasoning();
     },
     // Visible-text delta.
     text(chunk) {
-      if (!chunk) return;
+      if (terminal || !chunk) return;
       openMessage();
       text += chunk;
       emit("response.output_text.delta", {
@@ -606,6 +619,7 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
     // anthropic: the content-block index). Name and arguments accumulate because
     // both wires stream them in pieces.
     call(key, { id, name, args }) {
+      if (terminal) return;
       // A guarded tool (see oc-zen-proxy.mjs) is upstream-only bookkeeping: the
       // caller never declared it, so neither the item nor its deltas may surface.
       if (toolGuard && typeof name === "string" && name && toolGuard(name)) return;
@@ -645,6 +659,7 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
       }
     },
     setUsage(u) {
+      if (terminal) return;
       usage = u;
     },
     finish,
@@ -658,54 +673,80 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
 
 function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage = null, toolGuard = null, toolMap = null) {
   const em = createResponsesEmitter({ res, model, stream, onUsage, toolGuard, toolMap });
+  const decoder = new StringDecoder("utf8");
   let buf = "";
-  upstream.on("data", (chunk) => {
-    buf += chunk.toString("utf8");
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const payload = t.slice(5).trim();
-      if (payload === "[DONE]") continue;
-      let j;
-      try {
-        j = JSON.parse(payload);
-      } catch {
-        continue;
+  let ended = false;
+  let terminal = false;
+  let completionSeen = false;
+  const fail = (message) => {
+    if (terminal) return;
+    terminal = true;
+    em.fail(message);
+  };
+  const line = (raw) => {
+    if (terminal) return;
+    const t = raw.trim();
+    if (!t.startsWith("data:")) return;
+    const payload = t.slice(5).trim();
+    if (payload === "[DONE]") { completionSeen = true; return; }
+    let j;
+    try { j = JSON.parse(payload); }
+    catch { fail("invalid upstream stream data"); return; }
+    if (!j || typeof j !== "object") { fail("invalid upstream stream data"); return; }
+    if (j.error !== undefined) { fail("upstream stream error"); return; }
+    if (j.usage) {
+      const u = {
+        input_tokens: j.usage.prompt_tokens ?? 0,
+        output_tokens: j.usage.completion_tokens ?? 0,
+        total_tokens: j.usage.total_tokens ?? 0,
+      };
+      // Carry the upstream's reasoning counters through. Without these the
+      // responses stream reports no reasoning usage, so callers (and effort
+      // comparisons) cannot tell whether the requested level took effect.
+      const detail = j.usage.completion_tokens_details;
+      if (detail && typeof detail === "object") {
+        u.output_tokens_details = { reasoning_tokens: detail.reasoning_tokens ?? 0 };
       }
-      if (j.usage) {
-        const u = {
-          input_tokens: j.usage.prompt_tokens ?? 0,
-          output_tokens: j.usage.completion_tokens ?? 0,
-          total_tokens: j.usage.total_tokens ?? 0,
-        };
-        // Carry the upstream's reasoning counters through. Without these the
-        // responses stream reports no reasoning usage, so callers (and effort
-        // comparisons) cannot tell whether the requested level took effect.
-        const detail = j.usage.completion_tokens_details;
-        if (detail && typeof detail === "object") {
-          u.output_tokens_details = { reasoning_tokens: detail.reasoning_tokens ?? 0 };
-        }
-        if (typeof j.usage.completion_thinking_tokens === "number") {
-          u.output_tokens_details = u.output_tokens_details ?? {};
-          u.output_tokens_details.reasoning_tokens = j.usage.completion_thinking_tokens;
-        }
-        em.setUsage(u);
+      if (typeof j.usage.completion_thinking_tokens === "number") {
+        u.output_tokens_details = u.output_tokens_details ?? {};
+        u.output_tokens_details.reasoning_tokens = j.usage.completion_thinking_tokens;
       }
-      const d = j.choices?.[0]?.delta;
-      if (!d) continue;
-      if (d.reasoning_content) em.reasoning(d.reasoning_content);
-      if (d.content) em.text(d.content);
-      if (Array.isArray(d.tool_calls)) {
-        for (const tc of d.tool_calls) {
-          em.call(tc.index ?? 0, { id: tc.id, name: tc.function?.name, args: tc.function?.arguments });
-        }
+      em.setUsage(u);
+    }
+    const choice = j.choices?.[0];
+    const d = choice?.delta;
+    if (d?.reasoning_content) em.reasoning(d.reasoning_content);
+    if (d?.content) em.text(d.content);
+    if (Array.isArray(d?.tool_calls)) {
+      for (const tc of d.tool_calls) {
+        em.call(tc.index ?? 0, { id: tc.id, name: tc.function?.name, args: tc.function?.arguments });
       }
     }
+    if (choice?.finish_reason != null) {
+      if (["stop", "tool_calls", "function_call"].includes(choice.finish_reason)) completionSeen = true;
+      else fail("upstream generation did not complete normally");
+    }
+  };
+  upstream.on("data", (chunk) => {
+    if (terminal) return;
+    buf += typeof chunk === "string" ? chunk : decoder.write(chunk);
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const raw of lines) line(raw);
   });
-  upstream.on("end", () => em.finish());
-  upstream.on("error", () => em.fail());
+  upstream.on("end", () => {
+    ended = true;
+    if (terminal) return;
+    buf += decoder.end();
+    if (buf.trim()) line(buf);
+    if (terminal) return;
+    if (!completionSeen) { fail("upstream stream ended without completion"); return; }
+    terminal = true;
+    em.finish();
+  });
+  upstream.on("error", () => fail("upstream stream error"));
+  upstream.on("aborted", () => fail("upstream stream aborted"));
+  upstream.on("close", () => { if (!ended) fail("upstream stream closed before end"); });
 }
 
 // ---------------------------------------------------------------------------

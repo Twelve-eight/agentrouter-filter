@@ -37,12 +37,17 @@
 import http from "node:http";
 import https from "node:https";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Set BEFORE server.mjs is imported: these constants are read at module load,
 // and the LEAVE case has to observe a recovered /status inside the same process
 // instead of waiting out the 30s cache TTL.
 process.env.AR_REALM_STATUS_TTL_MS = "0";
 process.env.AR_REALM_HEALTH_TTL_MS = "0";
+process.env.AR_REALM_STATUS_TIMEOUT_MS = "25";
+process.env.AR_REALM_HEALTH_TIMEOUT_MS = "25";
 
 let failed = 0;
 const logs = [];
@@ -78,6 +83,8 @@ const chatCalls = [];
 let localStatus = null;
 let localHealth = null;
 let localHits = 0;
+let localFaults = {};
+const localRequests = [];
 
 const stubRequest = () => (opts, onResponse) => {
   const path = String(opts?.path ?? "");
@@ -85,10 +92,12 @@ const stubRequest = () => (opts, onResponse) => {
   const upstream = new EventEmitter();
   upstream.headers = { "content-type": "application/json" };
   upstream.destroyed = false;
-  upstream.destroy = () => {};
+  let releaseBody;
+  upstream.destroy = () => { upstream.destroyed = true; releaseBody?.(); };
   upstream.pipe = () => {};
   upstream.resume = () => {};
-  const req = { on: () => req, write: (b) => { rec.body = String(b); }, end() {} };
+  const req = { on: () => req, write: (b) => { rec.body = String(b); }, end() {}, destroy() { rec.cancelled = true; upstream.destroy(); } };
+  rec.upstream = upstream;
 
   // Deliver the body the way Node delivers a real http response: both an
   // EventEmitter (on("data")/on("end") - the passthrough and bridge paths) and
@@ -101,8 +110,10 @@ const stubRequest = () => (opts, onResponse) => {
     const chunks = text === null ? [] : [Buffer.from(text)];
     upstream[Symbol.asyncIterator] = async function* () { for (const c of chunks) yield c; };
     setImmediate(() => {
+      if (rec.cancelled) return;
       if (typeof onResponse === "function") onResponse(upstream);
       setImmediate(() => {
+        if (upstream.destroyed) return;
         for (const c of chunks) upstream.emit("data", c);
         upstream.emit("end");
       });
@@ -111,6 +122,18 @@ const stubRequest = () => (opts, onResponse) => {
 
   if (path === "/status" || path === "/healthz") {
     localHits++;
+    localRequests.push(rec);
+    const fault = localFaults[path];
+    if (fault === "headers-hang") return req;
+    if (fault === "body-hang") {
+      upstream.statusCode = 200;
+      upstream[Symbol.asyncIterator] = async function* () {
+        yield Buffer.from("{");
+        await new Promise(resolve => { releaseBody = resolve; });
+      };
+      setImmediate(() => onResponse(upstream));
+      return req;
+    }
     if (path === "/status") finish(localStatus ? 200 : 503, localStatus ? JSON.stringify(localStatus) : "{}");
     else finish(200, JSON.stringify(localHealth ?? { healthy: 1, realm_servable: { cn: true, global: true } }));
     return req;
@@ -136,7 +159,17 @@ http.createServer = (h) => {
   return { on() {}, listen() {} };
 };
 
+// Isolate usage before the real server (and its usage dependency) is imported.
+// Each run owns a new directory; keep its artifacts for post-run inspection.
+const testTmp = fileURLToPath(new URL("../.tmp/", import.meta.url));
+if (process.platform === "win32" && path.parse(testTmp).root.toLowerCase() !== "g:" + path.sep) {
+  throw new Error("Usage isolation tests must run from a project on G:");
+}
+fs.mkdirSync(testTmp, { recursive: true });
+process.env.AR_USAGE_DIR = fs.mkdtempSync(path.join(testTmp, "test-realm-fallback-usage-"));
+
 await import("../server.mjs");
+out(`测试账本目录: ${process.env.AR_USAGE_DIR}\n`);
 out("");
 
 const fakeRes = () => ({
@@ -166,12 +199,19 @@ const fakeRes = () => ({
 async function post(body) {
   const res = fakeRes();
   const done = new Promise((resolve) => { res._done = resolve; });
-  await handler(
-    { method: "POST", url: "/u/v1/responses", headers: {}, chunks: [Buffer.from(JSON.stringify(body))] },
-    res,
-  );
-  // Bounded wait for res.end().
-  await Promise.race([done, new Promise((r) => setTimeout(r, 2000))]);
+  let timer;
+  try {
+    await Promise.race([
+      (async () => {
+        await handler(
+          { method: "POST", url: "/u/v1/responses", headers: {}, chunks: [Buffer.from(JSON.stringify(body))] },
+          res,
+        );
+        await done;
+      })(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("handler did not finish within 5000ms")), 5000); }),
+    ]);
+  } finally { clearTimeout(timer); }
   return res;
 }
 
@@ -332,6 +372,79 @@ check("no-fallback: no realm header added", () => eq(res.headers["x-gateway-real
   localHealth = restore.health;
   script = restore.script;
 }
+
+// --- 6. Unknown probes must not clear an armed fallback ----------------------
+async function clearWindow() {
+  localFaults = {};
+  localStatus = recoveredStatus();
+  localHealth = { realm_servable: { global: true } };
+  script = [ok()];
+  await post(reqBody(GLOBAL));
+}
+await clearWindow();
+localStatus = null;
+localHealth = {}; // no usable global availability, not a positive health signal
+script = [{ status: 503, body: "{}" }, ok()];
+chatCalls.length = 0;
+res = await post(reqBody(GLOBAL));
+check("unknown: observed global failure then cn", () => {
+  eq(chatCalls.length, 2, "calls");
+  eq(JSON.parse(chatCalls[0].body).model, GLOBAL, "first model");
+  eq(JSON.parse(chatCalls[1].body).model, CN, "second model");
+});
+check("unknown: source is not transient", () => eq(res.headers["x-gateway-realm-source"], "unknown", "source"));
+script = [ok()];
+chatCalls.length = 0;
+res = await post(reqBody(GLOBAL));
+check("unknown: next request stays on cn", () => {
+  eq(chatCalls.length, 1, "calls");
+  eq(JSON.parse(chatCalls[0].body).model, CN, "model");
+  eq(res.headers["x-gateway-realm-source"], "unknown", "source");
+});
+check("unknown: retains bounded unknown recovery window", () => {
+  const remaining = Date.parse(res.headers["x-gateway-retry-at"]) - Date.now();
+  if (!(remaining > 60_000 && remaining <= 15 * 60_000)) throw new Error("unknown window was shortened to transient");
+});
+localHealth = { realm_servable: { global: "true" } };
+script = [ok()];
+chatCalls.length = 0;
+res = await post(reqBody(GLOBAL));
+check("unknown: non-boolean health does not recover", () => {
+  eq(JSON.parse(chatCalls[0].body).model, CN, "model");
+  eq(res.headers["x-gateway-realm-source"], "unknown", "source");
+});
+localHealth = { realm_servable: { global: true } };
+script = [ok()];
+chatCalls.length = 0;
+await post(reqBody(GLOBAL));
+check("health: positive evidence still clears window", () => eq(JSON.parse(chatCalls[0].body).model, GLOBAL, "model"));
+
+// --- 7. Deadline covers headers and body, and cancels owned I/O --------------
+for (const endpoint of ["/status", "/healthz"]) {
+  for (const fault of ["headers-hang", "body-hang"]) {
+    await clearWindow();
+    localStatus = null;
+    localHealth = {};
+    localFaults = { [endpoint]: fault };
+    localRequests.length = 0;
+    script = [{ status: 503, body: "{}" }, ok()];
+    chatCalls.length = 0;
+    const start = Date.now();
+    res = await post(reqBody(GLOBAL));
+    check(endpoint + " " + fault + ": deadline allows cn", () => {
+      eq(res.status, 200, "status");
+      eq(chatCalls.length, 2, "calls");
+      eq(JSON.parse(chatCalls[1].body).model, CN, "model");
+      if (Date.now() - start > 1000) throw new Error("probe exceeded bounded completion allowance");
+    });
+    check(endpoint + " " + fault + ": cancels request and response", () => {
+      const hit = localRequests.find(r => r.path === endpoint);
+      eq(hit.cancelled, true, "request cancelled");
+      eq(hit.upstream.destroyed, true, "response destroyed");
+    });
+  }
+}
+localFaults = {};
 
 out("");
 out(failed ? `${failed} check(s) FAILED\n` : "all checks passed\n");
