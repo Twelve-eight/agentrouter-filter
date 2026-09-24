@@ -1412,3 +1412,23 @@ README 里 "reasoning 剥离已整体移除" 仍然成立: 那条指的是无差
 ### 待用户执行
 
 线上网关 (7878) 仍跑旧代码, **需要重启**才生效 (重启由用户决定)。重启前该会话若再次回放外来 `item_` id, 仍会 400。
+### 补证:坏 id 就是 relaycat 给 reasoning 签发的 (2026-09-24 复测)
+
+上文的产地判断 (relaycat 是 `item_` 的签发方) 起初只有 message item 的样本。为了把
+`reasoning` 这一路也钉死, 直接对 relaycat 打两次真实请求 (model gpt-6-astra, 不含
+`include: ["reasoning.encrypted_content"]`):
+
+| effort | HTTP | 返回的 item id |
+|---|---|---|
+| `low` | 200 | `message id=item_a37521598ea539374ad14b1c` |
+| `max` | 200 | `reasoning id=item_bb3549e2d373cc46ccea4452`, `message id=item_392c2f18c4a60fe941906540` |
+
+两点由此确证:
+
+1. relaycat **也会给 `reasoning` 签发 `item_...` 形式的 id**, 与报错里那条
+   `item_9c5b989663879ef37cb7082c` 形态一致。跨 provider 切换后 Codex 回放它, agentrouter
+   即 400 —— 与本次修复针对的失败完全同源。
+2. 这些 reasoning item 的 `encrypted_content` 是**空的**(relaycat 没回加密体),
+   所以本次修复删 id 时连带清掉的也只是一个空字段, 不损失任何可还原的推理状态。
+
+原始输出留在 `.tmp/probe-relaycat-reasoning-id.txt` (未入库)。
