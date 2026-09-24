@@ -929,3 +929,84 @@ anyrouter 的 claude 系列**只在 anthropic /v1/messages 面服务**。实测:
   差别在网关补齐的工具/指纹组合, 直连探测脚本未复刻; **该 403 未追根因**, 不影响经网关的可用性。
 - **需重启网关与 Codex 才生效** (providers.json / server.mjs / catalog 均已更新到磁盘, 但
   线上 7878 仍是旧代码, Codex 仍是旧 catalog)。重启由用户执行。
+
+## 2026-09-24: 接入 motomoto.lol (4 个模型, 2 并发上限)
+
+用户提供 `https://motomoto.lol` (New-API 中转, `X-New-Api-Version:
+v1.0.0-rc.31-motomoto.49`) 与其 key, 要求配到 Codex, 并说明该站**上限为 1 个主代理
++ 1 个子智能体 = 2 并发**。
+
+### 1) 两个必须先知道的实测事实
+
+**a. 直连被 CDN 拦成 200 空响应, 必须走本地代理**
+
+直连 HTTPS 到**任意路径**都返回 `HTTP 200` + `Content-Type: text/plain` +
+**零长度 body**。实测 `/`, `/v1`, `/v1/models`, `/v1/chat/completions`, `/health`,
+甚至**不存在的路径**全都是同一个响应 —— 说明拦在 CDN 而不是 API。
+同一个请求走 `http://127.0.0.1:7897` 返回真实 JSON。
+
+这类故障**不会报错**, 客户端只会看到空 body; 若按 `HTTP 200` 判断成功就会误判。
+因此 provider 级设 `proxy` (与 anyrouter 同一机制, server.mjs 的 CONNECT 隧道)。
+
+**b. 只有 chat/completions 可用**
+
+| 路径 | 结果 |
+|---|---|
+| `/v1/chat/completions` | 可用 |
+| `/v1/responses` | `Upstream service temporarily unavailable` |
+| `/v1/messages` | 同上 (anthropic wire) |
+
+所以只能走网关的 chat 桥 (`wire: "chat"`)。
+
+### 2) 模型 id 冲突 (重要)
+
+该站暴露 4 个 id: `codex-auto-review`, `gpt-6-astra`, `gpt-5.5`, `gpt-5.6-sol`。
+**这 4 个在 providers.json 里已经存在, 且都指向 relaycat。**
+
+因此以 `motomoto:` 前缀注册 (同 zen: 的做法)。
+**绝不能覆盖裸 slug** —— 那会把所有现有调用者静默改道到另一个上游。
+
+### 3) 并发上限
+
+`~/.codex/config.toml` 新增:
+
+```toml
+[agents]
+max_concurrent_threads_per_session = 1
+```
+
+该键只计**spawned 线程, 不含主代理**, 所以 1 = 主 + 1 子 = 2 并发, 与该站上限一致。
+
+位置有讲究: 必须放在**第一个 `[table]` 之前**。TOML 里表格头之后的键属于该表,
+若追加到文件末尾会静默变成 `[mcp_servers.*]` 的字段。已断言 `[agents]` 就是第一个表头。
+
+**副作用 (已知且未消除)**: `[agents]` 是**全局**设置, 无法按模型设置。所以
+非 motomoto 的模型也会被限制到 1 个并发子代理。这是为 motomoto 付出的代价,
+若要恢复需在 config.toml 里改回或删除该块。
+
+### 验证
+
+- **隔离实例 (7879, 未碰线上 7878)**: `/u/v1/models` -> 43 个, 含 4 个 motomoto id。
+- 经网关打 4 个模型: 网关正确构造 chat body (163 字节, 见下方捕获),
+  经代理抵达上游并返回上游自身的错误 —— **链路已通, 失败发生在上游侧**。
+- **请求体取证**: 用 `toChatBody` 直接导出网关构造的 body, 确认结构正常
+  (`{model, messages:[system,user], stream:true}`), 不是网关构造错误。
+- 把**同一个 body** 经代理直发 motomoto: 同样报 `Upstream service temporarily
+  unavailable` —— 排除了网关的因素。
+- 门禁全绿 (syntax / anthropic-registry / realm-fallback / filter-failopen 6 /
+  bridge-request 32 / bridge-indices / usage-pricing / stream-terminal 48)。
+- catalog 重建: 43 个模型, 4 个 motomoto 条目已进 picker。
+- TOML 校验: 32 个表, 无重复, `[agents]` 位置正确, 顶层 model/model_provider 未受影响。
+
+### 诚实边界
+
+- **该站当前不可用**。第一次调用 (用户给的原始 curl, 走代理) 成功返回
+  `"Hi. What would you like to work on?"`, 之后连续 18+ 次全部
+  `Upstream service temporarily unavailable`。**这不是我们的配置问题** ——
+  同样的 body 绕开网关直发也一样失败。恢复后无需再改代码。
+- **未验证 motomoto 模型的真实对话质量与工具调用能力**, 因为上游不可用。
+- 4 个模型的 context_window 是 catalog 从同名 slug 继承的 (1050000 / 128000),
+  **不是 motomoto 自己公布的**, 未经验证。
+- 2 并发上限是**用户转述的站点限制**, 本站未提供可查询的配额接口, 未独立验证。
+- **需重启网关与 Codex 才生效** (providers.json / .env.local / config.toml / catalog
+  均已更新到磁盘)。重启由用户执行。

@@ -56,6 +56,12 @@
         "medium",
         "high"
       ]
+    },
+    "motomoto": {
+      "base": "https://motomoto.lol",
+      "wire": "chat",
+      "keyEnv": "MOTOMOTO_API_KEY",
+      "proxy": "http://127.0.0.1:7897"
     }
   },
   "_models_comment": [
@@ -231,7 +237,24 @@
         "max"
       ]
     },
-    "_spacebunny_comment": "space-bunny-free on the opencode zen free tier. Probed 2026-09-24: HTTP 200,\ntool calls work, and it is reached through the same local reverse proxy as the\nother zen free models (oc-zen-proxy.mjs, port 7901), which supplies the OpenCode\nclient fingerprint the free tier requires.\n\nThe explicit `efforts` list is what keeps it from inheriting the provider window:\nproviderFor() prefers a model-level list over the provider-level one (model >\nprovider > null). The provider-level [low,medium,high] exists for\nmimo-v2.6-flash-free, which rejects xhigh/max with a 400. A DIRECT probe of the\nzen proxy (bypassing the gateway, 2026-09-24) returned 200 for every level -\nminimal/low/medium/high/xhigh/max - so inheriting that list silently downgraded a\ncaller's `max` to `high`. Re-probe before narrowing this list."
+    "_spacebunny_comment": "space-bunny-free on the opencode zen free tier. Probed 2026-09-24: HTTP 200,\ntool calls work, and it is reached through the same local reverse proxy as the\nother zen free models (oc-zen-proxy.mjs, port 7901), which supplies the OpenCode\nclient fingerprint the free tier requires.\n\nThe explicit `efforts` list is what keeps it from inheriting the provider window:\nproviderFor() prefers a model-level list over the provider-level one (model >\nprovider > null). The provider-level [low,medium,high] exists for\nmimo-v2.6-flash-free, which rejects xhigh/max with a 400. A DIRECT probe of the\nzen proxy (bypassing the gateway, 2026-09-24) returned 200 for every level -\nminimal/low/medium/high/xhigh/max - so inheriting that list silently downgraded a\ncaller's `max` to `high`. Re-probe before narrowing this list.",
+    "motomoto:codex-auto-review": {
+      "p": "motomoto",
+      "m": "codex-auto-review"
+    },
+    "motomoto:gpt-6-astra": {
+      "p": "motomoto",
+      "m": "gpt-6-astra"
+    },
+    "motomoto:gpt-5.5": {
+      "p": "motomoto",
+      "m": "gpt-5.5"
+    },
+    "motomoto:gpt-5.6-sol": {
+      "p": "motomoto",
+      "m": "gpt-5.6-sol"
+    },
+    "_motomoto_comment": "motomoto.lol - a New-API relay (X-New-Api-Version: v1.0.0-rc.31-motomoto.49).\n\nDIRECT CONNECTIONS DO NOT WORK and they do not fail loudly: a direct HTTPS\nrequest to any path answers `HTTP 200`, `Content-Type: text/plain`, and a\nZERO-LENGTH body. Measured 2026-09-24 - /, /v1, /v1/models, /v1/chat/\ncompletions, /health, even a nonexistent path all answered the same way, so it\nis the CDN, not the API. The same request through the local HTTP proxy returns\nreal JSON. Hence the provider-level `proxy` (same mechanism anyrouter uses).\n\nWIRE: chat/completions only. /v1/responses and /v1/messages both answer\n`Upstream service temporarily unavailable` (upstream_error / nil type) while\n/v1/chat/completions works, so the gateway's chat bridge is the only path.\n\nID COLLISION: all four ids (codex-auto-review, gpt-6-astra, gpt-5.5,\ngpt-5.6-sol) are ALREADY registered against relaycat. They are therefore\nexposed here under a `motomoto:` prefix. Do not overwrite the bare slugs -\nthat would silently reroute every existing caller to a different upstream.\n\nCONCURRENCY: the operator reports a ceiling of one primary + one subagent\n(2 concurrent requests). See the [agents] block in ~/.codex/config.toml."
   },
   "_claude_comment": "claude-opus-4-8 is served by justwoker over the anthropic-messages wire (see the anthropic bridge in bridge.mjs). It was briefly removed when only agentrouter offered it: agentrouter registers the claude ids on its anthropic-messages face only (messages=402 quota, responses=503, while a nonexistent model is 503 on both) and codex speaks only responses, so selecting them always failed. That is why the responses->messages bridge exists. claude-opus-5 is still unavailable on every provider we route."
 }
