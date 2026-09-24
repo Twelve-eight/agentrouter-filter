@@ -51,6 +51,26 @@ import { statsApi } from "./stats-api.mjs";
 // the secret never reaches the repository, and loaded BEFORE the registry is read
 // because providerFor() resolves keys from process.env.
 //
+// PRECEDENCE: this file OVERRIDES the ambient environment (see loadLocalEnv).
+//
+// Why that direction, when the usual convention is the opposite: an inherited
+// environment variable is a SNAPSHOT taken when the process tree was created,
+// and this gateway is launched by autostart through Windows Terminal, whose
+// shell may have been running for hours. Rotating a key with
+// [Environment]::SetEnvironmentVariable updates the registry but NOT any
+// already-running shell, so the gateway kept inheriting a REVOKED key.
+//
+// Measured 2026-09-24: after rotating JUSTWOKER_API_KEY, the file and the User
+// scope both held the new value, direct calls with it returned 200, and the
+// gateway still answered 401 'Invalid token' - because its parent terminal had
+// captured the old value earlier and the old code let the environment win.
+//
+// The failure mode is the point: a shadowed key is indistinguishable from a bad
+// key at the API boundary, so it sends you hunting the wrong problem. Making the
+// FILE authoritative means editing it is always sufficient, and
+// `AR_ALLOW_ENV_OVERRIDE=1` is there for the rare case an operator really does
+// need to inject a key per-process.
+//
 // Format: KEY=value per line, `#` comments, surrounding quotes stripped.
 function loadLocalEnv() {
   const file = new URL("./.env.local", import.meta.url);
@@ -70,8 +90,15 @@ function loadLocalEnv() {
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
     }
-    // A real environment variable wins, so an explicit override still works.
-    if (process.env[key] === undefined) process.env[key] = value;
+    // The file wins - see the precedence note above loadLocalEnv. A stale
+    // ambient variable once shadowed a rotated key here and surfaced only as an
+    // upstream 401. AR_ALLOW_ENV_OVERRIDE=1 restores the old direction for the
+    // rare case an operator must inject a key per-process.
+    if (process.env.AR_ALLOW_ENV_OVERRIDE === "1") {
+      if (process.env[key] === undefined) process.env[key] = value;
+    } else {
+      process.env[key] = value;
+    }
   }
 }
 loadLocalEnv();
