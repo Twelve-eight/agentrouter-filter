@@ -197,6 +197,23 @@ try {
   // no previous catalog (first run) - nothing to remember
 }
 
+// The effort levels the GATEWAY will actually forward. providers.json is the
+// single source of truth for the clamp (see providerFor() in server.mjs): a model
+// may narrow its provider's window with its own `efforts` array. Advertising the
+// unclamped set here makes the picker a liar - the user selects `max`, the gateway
+// rewrites it to `high`, and nothing says so. Measured 2026-09-24: zen's
+// mimo-v2.6-flash-free inherited [low,medium,high] while the catalog advertised
+// `max` from the EFFORTS_DEFAULT guess, and space-bunny-free (which accepts all six
+// levels) was advertised WITHOUT minimal/xhigh. Precedence mirrors the gateway:
+// model clamp > provider clamp > live upstream metadata > built-in default.
+function clampWindow(slug) {
+  const spec = REGISTRY.models[slug];
+  const prov = spec && REGISTRY.providers[spec.p];
+  if (Array.isArray(spec?.efforts) && spec.efforts.length) return spec.efforts;
+  if (Array.isArray(prov?.efforts) && prov.efforts.length) return prov.efforts;
+  return null;
+}
+
 const ours = Object.entries(REGISTRY.models)
   .filter(([, v]) => v && typeof v === "object")
   .map(([slug, spec]) => {
@@ -206,7 +223,7 @@ const ours = Object.entries(REGISTRY.models)
       slug,
       `${spec.m ?? slug} (via ${prov})`,
       `${upstream} served by ${prov} through the local gateway`,
-      EFF[slug] ?? EFFORTS_DEFAULT,
+      clampWindow(slug) ?? EFF[slug] ?? EFFORTS_DEFAULT,
       CTX[slug] ?? CTX_YML[spec.m ?? slug] ?? CTX_YML[slug] ?? CTX_PREV[slug] ?? CTX_DEFAULT,
     );
   })

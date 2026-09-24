@@ -229,8 +229,14 @@ function providerFor(model) {
     keyEnv: p.keyEnv,
     key: p.keyEnv ? process.env[p.keyEnv] : undefined,
     // Effort levels the upstream accepts, when it is pickier than chat/completions
-    // (opencode-zen free models: low/medium/high only; max/xhigh are 400).
-    efforts: Array.isArray(p.efforts) ? p.efforts : null,
+    // (opencode-zen's mimo-v2.6-flash-free: low/medium/high only; max/xhigh are
+    // 400). A MODEL may override the provider window with its own `efforts` array
+    // in providers.json: zen's space-bunny-free accepts all six levels, so
+    // inheriting the provider list silently downgraded a `max` request to `high`
+    // (measured 2026-09-24; the clamp itself lives in bridge.mjs toChatBody).
+    // Precedence: model > provider > null (no clamp).
+    efforts: Array.isArray(spec.efforts) ? spec.efforts
+      : (Array.isArray(p.efforts) ? p.efforts : null),
     // Extra request headers to inject on the wire, per model or per provider
     // (providers.json `headers`). anyrouter's claude ids REQUIRE
     // `anthropic-beta: context-1m-2025-08-07`: without it the upstream answers

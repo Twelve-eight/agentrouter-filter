@@ -160,7 +160,7 @@
       "p": "anyrouter",
       "m": "gpt-6-astra"
     },
-        "_anyrouter_claude_comment": "anyrouter exposes its claude ids ONLY on the anthropic /v1/messages face.\nProbed 2026-09-24: /v1/responses answers 404 \"当前 API 不支持所选模型\" for every\nclaude id (and for gpt-5-codex / gemini-2.5-pro too - that face serves nothing),\nwhile /v1/messages reaches the business layer. Hence the per-model\n\"wire\": \"anthropic\" override (the provider default stays \"responses\" so\ngpt-6-astra-an is unaffected).\n\nanthropic-beta is REQUIRED. Without it the upstream answers 400 \"1m 上下文已经\n全量可用,请启用 1m 上下文后重试\"; with it the error layer advances to 503\nService Unavailable. That 503 is a SITE-WIDE condition, not a model fault:\nclaude-opus-4-7 / claude-sonnet-4-5 / claude-3-5-sonnet all answered 503 at the\nsame moment. So these two ids are registered and routable but NOT currently\nworking - do not report them as available until the upstream channel pool\nrecovers. Verify with:\n  curl -sS -o NUL -w '%{http_code}' -x http://127.0.0.1:7897 \\\n    -X POST https://anyrouter.top/v1/messages \\\n    -H 'x-api-key: <ANYROUTER_API_KEY>' -H 'anthropic-version: 2023-06-01' \\\n    -H 'anthropic-beta: context-1m-2025-08-07' \\\n    -H 'Content-Type: application/json' \\\n    --data '{\"model\":\"claude-opus-5-5\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'\n  # 400 = beta header missing/wrong; 503 = header accepted, channel pool down;\n  # 200 = recovered.",
+    "_anyrouter_claude_comment": "anyrouter exposes its claude ids ONLY on the anthropic /v1/messages face.\nProbed 2026-09-24: /v1/responses answers 404 \"当前 API 不支持所选模型\" for every\nclaude id (and for gpt-5-codex / gemini-2.5-pro too - that face serves nothing),\nwhile /v1/messages reaches the business layer. Hence the per-model\n\"wire\": \"anthropic\" override (the provider default stays \"responses\" so\ngpt-6-astra-an is unaffected).\n\nanthropic-beta is REQUIRED. Without it the upstream answers 400 \"1m 上下文已经\n全量可用,请启用 1m 上下文后重试\"; with it the error layer advances to 503\nService Unavailable. That 503 is a SITE-WIDE condition, not a model fault:\nclaude-opus-4-7 / claude-sonnet-4-5 / claude-3-5-sonnet all answered 503 at the\nsame moment. So these two ids are registered and routable but NOT currently\nworking - do not report them as available until the upstream channel pool\nrecovers. Verify with:\n  curl -sS -o NUL -w '%{http_code}' -x http://127.0.0.1:7897 \\\n    -X POST https://anyrouter.top/v1/messages \\\n    -H 'x-api-key: <ANYROUTER_API_KEY>' -H 'anthropic-version: 2023-06-01' \\\n    -H 'anthropic-beta: context-1m-2025-08-07' \\\n    -H 'Content-Type: application/json' \\\n    --data '{\"model\":\"claude-opus-5-5\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'\n  # 400 = beta header missing/wrong; 503 = header accepted, channel pool down;\n  # 200 = recovered.",
     "claude-opus-5-5": {
       "p": "anyrouter",
       "wire": "anthropic",
@@ -207,7 +207,31 @@
     "zen:mimo-v2.6-flash": {
       "p": "opencode-zen",
       "m": "mimo-v2.6-flash-free"
-    }
+    },
+    "space-bunny-free": {
+      "p": "opencode-zen",
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "zen:space-bunny": {
+      "p": "opencode-zen",
+      "m": "space-bunny-free",
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "_spacebunny_comment": "space-bunny-free on the opencode zen free tier. Probed 2026-09-24: HTTP 200,\ntool calls work, and it is reached through the same local reverse proxy as the\nother zen free models (oc-zen-proxy.mjs, port 7901), which supplies the OpenCode\nclient fingerprint the free tier requires.\n\nThe explicit `efforts` list is what keeps it from inheriting the provider window:\nproviderFor() prefers a model-level list over the provider-level one (model >\nprovider > null). The provider-level [low,medium,high] exists for\nmimo-v2.6-flash-free, which rejects xhigh/max with a 400. A DIRECT probe of the\nzen proxy (bypassing the gateway, 2026-09-24) returned 200 for every level -\nminimal/low/medium/high/xhigh/max - so inheriting that list silently downgraded a\ncaller's `max` to `high`. Re-probe before narrowing this list."
   },
   "_claude_comment": "claude-opus-4-8 is served by justwoker over the anthropic-messages wire (see the anthropic bridge in bridge.mjs). It was briefly removed when only agentrouter offered it: agentrouter registers the claude ids on its anthropic-messages face only (messages=402 quota, responses=503, while a nonexistent model is 503 on both) and codex speaks only responses, so selecting them always failed. That is why the responses->messages bridge exists. claude-opus-5 is still unavailable on every provider we route."
 }

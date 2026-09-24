@@ -872,3 +872,60 @@ anyrouter 的 claude 系列**只在 anthropic /v1/messages 面服务**。实测:
   同一时刻 opus-4-7 / sonnet-4-5 / 3-5-sonnet 全部 503, haiku-4-5 是 520。
 - 配完**不代表可用**。恢复后无需再改代码, 直接就能用。
 - 已试遍的头名变体与指纹变体记录在 `docs/ANYROUTER-CLAUDE-ACCESS.md` §3, 不必重试。
+
+## 2026-09-24: 接入 opencode zen 的 space-bunny-free (+ 修掉 effort 夹取的三处不一致)
+
+用户要求把 opencode zen 新增的免费模型 `space-bunny-free` 拉到 Codex 侧。
+
+### 1) 注册 (已完成)
+- `providers.json`: 新增 `space-bunny-free` 与别名 `zen:space-bunny` (provider `opencode-zen`,
+  走既有的 `oc-zen-proxy.mjs` 反代 7901 —— 免费档要求 OpenCode 客户端指纹, 该反代负责补齐)。
+- 注释用**字符串** `_spacebunny_comment` (不是数组: `models` 里的数组会被
+  `typeof === "object"` 放行, 在 `/u/v1/models` 与选择器里变成假模型 id)。这是**第三次**
+  踩同一类坑 (前两次: anyrouter claude 注释、更早一处), 已在注释里写明。
+
+### 2) 发现并修掉的三处 effort 不一致 (本次主要产出)
+排查中先用**经网关**的探测得出 "space-bunny 六档全收" —— **该结论当时是假的**: 网关把
+`max` 静默改写成 `high` 后再发上游, 上游当然回 200。改成**直连 zen 反代 (7901, 绕过网关)**
+复测, 才是真证据: `minimal/low/medium/high/xhigh/max` 全 200。由此暴露三个问题:
+
+1. **`providerFor()` 只有 provider 级夹取** (`server.mjs`)。opencode-zen 的
+   provider 级 `efforts: [low,medium,high]` 是为 mimo 设的, space-bunny 继承后
+   `max`->`high`、`xhigh`->`high`、`minimal`->`low`, 静默降级。已改为
+   **model > provider > null** 的优先级, 并给 space-bunny 两条显式声明六档。
+2. **`tools/build-model-catalog.cjs` 完全忽略 registry 的 `efforts`**, 落回硬编码猜测
+   `EFFORTS_DEFAULT = [low,medium,high,max]`。后果: picker 宣称 mimo 支持 `max`, 实际被夹成
+   `high` (picker 撒谎); space-bunny 实际收 `minimal/xhigh`, picker 却不列。已加
+   `clampWindow()`, 优先级与网关一致, 并注明 registry 是唯一真源。
+3. **我先前写下的注释断言是错的** —— 声称 "providerFor() reads spec-level overrides
+   before provider ones", 而代码里根本没有 spec 级覆盖。已改正, 并把
+   "直连复测" 的方法写进注释, 避免下次又用经网关的探测自我欺骗。
+
+### 验证 (全部实机, 隔离实例 7879, 未碰线上 7878)
+- **转发内容取证**: 起假上游 (7999) + 指向它的隔离网关, 记录网关**实际转发**的
+  `reasoning_effort`。修复前后对比:
+
+  | 请求 | 修复前 | 修复后 |
+  |---|---|---|
+  | space-bunny `max` | `high` (降级) | **`max`** |
+  | space-bunny `xhigh` | `high` (降级) | **`xhigh`** |
+  | space-bunny `minimal` | `low` (降级) | **`minimal`** |
+  | mimo `max` | `high` (夹取, 正确) | `high` (夹取, 正确) |
+  | mimo `minimal` | `low` (夹取, 正确) | `low` (夹取, 正确) |
+
+- **端到端 (真实上游, 流式)**: `zen:space-bunny` 六档全部 `200` + `response.completed`;
+  `zen:mimo-v2.6-flash` 六档全部 `200` (内部夹取到 low/medium/high, 符合预期)。
+- **catalog 一致性**: 重建后 `space-bunny` = `minimal/low/medium/high/xhigh/max`,
+  `zen:mimo-v2.6-flash` = `low/medium/high` (default `high`) —— 与网关实际转发一致。
+  改动范围经逐条比对**严格限于 4 个 zen 条目**, 无其它模型被波及。
+- **门禁**: check-syntax / anthropic-registry / realm-fallback / filter-failopen 6 /
+  bridge-request 32 / bridge-indices / usage-pricing / stream-terminal 48 全绿。
+- 临时实例 (7879/7999) 已全部停止; 线上 7878 (PID 27488) 全程未动。
+
+### 诚实边界
+- 只验证了 `space-bunny-free` 与 `mimo-v2.6-flash-free`。zen 同档其它 free 模型
+  (`ling-3.0-flash-fin-free` / `muse-spark-*` / `nemotron-*` / `jev-1.13-free`) 未逐一探测。
+- `mimo-v2.6-flash-free` 直连 zen 反代时**六档全 403 FreeTierError**, 而经网关同模型 200。
+  差别在网关补齐的工具/指纹组合, 直连探测脚本未复刻; **该 403 未追根因**, 不影响经网关的可用性。
+- **需重启网关与 Codex 才生效** (providers.json / server.mjs / catalog 均已更新到磁盘, 但
+  线上 7878 仍是旧代码, Codex 仍是旧 catalog)。重启由用户执行。
