@@ -1432,3 +1432,51 @@ README 里 "reasoning 剥离已整体移除" 仍然成立: 那条指的是无差
    所以本次修复删 id 时连带清掉的也只是一个空字段, 不损失任何可还原的推理状态。
 
 原始输出留在 `.tmp/probe-relaycat-reasoning-id.txt` (未入库)。
+## 2026-09-24: motomoto `invalid JSON request body` (已修复, 已实测)
+
+### 现象
+
+用户报告 motomoto 每次调用都失败:
+
+```
+Invalid request: Invalid request: invalid JSON request body
+(request id: 202609241218333883680598268d9d61SYbudbX)
+```
+
+从网关日志定位到唯一一次 motomoto 调用 (2026-09-24T12:18:14Z): `bridge u/v1/responses -> motomoto model=gpt-6-astra msgs=23 tools=29`, 3 秒后上游回 400。用小请求 (`msgs=2 tools=0`) 复现同样 400, 说明与上下文大小/工具无关。
+
+### 根因一: 出站 body 用了 chunked 分帧
+
+**实测对照** (同一 key、同一 body, 2026-09-24):
+
+| 分帧方式 | 结果 |
+|---|---|
+| `Transfer-Encoding: chunked` (Node 默认) | **400** `invalid JSON request body` |
+| `Content-Length: <n>` | **200** + 真实补全 |
+
+body 的字节完全相同, 只有分帧不同。Node 对"有 body 但没 Content-Length"的请求默认用 chunked, 而 motomoto (New-API 系) 解不出这种分帧, 于是报成 JSON 格式错误。修复: `request()` 显式给带 body 的出站请求补 `Content-Length` (仅当调用方没有自带任何分帧头)。`/v1/models` 走 GET 无 body, 两种分帧都 200, 所以之前接 motomoto 时只探过 GET 与 responses 面, 没暴露这个差异。
+
+### 根因二: 收到完整回答后上游粗暴断连, 桥接层把它当失败
+
+修好分帧后仍得到 `status=failed / upstream stream aborted`。用原始客户端直连复现:
+
+```
+outcome=aborted elapsed=164152ms sse-lines=5  has [DONE]: true
+last lines: ... "delta":{"content":""}, "finish_reason":"stop" ... [DONE]
+```
+
+即 motomoto **把整个 SSE 流发完 (含 `data: [DONE]`、真实内容 "Hi"、usage) 后直接断连**, 不做干净关闭。`bridgeChatStream` 把 abort/close 一律当失败, 于是已经完整到达的回答被丢弃, 调用方拿到 `upstream stream aborted` 与 502。
+
+修复: 粗暴断连 (abort / close-without-end) **只有已经看到 `data: [DONE]` 时才宽恕**。单有 `finish_reason` 不够 —— 上游可能还要补发 usage, 且 `test-stream-terminal` 的 `finish-then-close` 用例明确把它钉为失败。尾部缓冲必须先冲刷再判断 (上游的 `[DONE]` 可能没有末尾换行)。
+
+### 验证
+
+- 新增 `tools/test-bridge-rude-close.mjs` **8/8**: 完整回答+粗暴断连 -> `response.completed` (文本 "Hi" 与 usage 都保留) / 无任何信号 -> 仍失败 / 只有 finish_reason -> 仍失败 / 干净 end 行为不变 / 只发一次 completed。
+- 全门禁绿: `test-stream-terminal` 48/48 (含 `finish-then-close`、`error-after-done` 等边界) / `test-bridge-request` 32 / `test-bridge-indices` / `test-realm-fallback` / `test-anthropic-registry` / `test-responses-ids` 16 / `test-strict-item-ids` / `test-egress-guard` 16 / `test-egress-scan` 28 / `test-filter-failopen` / `test-usage-pricing` / `check-syntax` / `diff-test` 0 mismatches。
+- **隔离实例 7879 打真实上游**: 7878 (旧代码) 仍是报错原文那个 400; 7879 (新代码) **200**, `response.completed`, 文本 "Hi", `total_tokens=27`。
+
+耗时观察: 修好后单次调用约 120-140 秒才能拿到结果, 这是**上游本身慢**, 不是网关引入的 —— 原始客户端直连测量同样是 164 秒才收到流尾。
+
+### 协作事故 (需注意)
+
+修这块时检测到**另一个 Codex 会话 (19:05 那个) 正在并发编辑同一仓库**, 并在 20:38-20:39 执行过 `git checkout`, 把本会话**尚未提交**的 `bridge.mjs` 改动冲掉过一次 (两个文件 mtime 同时变为 20:38:52, reflog 无记录, 内容回到 HEAD)。改动已重做并在本次提交 (`b5d828b`) 落盘。教训: 本仓库只要还有别的会话在跑, 编辑后应**尽快提交**, 不要长时间停留在未提交状态。
