@@ -5,6 +5,7 @@ let pass = 0, fail = 0;
 const t = (n, fn) => { try { fn(); console.log("PASS  " + n); pass++; } catch (e) { console.log("FAIL  " + n + "\n      " + e.message); fail++; } };
 const hasNot = (s, sub, w) => { if (s.includes(sub)) throw new Error(w + ": still present " + JSON.stringify(sub)); };
 const has = (s, sub, w) => { if (!s.includes(sub)) throw new Error(w + ": missing " + JSON.stringify(sub)); };
+const eq = (a, b, w) => { if (a !== b) throw new Error(w + ": got " + JSON.stringify(a) + " want " + JSON.stringify(b)); };
 
 // Every field name from the independent scan, with the hit counts it reported.
 const SCAN = [
@@ -63,6 +64,49 @@ console.log("=== references stay readable (coding must not break) ===");
 t("process.env under a sensitive key is preserved", () => {
   const g2 = guardBody(JSON.stringify({ credentials: { apiKey: "process.env.OPENAI_API_KEY" } }));
   has(g2.body, "process.env.OPENAI_API_KEY", "reference");
+});
+
+console.log("");
+console.log("=== JSON Schema must survive (regression: TOOL_SCHEMA_INVALID) ===");
+// Measured 2026-09-24: key-name redaction walked INTO tool schemas, so
+// `properties.password.type: "string"` became `type: "<redacted>"` and justwoker
+// rejected the whole request with TOOL_SCHEMA_INVALID. A schema describes shape;
+// `password` there is a FIELD NAME, not a secret value.
+t("tool input_schema survives intact", () => {
+  const body = JSON.stringify({
+    tools: [{ name: "login", input_schema: {
+      type: "object",
+      properties: { password: { type: "string" }, apiKey: { type: "string" }, key: { type: "string" } },
+      required: ["password"],
+    } }],
+  });
+  const g = guardBody(body);
+  const schema = JSON.parse(g.body).tools[0].input_schema;
+  eq(schema.properties.password.type, "string", "password.type");
+  eq(schema.properties.apiKey.type, "string", "apiKey.type");
+  eq(schema.properties.key.type, "string", "key.type");
+  eq(schema.properties.password.description, undefined, "no stray description");
+  eq(JSON.stringify(schema.required), JSON.stringify(["password"]), "required");
+});
+t("anthropic-style input_schema also survives", () => {
+  const body = JSON.stringify({
+    tools: [{ name: "t", input_schema: { type: "object", properties: { secret: { type: "string" } } } }],
+  });
+  const g = guardBody(body);
+  eq(JSON.parse(g.body).tools[0].input_schema.properties.secret.type, "string", "secret.type");
+});
+t("a real credential inside a schema DESCRIPTION is still redacted", () => {
+  const SECRET = "sk-abcdefghijklmnopqrstuvwxyz012345";
+  const body = JSON.stringify({
+    tools: [{ name: "t", input_schema: { type: "object", properties: { c: { type: "string", description: "use " + SECRET } } } }],
+  });
+  const g = guardBody(body);
+  hasNot(g.body, SECRET, "key in description");
+  eq(JSON.parse(g.body).tools[0].input_schema.properties.c.type, "string", "shape preserved");
+});
+t("data under a sensitive key is still redacted (schema fix must not weaken it)", () => {
+  const g = guardBody(JSON.stringify({ credentials: { password: "hunter2hunter2" } }));
+  hasNot(g.body, "hunter2hunter2", "password value");
 });
 
 console.log("");

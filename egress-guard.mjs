@@ -93,6 +93,21 @@ const PUBLIC_SEGMENTS = new Set(["public", "pub"]);
 
 const CJK_SECRET = /(?:令牌|凭证|密钥|密码|私钥|凭据|口令)/;
 
+// Keys whose SUBTREE is a JSON Schema rather than data.
+//
+// This distinction is load-bearing. A schema describes SHAPE: the key
+// `properties.password` means "this tool accepts a field named password", and
+// its children are keywords (`type`, `description`, ...) rather than secret
+// values. Treating it as data redacted `type: "string"` into
+// `type: "<redacted>"` and the upstream rejected the whole request with
+// TOOL_SCHEMA_INVALID (measured 2026-09-24). Key-name redaction is therefore
+// suppressed inside a schema; value-shape rules still run, so a real credential
+// pasted into a description is still caught while `type`/`required`/`enum`
+// keywords survive intact.
+const SCHEMA_ROOT_KEYS = new Set([
+  "input_schema", "inputSchema", "parameters", "json_schema", "schema",
+]);
+
 // Split camelCase / snake_case / kebab-case / dotted names into segments so
 // `apiKey` and `API_KEY` both resolve to [api, key] while `tokenizer` stays a
 // single innocent word.
@@ -245,9 +260,11 @@ export function redactText(input, rules = RULES) {
 // their values.
 export function redactValue(value, rules = RULES) {
   const findings = [];
-  const walk = (v, underSensitive) => {
+  // `inSchema` propagates down a schema subtree and suppresses KEY-NAME
+  // redaction only; string values are still filtered by shape.
+  const walk = (v, underSensitive, inSchema) => {
     if (typeof v === "string") {
-      if (underSensitive && v.length > 0) {
+      if (underSensitive && !inSchema && v.length > 0) {
         // Only an explicit env/reference EXPRESSION survives here
         // (`process.env.X`, `readSecret(...)`) - that is the thing a coding agent
         // must still see in order to edit config code.
@@ -264,17 +281,18 @@ export function redactValue(value, rules = RULES) {
       if (r.findings.length) findings.push(...r.findings);
       return r.text;
     }
-    if (Array.isArray(v)) return v.map((x) => walk(x, underSensitive));
+    if (Array.isArray(v)) return v.map((x) => walk(x, underSensitive, inSchema));
     if (v && typeof v === "object") {
       const out = {};
       for (const [k, val] of Object.entries(v)) {
-        out[k] = walk(val, underSensitive || isSensitiveKey(k));
+        const childSchema = inSchema || SCHEMA_ROOT_KEYS.has(k);
+        out[k] = walk(val, underSensitive || isSensitiveKey(k), childSchema);
       }
       return out;
     }
     return v;
   };
-  return { value: walk(value, false), findings };
+  return { value: walk(value, false, false), findings };
 }
 
 // Guard a serialised request body. Throws on unparseable JSON so the caller can

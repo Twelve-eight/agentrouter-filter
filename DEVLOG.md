@@ -1146,3 +1146,54 @@ User 级环境变量里存着一份**旧的** JUSTWOKER_API_KEY, 一直**遮蔽*
 - 该优先级改动是**全局的**: 其它走 `.env.local` 的键 (`OPENCODE_API_KEY`) 也变成文件优先。
   目前文件与环境变量里这两个值相同, 无实际影响; 但今后轮换时**只需改文件**, 这正是不变量。
 - **需重启网关**才生效。
+
+## 2026-09-24: egress-guard 破坏了 tool schema (TOOL_SCHEMA_INVALID)
+
+启用清洗后, 带工具的请求被上游拒绝:
+
+```
+Invalid request (TOOL_SCHEMA_INVALID): ... custom.input_schema: JSON schema is invalid.
+It must match JSON Schema draft 2020-12
+```
+
+### 根因: 把 schema 当成了数据
+
+键名清洗会**向下传播**, 于是走进了 `tools[].input_schema`, 把 schema 里的
+**关键字**当成值抹掉了:
+
+```
+password.type: "string"  ->  "<redacted>"     <- schema 被破坏
+apiKey.type:   "string"  ->  "<redacted>"
+key.type:      "string"  ->  "<redacted>"
+```
+
+关键区别: schema 里的 `properties.password` 意思是"这个工具接受一个叫 password 的
+字段", 是**结构定义**; 它本身不是密钥。把它抹掉, 整个 schema 就非法了。
+
+### 修法: schema 子树只做"值形状"清洗, 不做"键名"清洗
+
+新增 `SCHEMA_ROOT_KEYS` (`input_schema` / `inputSchema` / `parameters` /
+`json_schema` / `schema`), 这些键的子树标记为 `inSchema`, **抑制键名清洗**。
+但值规则照常运行 —— 所以:
+
+- `type` / `required` / `enum` 等关键字原样保留, schema 合法;
+- schema 的 `description` 里若真贴了密钥或真实路径, **仍会被脱敏**;
+- 数据区 (messages / credentials 等) 强度不变。
+
+### 验证
+
+- 复现脚本: 修复前 `password.type` 变 `<redacted>`, 修复后三个 schema 全 `valid`。
+- 平衡性检查 (关键): schema 结构完整, 同时其 `description` 里的
+  `C:\\Users\\o_Obl\\x` 变 `C:\\Users\\<user>\\x`、`sk-tS8...` 变 `sk-<redacted>`,
+  数据区 `credentials.apiKey` / `password` 照常抹掉。
+- **真实上游 E2E**: 带 `password` / `apiKey` / `key` / `secret` 字段名的两个工具, 经隔离网关
+  打 justwoker -> **HTTP 200**, 回复 `pong`; 同次日志仍有 `windows-buildx1,host-identity:o_Oblx1`。
+- 新增 4 条回归断言 (schema 存活 / anthropic 形式 / description 里的密钥仍被抹 /
+  数据区未削弱), `test-egress-scan.mjs` 由 24 条增至 **28 条**。
+- 门禁全绿。
+
+### 教训
+
+脱敏的根本难点不是"找到密钥", 而是**区分"值"与"结构"**。一条向下传播的键名规则
+很强, 但它会把 schema / 类型定义 / 枚举这些**非数据**一并吃掉。
+凡是带元结构的协议 (JSON Schema / OpenAPI / 模板), 都需要先声明"这里是结构"。
