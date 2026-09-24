@@ -44,6 +44,7 @@ import { guardBody, selectRules, summarize } from "./egress-guard.mjs";
 import { bridgeAnthropicStream, bridgeChatStream, toAnthropicBody, toChatBody } from "./bridge.mjs";
 import { record as recordUsage } from "./usage.mjs";
 import { statsApi } from "./stats-api.mjs";
+import { stripForeignItemIds, stripAllItemIds, isItemIdRejection } from "./responses-ids.mjs";
 
 // Per-provider credentials for upstreams whose key is not already in the
 // machine/user environment (agentrouter's is Machine-scoped; justwoker's could
@@ -136,6 +137,10 @@ const ROUTES = {
     base: process.env.AR_UPSTREAM_AR ?? "https://ps.air-outer.com",
     chat: false,
     filter: true,
+    // ps.air-outer.com validates the prefix of every replayed item id against
+    // the item type (reasoning -> rs, message -> msg, function_call -> fc, ...)
+    // and answers 400 for a foreign one. See responses-ids.mjs for the probes.
+    strictItemIds: true,
   },
   // Two key groups share this host; the route cannot tell them apart, so the
   // name covers both. Usage rows still separate them by model.
@@ -245,6 +250,11 @@ function providerFor(model) {
     chat: (typeof spec.wire === "string" ? spec.wire : p.wire) === "chat",
     anthropic: (typeof spec.wire === "string" ? spec.wire : p.wire) === "anthropic",
     filter: p.filter === true,
+    // Strict-Responses upstream: a replayed item id must follow its per-type
+    // prefix contract, and an id minted by a DIFFERENT upstream has to be
+    // dropped before the body leaves. Declared per provider in providers.json so
+    // this toggle sits with the other upstream facts instead of being hardcoded.
+    strictItemIds: p.strictItemIds === true,
     proxy: p.proxy,
     // Upstream model id, when it differs from the id the client sent.
     upstreamModel: spec.m ?? model,
@@ -1190,14 +1200,79 @@ const server = http.createServer(async (req, res) => {
 
   const target = route.base + rest;
   log(`proxy ${prefix}${rest} -> ${target} (${route.name}) bytes=${raw.length}`);
+
+  // --- strict-Responses item ids (agentrouter) -------------------------------
+  // The upstream validates the prefix of every REPLAYED item id against the item
+  // type and answers 400 "Expected an ID that begins with 'rs'" for one minted
+  // elsewhere (relaycat mints `item_...`). Renaming cannot work - the id is
+  // resolved in the upstream's own store, and a rewritten one comes back as
+  // "Item with id .. not found" - so a foreign id is DROPPED. The request the
+  // gateway would otherwise send is untouched: only ids that contradict the
+  // contract this upstream states in its own error message are removed.
+  //
+  // Level 2 (stripAllItemIds) runs only in response to the upstream's own
+  // rejection, covering the residue level 1 cannot judge: an id with an
+  // acceptable prefix that this upstream has no record of.
+  let sentBody = body;
+  const canRepairIds = route.strictItemIds && isResponses && req.method === "POST" && body !== undefined;
+  if (canRepairIds) {
+    const fixed = stripForeignItemIds(body);
+    if (fixed.dropped) {
+      sentBody = fixed.body;
+      log(`strict-item-ids ${prefix}${rest}: dropped ${fixed.dropped} foreign replay id(s)`);
+    }
+  }
+
+  const sendUpstream = (payload) => requestWithRetry(
+    target,
+    // Retrying a GET is pointless and would only add latency to /models.
+    { method: req.method, headers, body: payload, proxy: route.proxy, retry: req.method === "POST" },
+    `${prefix}${rest} (${route.name})`,
+  );
+
   let upstream;
+  const t0 = Date.now();
   try {
-    upstream = await requestWithRetry(
-      target,
-      // Retrying a GET is pointless and would only add latency to /models.
-      { method: req.method, headers, body, proxy: route.proxy, retry: req.method === "POST" },
-      `${prefix}${rest} (${route.name})`,
-    );
+    upstream = await sendUpstream(sentBody);
+
+    // The upstream is the authority on its own id store: when it answers 400
+    // complaining about a replayed id, resend once with every id dropped. The
+    // error body is small, so buffering it here does not affect streaming; the
+    // success path below still pipes through untouched.
+    if (canRepairIds && upstream.statusCode === 400) {
+      const parts = [];
+      for await (const c of upstream) parts.push(c);
+      const text = Buffer.concat(parts).toString("utf8");
+      const all = isItemIdRejection(text) ? stripAllItemIds(sentBody) : { body: sentBody, dropped: 0 };
+      if (all.dropped) {
+        log(`strict-item-ids ${prefix}${rest}: upstream rejected replayed ids; retrying with all ${all.dropped} dropped`);
+        upstream = await sendUpstream(all.body);
+      } else {
+        // Not repairable (a non-id 400, or an `item_reference` whose id IS its
+        // payload). Answer with the upstream's own bytes rather than dropping
+        // them on the floor - including its content-type, so an error the client
+        // already understands keeps its shape.
+        res.writeHead(400, {
+          "Content-Type": upstream.headers["content-type"] ?? "application/json",
+          "Cache-Control": "no-cache",
+        });
+        res.end(text);
+        recordUsage({
+          route: prefix,
+          provider: route.name,
+          model: requestModel,
+          effort: null,
+          ok: false,
+          status: 400,
+          duration_ms: Date.now() - t0,
+          input_tokens: 0,
+          output_tokens: 0,
+          reasoning_tokens: 0,
+          cached_tokens: 0,
+        });
+        return;
+      }
+    }
   } catch (e) {
     res.writeHead(502, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: String(e?.message ?? e) } }));
@@ -1228,7 +1303,6 @@ const server = http.createServer(async (req, res) => {
   // `usage` object is the only source; nothing is estimated. A streamed response
   // carries usage in its final event, so the body is sniffed rather than buffered
   // wholesale (buffering would defeat streaming).
-  const t0 = Date.now();
   const ct = String(upstream.headers["content-type"] ?? "");
   if (!ct.includes("event-stream")) {
     const parts = [];

@@ -33,6 +33,20 @@ Codex 的 `model_provider.base_url` 指向 `http://127.0.0.1:7878/<route>/v1`:
 (它的词表会对不透明内容 400/500);对 relaycat/wb2api 跑这些规则只有保真度损失
 (emoji 与非批准文字被删,`relic-bag`/`net id` 这类标识符被改写),包括模型正在读写的代码.
 
+**严格 item id 修复 (2026-09-24, 仅 agentrouter)**:agentrouter 会校验**每条回放 item 的 id 前缀**
+是否与类型相符 (reasoning -> `rs`, message -> `msg`, function_call / function_call_output -> `fc`,
+web_search_call -> `ws`, custom_tool_call -> `ctc`, custom_tool_call_output -> `ctco`), 并在不符时
+400 `Expected an ID that begins with 'rs'`。relaycat 签发的 id 形如 `item_...`, 会话从 relaycat 切到
+agentrouter 时被 Codex 原样回放, 该轮即失败。
+
+改名救不了 (上游在自己库里按 id 查, 改前缀会变成 `Item with id .. not found`), 所以网关**删除**与类型契约
+冲突的 id; 只有当上游自己抱怨回放 id 时, 才再重发一次并删掉**所有** id。`item_reference` 不删 (它的 id
+就是载荷)。实现与完整实测矩阵见 `responses-ids.mjs`, 测试见 `tools/test-responses-ids.mjs` (16) 与
+`tools/test-strict-item-ids.mjs` (14)。开关是 `providers.json` 里该提供商的 `strictItemIds`, **只有
+agentrouter 置位** —— 其它上游的 id 逐字节不动。
+
+这与下面那条全局 `stripReasoning` 移除不冲突: 那是无差别剥离, 这是按类型契约的最小删除。
+
 **reasoning 剥离已整体移除**:曾有一个 `stripReasoning` 开关(丢弃回放的 `reasoning`
 item),用于规避 agentrouter 多 Azure 资源池无会话粘性导致的 400.用户已声明不再需要,
 且实测带 `encrypted_content` 回放上游返回 200,故**不留该机制,也不为没有实证问题的

@@ -19,6 +19,27 @@
       "base": "https://ps.air-outer.com",
       "wire": "responses",
       "filter": true,
+      "_strictItemIds_comment": [
+        "ps.air-outer.com validates the PREFIX of every REPLAYED item id against the",
+        "item type, and answers 400 when it does not match:",
+        "  reasoning -> rs, message -> msg, function_call / function_call_output -> fc,",
+        "  web_search_call -> ws, custom_tool_call -> ctc, custom_tool_call_output -> ctco.",
+        "",
+        "A session previously served by relaycat (which mints ids as `item_...`) replayed",
+        "those ids here verbatim and died on:",
+        "  Invalid 'input[127].id': 'item_9c5b989663879ef37cb7082c'. Expected an ID that",
+        "  begins with 'rs'. [trace_id=76537bee1fa8ea2e23c577d8b0d63b4]",
+        "",
+        "Renaming cannot fix it: the id is resolved in the upstream's own store, and a",
+        "rewritten one comes back as 'Item with id ... not found'. So the gateway DROPS an",
+        "id whose prefix contradicts the contract, and additionally retries with ALL ids",
+        "dropped only when the upstream itself rejects a replay. Class implementation and",
+        "the full probe matrix: responses-ids.mjs.",
+        "",
+        "Only this provider sets the flag. Every other upstream keeps its own ids - the",
+        "gateway must not rewrite what it has no evidence about."
+      ],
+      "strictItemIds": true,
       "keyEnv": "AGENTROUTER_API_KEY"
     },
     "relaycat": {

@@ -1348,3 +1348,67 @@ max_concurrent_threads_per_session = 1
   本次只验证了配置语法与语义被接受, 没有把上限跑满。
 - Codex 的内置默认值**仍未从二进制中确证**（6 是用户观察 + 历史日志推断）。
 - **需重启 Codex**。
+
+## 2026-09-24: agentrouter 严格 item id —— 跨上游回放导致的 400 (已修复, 已实测)
+
+### 现象
+
+用户报告 agentrouter 的 gpt 报:
+
+```
+OpenAI Responses bad request: Invalid 'input[127].id':
+'item_9c5b989663879ef37cb7082c'. Expected an ID that begins with 'rs'.
+[trace_id=76537bee1fa8ea2e23c577d8b0d63b4]
+```
+
+这不再是当初那个 `reasoning_content` / `stripReasoning` 问题。用户明确要求**只修这一个**, 且**不得**恢复会波及其它模型的全局剥离 reasoning 补丁。本次修法因此按类型 + 按提供商限定, 只在 agentrouter 上生效。
+
+### 根因 (全链路实测, 非推断)
+
+1. **坏 id 的产地是 relaycat, 不是网关**。网关从不产生 `item_` 前缀 (只生成 `resp_` / `rs_` / `msg_` / `fc_`)。实测 relaycat 对 message item 的回答就是 `{"type":"message","id":"item_66935b8aec1a06f235fcf537",...}` —— `item_` 是 relaycat 自己的 id 命名空间。
+2. **Codex 忠实回放**。会话 `01a0cbfd-...` 第 2691/2692 条 (2026-09-24T08:04:12Z) 就是 `{"type":"reasoning","id":"item_9c5b989663879ef37cb7082c","summary":[{"type":"summary_text","text":"**Checking workspace snapshot**..."}],"content":null,"encrypted_content":null}`。该会话当轮 provider 是 relaycat (网关日志 08:04:13 `proxy u/v1/responses -> https://api.relaycat.top/...`)。
+3. **agentrouter 按类型校验 id 前缀, 且解析的是它自己的库**。逐类型实测 (2026-09-24, model gpt-6-astra, 每行一次真实探测):
+
+| item type | 上游报错要求的前缀 |
+|---|---|
+| `reasoning` | `rs` |
+| `message` | `msg` |
+| `function_call` | `fc` |
+| `function_call_output` | `fc` |
+| `web_search_call` | `ws` |
+| `custom_tool_call` | `ctc` |
+| `custom_tool_call_output` | `ctco` |
+
+4. **改名无用, 只能丢**: 把 `item_...` 改写成 `rs_...` 仍然失败 —— `Item with id 'rs_9c5b989663879ef37cb7082c' not found` (上游在自己库里查这个名字)。把 id **删掉**则同一请求 200。因为回放真正需要的关联是 `call_id`, 正文 (文本 / arguments) 都在 item 体内, id 在这条路径上是纯元数据。
+5. **`encrypted_content` 必须随 id 一起走**: 它是**签发该 id 的那个上游**加密的, 外来 blob 被拒 —— `The encrypted content gAAA... could not be verified. Reason: Encrypted content could not be decrypted or parsed`。而 agentrouter **自己**的 reasoning (id `rs_*` + `encrypted_content`) 回放 200, 所以二者必须同进同退。
+
+### 修法 (外科式, 仅 agentrouter)
+
+新增 `responses-ids.mjs`, 两级:
+
+- **第 1 级 `stripForeignItemIds`**: 只删**前缀与类型契约冲突**的 id (即铁证属于别的上游的)。
+- **第 2 级 `stripAllItemIds`**: 仅在**上游自己**抱怨回放 id 时才触发重发一次 (覆盖第 1 级无法判断的残留: 前缀合法但上游库里没有的 id, 例如上游多 Azure 资源池无会话粘性时它自己签发的 id 也会 not found)。只对上游明确的三种抱怨生效 (`Expected an ID that begins with` / `Item with id .. not found` / `encrypted content .. could not be verified`), 其它 400 原样透传不重试 (避免重发一个本身格式错的请求白烧配额)。
+- `item_reference` **永不剥离**: 它的 id 就是载荷本身 ("把该 id 的条目取来"), 删掉会把一个被拒的请求变成无意义的请求。这类跨库引用确实无法在此上游服务, 原样报错。
+- 开关按提供商声明: `providers.json` 的 `agentrouter.strictItemIds = true` (带完整注释), `providerFor()` 读取; 内置 `/ar` 路由同样置位。**其它上游一律不碰** (relaycat / wb2api / justwoker / anyrouter / opencode-zen / motomoto 的 id 原样保留) —— 没有证据就不改写。
+
+### 验证
+
+- 单元 `tools/test-responses-ids.mjs` **16/16 PASS**: 逐类型前缀矩阵 / 外来 id 删除 / 自家 id 与 blob 保留 / `item_reference` 不动 / 未知类型不动 / 非 JSON 原样返回 / 无需修复时返回**原始字符串** (不重序列化) / 第 2 级覆盖无 id 的外来 blob / 拒绝识别表。
+- 端到端 `tools/test-strict-item-ids.mjs` **14/14 PASS** (桩 http 层, 驱动真实 handler, 不开端口): `/ar` 在上游看到请求**之前**就删掉外来 id (1 次上游调用, 无浪费重试) / 上游 400 后第 2 级重发 1 次且重发体无 id / 无关 400 不重试且原样透传 / relaycat 路由的 id 逐字节不动 / 混合回放的 `call_id` 关联完好 / GET 不伪造请求体。
+- **隔离实例实测** (7879 新代码; 7878 保持旧代码, 线上会话未受干扰):
+
+| 请求 | 7879 (修复) | 7878 (未修复) |
+|---|---|---|
+| 报错原文那条 `item_` reasoning 回放 | **200** | **400** `Expected an ID that begins with 'rs'` |
+| 干净请求 (回归) | **200** | - |
+
+7879 日志同时给出 `strict-item-ids u/v1/responses: dropped 1 foreign replay id(s)`。
+- 回归门禁全绿: `check-syntax` (含 collapsed-spread 扫描) / `diff-test` 0 mismatches / `test-bridge-request` 32 / `test-bridge-indices` / `test-realm-fallback` / `test-filter-failopen` 6 / `test-anthropic-registry` / `test-egress-guard` 16 / `test-egress-scan` 28 / `test-stream-terminal` 48 / `test-usage-pricing`。
+
+### 与上一轮的区别 (避免误读)
+
+README 里 "reasoning 剥离已整体移除" 仍然成立: 那条指的是无差别的全局剥离开关。本次是**按类型契约、按提供商**的最小删除, 且只在**前缀与类型冲突**时发生; 上游自家 id 与合法前缀一律保留。`stripReasoning` 没有回来。
+
+### 待用户执行
+
+线上网关 (7878) 仍跑旧代码, **需要重启**才生效 (重启由用户决定)。重启前该会话若再次回放外来 `item_` id, 仍会 400。
