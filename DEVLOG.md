@@ -819,3 +819,56 @@ tlsv1 alert internal error:openssl\ssl\record\rec_layer_s3.c:918:SSL alert numbe
 
 ### 待办
 - **线上 7878 需重启**才能加载修复 (重启前 anyrouter 一直 502)。
+
+## 2026-09-24 接入 anyrouter 的 claude 模型 (opus-5-5 / fable-5-1)
+
+问题全貌见 `G:\omp works\docs\ANYROUTER-CLAUDE-ACCESS.md`。
+
+### 背景
+anyrouter 的 claude 系列**只在 anthropic /v1/messages 面服务**。实测:
+- `/v1/responses` -> 404 `当前 API 不支持所选模型` (该面对**任何**模型都 404, 连 gpt-5-codex/gemini-2.5-pro 也是)
+- `/v1/messages` 不带 beta 头 -> 400 `1m 上下文已经全量可用,请启用 1m 上下文后重试`
+- `/v1/messages` 带 `anthropic-beta: context-1m-2025-08-07` -> 503 `Service Unavailable`
+
+那个 400 是**正向证据**: 模型存在且请求到达业务层 (不存在的模型返回 404)。
+
+### 发现的两个真问题 (都在我们这边)
+1. **入站白名单剥掉 `anthropic-beta`** (`server.mjs` 的 header 白名单不含它)。
+   后果: 即使上游恢复, 经网关也只会拿到 400。实测: 经网关传该头 -> 仍是 400。
+2. **wire 只有 provider 级, 没有模型级** (`providerFor` 取 `p.wire`)。
+   anyrouter 是 `responses`, 而 claude 需要 `anthropic` -> 必须支持模型级覆盖,
+   否则注册了也永远走错面。
+
+### 改动
+- `server.mjs`:
+  - `providerFor()`: 新增**模型级 `wire` 覆盖** (`spec.wire ?? p.wire`), `chat`/`anthropic` 随之。
+  - `providerFor()`: 新增 `headers` 字段 (模型级优先, 其次 provider 级, 缺省 null)。
+  - `anthropicHeaders(headers, extra)`: 透传 `anthropic-beta` + **注入**注册表声明的头
+    (注册表优先于客户端自带)。不传 extra 时行为与从前一致。
+  - 入站白名单补 `anthropic-beta`。
+- `providers.json`: 注册 `claude-opus-5-5` 与 `claude-fable-5-1` ->
+  anyrouter, `wire: "anthropic"`, `headers.anthropic-beta = context-1m-2025-08-07`。
+  附 `_anyrouter_claude_comment` 说明 (用**字符串**而非数组: `models` 里的数组会被
+  `typeof === "object"` 过滤放行, 在 `/u/v1/models` 与选择器里变成假模型 id —— 本次先踩后修)。
+  `gpt-6-astra-an` 保持 responses 面不变。
+- `tools/test-anthropic-registry.mjs`: 新增 16 项断言 (注册表形状 / 实际出站 wire 与头 /
+  astra-an 不回归 / **justwoker claude-opus-4-8 零回归** / 数组注释不泄漏)。
+
+### 验证
+- 单元: `test-anthropic-registry.mjs` **16/16 PASS**; 其余门禁全绿
+  (check-syntax, realm-fallback, filter-failopen 6, bridge-request 32, bridge-indices,
+  usage-pricing, stream-terminal 48)。
+- **实机 (隔离实例 7879, 未碰线上 7878)**:
+  - `/u/v1/models` -> 37 个, 含 opus-5-5 与 fable-5-1, 无 `_` 开头的假条目。
+  - 打 `claude-opus-5-5` -> **503** (修复前经网关是 **400**)。日志
+    `bridge u/v1/responses -> anyrouter model=claude-opus-5-5` 证明走了 anthropic 桥。
+  - 打 `claude-fable-5-1` -> **503** 同上。
+  - **503 是预期且正确的**: 它证明 beta 头已送达 (错误层从 400 推进到 503);
+    剩下的 503 是 anyrouter 渠道池问题。
+- 临时实例已停止; 线上 7878 (PID 27488) 未动。
+
+### 诚实边界
+- **这两个模型当前仍然调不通 (503)**。上游 anthropic 渠道池不可用, 且是**站点级**:
+  同一时刻 opus-4-7 / sonnet-4-5 / 3-5-sonnet 全部 503, haiku-4-5 是 520。
+- 配完**不代表可用**。恢复后无需再改代码, 直接就能用。
+- 已试遍的头名变体与指纹变体记录在 `docs/ANYROUTER-CLAUDE-ACCESS.md` §3, 不必重试。

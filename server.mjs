@@ -205,8 +205,17 @@ function providerFor(model) {
     base: process.env[`AR_UPSTREAM_${spec.p.toUpperCase().replace(/-/g, "_")}`]
       ?? process.env[`AR_UPSTREAM_${ROUTE_PREFIX[spec.p] ?? ""}`]
       ?? p.base,
-    chat: p.wire === "chat",
-    anthropic: p.wire === "anthropic",
+    // Wire selection. The provider's own `wire` is the default, but a model
+    // may override it (`"wire"` inside its providers.json entry). anyrouter needs
+    // this: the provider serves `gpt-6-astra` on the responses wire while its
+    // claude ids live ONLY on the anthropic /v1/messages face - probing showed
+    // /v1/responses answering 404 "当前 API 不支持所选模型" for every claude id,
+    // and /v1/messages answering 400/503 (i.e. reaching the business layer).
+    // Without the override, registering a claude id would send it down the
+    // responses passthrough and it could never work.
+    wire: typeof spec.wire === "string" ? spec.wire : p.wire,
+    chat: (typeof spec.wire === "string" ? spec.wire : p.wire) === "chat",
+    anthropic: (typeof spec.wire === "string" ? spec.wire : p.wire) === "anthropic",
     filter: p.filter === true,
     proxy: p.proxy,
     // Upstream model id, when it differs from the id the client sent.
@@ -222,6 +231,16 @@ function providerFor(model) {
     // Effort levels the upstream accepts, when it is pickier than chat/completions
     // (opencode-zen free models: low/medium/high only; max/xhigh are 400).
     efforts: Array.isArray(p.efforts) ? p.efforts : null,
+    // Extra request headers to inject on the wire, per model or per provider
+    // (providers.json `headers`). anyrouter's claude ids REQUIRE
+    // `anthropic-beta: context-1m-2025-08-07`: without it the upstream answers
+    // 400 "1m 上下文已经全量可用,请启用 1m 上下文后重试", and WITH it the error
+    // layer advances to 503 (Service Unavailable) - which is how we know the
+    // header is right and the remaining failure is the upstream channel pool.
+    // Absent => null => nothing injected => existing providers unchanged.
+    headers: (spec.headers && typeof spec.headers === "object")
+      ? spec.headers
+      : ((p.headers && typeof p.headers === "object") ? p.headers : null),
     // Cross-realm fallback target for this model (providers.json "fallback"),
     // e.g. "global:deepseek-v4.1-flash" -> "cn:deepseek-v4.1-flash".
     fallback: typeof spec.fallback === "string" ? spec.fallback : null,
@@ -240,7 +259,7 @@ function modelList() {
 // /v1/messages with x-api-key returned 200, the same call with Bearer 403'd at
 // Cloudflare). Codex sends `Authorization: Bearer ..`, so translate rather than
 // forward.
-function anthropicHeaders(headers) {
+function anthropicHeaders(headers, extra = null) {
   const out = { "Content-Type": "application/json", "anthropic-version": "2023-06-01" };
   const bearer = headers.authorization?.replace(/^Bearer\s+/i, "");
   const key = headers["x-api-key"] ?? bearer;
@@ -249,8 +268,16 @@ function anthropicHeaders(headers) {
   // Cloudflare, and an explicit `accept: */*` intermittently drew a 403
   // "Attention Required!" page (measured: same body, same key, 1/3 requests
   // failed with it, 0/3 without). Nothing here needs content negotiation.
-  for (const h of ["originator", "version", "session_id", "user-agent"]) {
+  for (const h of ["originator", "version", "session_id", "user-agent", "anthropic-beta"]) {
     if (headers[h] !== undefined) out[h] = headers[h];
+  }
+  // Registry-declared headers win over the forwarded ones: a provider that
+  // states it needs `anthropic-beta` must get exactly that, not whatever the
+  // client happened to send. Absent => nothing changes for existing providers.
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) {
+      if (typeof v === "string" && v) out[k.toLowerCase()] = v;
+    }
   }
   return out;
 }
@@ -758,7 +785,11 @@ const server = http.createServer(async (req, res) => {
   // keys off `originator` (probe-verified: originator: codex_exec -> 200,
   // originator: omp -> 401). These are Codex's OWN headers, not spoofed ones.
   const headers = { "Content-Type": "application/json" };
-  for (const h of ["authorization", "x-api-key", "originator", "version", "session_id", "user-agent", "accept"]) {
+  // `anthropic-beta` is forwarded because some anthropic-wire upstreams gate a
+  // capability behind it (anyrouter: context-1m-2025-08-07, without which it
+  // answers 400). It was previously dropped here, so a client could send it and
+  // the gateway would silently strip it.
+  for (const h of ["authorization", "x-api-key", "originator", "version", "session_id", "user-agent", "accept", "anthropic-beta"]) {
     if (req.headers[h] !== undefined) headers[h] = req.headers[h];
   }
   if (headers["user-agent"] === undefined) headers["user-agent"] = "codex_exec/0.154.0";
@@ -1032,7 +1063,7 @@ const server = http.createServer(async (req, res) => {
     try {
       upstream = await requestWithRetry(route.base + "/v1/messages", {
         method: "POST",
-        headers: anthropicHeaders(headers),
+        headers: anthropicHeaders(headers, route.headers),
         body: JSON.stringify(msg),
         proxy: route.proxy,
       }, `${prefix}${rest} -> ${route.name} model=${parsed.model}`);
