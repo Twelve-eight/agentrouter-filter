@@ -1010,3 +1010,89 @@ max_concurrent_threads_per_session = 1
 - 2 并发上限是**用户转述的站点限制**, 本站未提供可查询的配额接口, 未独立验证。
 - **需重启网关与 Codex 才生效** (providers.json / .env.local / config.toml / catalog
   均已更新到磁盘)。重启由用户执行。
+
+## 2026-09-24: justwoker 出网清洗 (egress-guard) + 密钥轮换
+
+用户判定 justwoker (api.justwoker.icu) 是**危险供应商**, 要求加清洗并全量审查出网数据。
+
+### 1) 审计: 发往它的是什么 (实测, 非推断)
+
+用假上游捕获真实请求, 逐字段核对。**七类敏感信息全部原样外发**:
+
+- API key (明文, 因为 Codex 会读文件, tool_result 里就是 .env 的内容)
+- 用户名 o_Obl
+- 绝对路径 G:/omp works/...
+- Windows 版本号 10.0.19045
+- 时区 Asia/Shanghai
+- shell 名 powershell
+- 局域网 IP
+
+### 2) 第三方扫描结果 (用户提供, 直接驱动了规则设计)
+
+另一份对该站的独立数据包扫描给出**按字段名的命中计数**:
+credentials 37657, API Key 22734, credential 8216, 令牌 6071, OpenAI Key 3917,
+凭证 3191, 密钥 2546, JWT 2187, 密码 1458, dsn 1201, URL凭据 636, 私钥 469,
+AccessKey 378, SecretKey 204, encryptionkey 184, GitHub Token 18。
+
+这份清单决定了设计: **只按值形状匹配永远追不上**, 因为值格式可以有无穷变体,
+而叫 credentials 的字段无论值长什么样都是凭据。所以除了值规则, 还实现了
+**按键名清洗** (isSensitiveKey), 且对敏感键**向下传播**到整棵子树。
+
+### 3) 实现 (egress-guard.mjs, 21 条规则)
+
+值规则: 私钥块 / JWT / Bearer / sk- / GitHub / AWS / Google / Slack / npm /
+URL 内嵌凭据 / KEY=value / 中文 密钥:值。
+主机规则: Windows 用户路径 / POSIX home / UNC 主机 / Windows 版本号 / 私网 IP / MAC /
+**运行时从环境变量取的真实用户名与机器名**。
+
+键名规则: SECRET_SEGMENTS + 驼峰/下划线切分, 覆盖上面扫描清单的全部字段。
+
+### 4) 三个必须记的设计取舍
+
+**a. 不误伤代码**。coding agent 天天读源码, apiKey: process.env.X 是**常态**,
+把它抹掉模型就没法改配置代码了。所以: 敏感键下只保留**显式引用表达式**
+(process.env.X / readSecret(...)), 其余一律替换。
+
+**b. 区分真密钥与占位符**。sk-workbuddy 是本地占位符, 抹掉会让用户写不进配置。
+判据: 真凭据**必含数字**, 手写占位符通常不含。
+
+**c. fail-closed**。与 agentrouter 的 filter 相反 —— 那个是内容整形, 失败放行;
+这个是为防数据外泄, 失败**拒绝转发**并返回 500。两者语义不同, 不能统一。
+
+### 5) 排查中发现的真实缺陷 (全部已修, 有测试钉住)
+
+1. **最严重**: 敏感键下的值仍走 looksLikeReference() 宽松启发式, 而
+   hunter2hunter2 符合裸标识符, 导致 password 的值**完全没被清洗**。已改为严格表达式判定。
+2. keyCount / apiKeyName 因含 key 段被误判为敏感 (描述符后缀规则已修)。
+3. $1 反向引用在**字符串**替换里不展开 (只有字面正则才行), 路径前缀被吞。
+4. postgres://u:p@host 的密码组要求 3+ 字符, 单字符密码漏过。
+5. JSON 里 "密码": 值 因引号位置漏匹配。
+
+### 6) 密钥轮换 + 一个隐蔽的优先级陷阱
+
+旧 sk-pLl... 上游返回 Invalid token (流式/非流式都试过)。换用用户提供的新密钥。
+
+**陷阱**: loadLocalEnv 只在键**未定义**时填充, 所以**真实环境变量优先于 .env.local**。
+User 级环境变量里存着一份**旧的** JUSTWOKER_API_KEY, 一直**遮蔽**着文件里的新值,
+而症状只是一个上游 401 Invalid token —— 看起来像密钥坏, 实际是被遮蔽。
+已同步更新 User 级变量, 并在 .env.local 顶部写明这个陷阱与自查命令。
+
+### 验证
+
+- 单测: tools/test-egress-guard.mjs **16/16**, tools/test-egress-scan.mjs **24/24**
+  (后者逐条覆盖上面那份扫描清单的每个字段名)。
+- 假上游取证: 7 项敏感信息全部 clean, 且 model/tools/消息结构完整保留。
+- **真实上游 E2E** (隔离实例 7879): HTTP **200** 返回 pong, 同时日志可见
+  windows-buildx1,host-identity:o_Oblx1,api-key-skx1,secret-assignmentx2,env-secret-linex1。
+- 门禁全绿 (check-syntax / anthropic-registry / realm-fallback / filter-failopen 6 /
+  bridge-request 32 / bridge-indices / usage-pricing / stream-terminal 48)。
+- egress-guard.mjs 已纳入 tools/check-syntax.mjs 的 PLAIN 列表。
+
+### 诚实边界
+
+- **规则是黑名单, 不可能穷尽**。它按扫描清单和常见凭据格式覆盖, 但一种从未见过的
+  凭据格式仍可能漏过。真正的边界是**不要把这个 provider 用于敏感代码库**。
+- 只对 **justwoker** 启用 (providers.json 的 egressGuard: true)。其它 provider 未开,
+  因为会改变发出去的内容, 需要用户逐个决定。
+- 未验证被清洗后的对话质量是否下降 (本次只验了 pong 这种最小往返)。
+- **需重启网关才生效** (providers.json / server.mjs / .env.local 均已落盘)。

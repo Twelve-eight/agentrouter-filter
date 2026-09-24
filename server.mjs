@@ -40,6 +40,7 @@ import https from "node:https";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { filterBody } from "./filter.mjs";
+import { guardBody, selectRules, summarize } from "./egress-guard.mjs";
 import { bridgeAnthropicStream, bridgeChatStream, toAnthropicBody, toChatBody } from "./bridge.mjs";
 import { record as recordUsage } from "./usage.mjs";
 import { statsApi } from "./stats-api.mjs";
@@ -237,6 +238,14 @@ function providerFor(model) {
     // Precedence: model > provider > null (no clamp).
     efforts: Array.isArray(spec.efforts) ? spec.efforts
       : (Array.isArray(p.efforts) ? p.efforts : null),
+    // Egress redaction. providers.json `egressGuard` selects which rules run
+    // before the body leaves the machine; a model entry may narrow it further
+    // (same model > provider precedence as `efforts`).
+    //   true / "all" -> every rule
+    //   ["api-key", "host-identity"] -> only those (prefixes allowed)
+    //   absent -> no redaction (the default: only for providers we trust)
+    egressGuard: spec.egressGuard !== undefined ? spec.egressGuard
+      : (p.egressGuard !== undefined ? p.egressGuard : null),
     // Extra request headers to inject on the wire, per model or per provider
     // (providers.json `headers`). anyrouter's claude ids REQUIRE
     // `anthropic-beta: context-1m-2025-08-07`: without it the upstream answers
@@ -971,7 +980,21 @@ const server = http.createServer(async (req, res) => {
     // response, so a retry must never reuse the failed attempt's map.
     const sendChat = async (modelId) => {
       const toolMap = { byWire: new Map(), byPair: new Map() };
-      const chat = toChatBody(parsed, modelId, route.efforts ?? null, toolMap);
+      // Same fail-closed guard as the anthropic path (see the note there).
+      let guardedBody = parsed;
+      if (route.egressGuard) {
+        try {
+          const guarded = guardBody(JSON.stringify(parsed), selectRules(route.egressGuard));
+          guardedBody = JSON.parse(guarded.body);
+          if (guarded.findings.length) {
+            log(`egress-guard ${prefix}${rest} -> ${route.name}: ${summarize(guarded.findings)}`);
+          }
+        } catch (e) {
+          log(`!! egress-guard FAILED on ${prefix}${rest} -> ${route.name}; refusing to forward: ${e?.message ?? e}`);
+          return { error: new Error(`egress guard failed; blocked rather than forwarded unredacted`) };
+        }
+      }
+      const chat = toChatBody(guardedBody, modelId, route.efforts ?? null, toolMap);
       log(`bridge ${prefix}${rest} -> ${route.name} model=${modelId} msgs=${chat.messages.length} tools=${chat.tools?.length ?? 0}`);
       try {
         const upstream = await requestWithRetry(route.base + "/v1/chat/completions", {
@@ -1063,6 +1086,32 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const toolMap = { byWire: new Map(), byPair: new Map() };
+    // Redact BEFORE the wire conversion: toAnthropicBody is what produces the
+    // bytes that actually leave, so guarding after it would be too late.
+    //
+    // FAIL CLOSED, unlike the agentrouter filter above. That filter is a
+    // content-shaping convenience and failing open keeps traffic moving; this
+    // one exists because the upstream is not trusted with host data, so a
+    // guard that cannot run must NOT forward the original bytes.
+    if (route.egressGuard) {
+      try {
+        const guarded = guardBody(JSON.stringify(parsed), selectRules(route.egressGuard));
+        parsed = JSON.parse(guarded.body);
+        if (guarded.findings.length) {
+          log(`egress-guard ${prefix}${rest} -> ${route.name}: ${summarize(guarded.findings)}`);
+        }
+      } catch (e) {
+        log(`!! egress-guard FAILED on ${prefix}${rest} -> ${route.name}; refusing to forward: ${e?.message ?? e}`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: {
+            message: `egress guard failed for ${route.name}; request blocked rather than forwarded unredacted`,
+            type: "egress_guard_error",
+          },
+        }));
+        return;
+      }
+    }
     const msg = toAnthropicBody(parsed, parsed.model, toolMap);
     log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${msg.messages.length} tools=${msg.tools?.length ?? 0}`);
     let upstream;
