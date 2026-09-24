@@ -678,6 +678,10 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
   let ended = false;
   let terminal = false;
   let completionSeen = false;
+  // `[DONE]` specifically - the explicit end-of-stream marker, as opposed to a
+  // per-choice `finish_reason` (after which an upstream may still send usage).
+  // Only this marker makes a rude disconnect forgivable (see endIfComplete).
+  let doneSeen = false;
   const fail = (message) => {
     if (terminal) return;
     terminal = true;
@@ -688,7 +692,7 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
     const t = raw.trim();
     if (!t.startsWith("data:")) return;
     const payload = t.slice(5).trim();
-    if (payload === "[DONE]") { completionSeen = true; return; }
+    if (payload === "[DONE]") { completionSeen = true; doneSeen = true; return; }
     let j;
     try { j = JSON.parse(payload); }
     catch { fail("invalid upstream stream data"); return; }
@@ -735,18 +739,41 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
     for (const raw of lines) line(raw);
   });
   upstream.on("end", () => {
-    ended = true;
+    if (ended || terminal) return;
+    endIfComplete("upstream stream ended without completion", false);
+  });
+  // A RUDE close (abort / close without end) is forgiven ONLY when `[DONE]` was
+  // seen.
+  //
+  // Why: motomoto (New-API) sends the entire SSE body - including `data: [DONE]`
+  // and a real completion with usage - and then drops the socket instead of
+  // ending it. Measured 2026-09-24 with a raw client: outcome=aborted after 164s,
+  // all 5 SSE lines present, `[DONE]` present, content "Hi". Treating that as a
+  // failure threw away a complete answer and reported "upstream stream aborted".
+  //
+  // Why NOT a plain `completionSeen` (which a finish_reason also sets): a
+  // finish_reason only says the model stopped that choice; the upstream may still
+  // be about to send usage. A socket cut there is genuinely incomplete, and the
+  // `finish-then-close` gate pins that as a failure. `[DONE]` is the only marker
+  // that promises the stream itself is over.
+  //
+  // A clean `end` is the upstream's own promise that the stream is over, so
+  // there any completion signal (finish_reason included) suffices.
+  const endIfComplete = (why, rude) => {
     if (terminal) return;
+    ended = true;
+    // Flush first (a final `data: [DONE]` may still lack its newline), THEN
+    // judge. Swapping these two made the "final line without newline" case fail.
     buf += decoder.end();
     if (buf.trim()) line(buf);
     if (terminal) return;
-    if (!completionSeen) { fail("upstream stream ended without completion"); return; }
+    if (!completionSeen || (rude && !doneSeen)) { fail(why); return; }
     terminal = true;
     em.finish();
-  });
-  upstream.on("error", () => fail("upstream stream error"));
-  upstream.on("aborted", () => fail("upstream stream aborted"));
-  upstream.on("close", () => { if (!ended) fail("upstream stream closed before end"); });
+  };
+  upstream.on("error", () => endIfComplete("upstream stream error", true));
+  upstream.on("aborted", () => endIfComplete("upstream stream aborted", true));
+  upstream.on("close", () => { if (!ended) endIfComplete("upstream stream closed before end", true); });
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +845,15 @@ function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = nu
         case "error": {
           const msg = j.error?.message ?? "anthropic stream error";
           process.stdout.write(`[anthropic-bridge] upstream error event: ${msg}\n`);
+          // An upstream protocol `error` event IS a terminal state. Before this
+          // the case only logged it, and the unconditional `end` handler below
+          // still ran em.finish(): the failed generation surfaced to the client
+          // as response.completed and was booked as a SUCCESS usage row. The
+          // success callback is invoked by finish() only, so failing here is
+          // also what keeps the ledger clean. fail() and finish() share the
+          // emitter one-shot `terminal` flag, so a later message_stop or `end`
+          // cannot resurrect the turn.
+          em.fail(msg);
           break;
         }
         default:

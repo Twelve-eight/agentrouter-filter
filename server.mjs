@@ -107,6 +107,19 @@ loadLocalEnv();
 const PORT = Number(process.env.AR_GATEWAY_PORT ?? 7878);
 const HOST = "127.0.0.1";
 
+// Idle deadline for an upstream BUSINESS response body. This is DISTINCT from the
+// probe deadline in fetchLocalJSON (db2c5dd added that one, and only for the
+// /status and /healthz probes). An upstream that flushes its response headers and
+// then goes silent - a half-open TCP connection, or a body truncated mid-flight -
+// would otherwise hang this path forever: it had no setTimeout on the business
+// body, only res.on("close") (which fires on CLIENT disconnect, not on upstream
+// silence). This is an IDLE timeout, not a total-duration cap: every received
+// chunk resets it, so a long but healthy stream is never cut - only a genuinely
+// dead socket is. 0 disables it. The 120s default sits well above any single
+// inter-chunk gap a real generation produces while still bounding a stall.
+const BODY_IDLE_TIMEOUT_MS = Number(process.env.AR_UPSTREAM_BODY_IDLE_MS ?? 120_000);
+
+
 // The opencode-zen free tier only serves requests that carry the OpenCode
 // client's first five built-in tool definitions (see oc-zen-proxy.mjs). The proxy
 // prepends them, so they must be stripped from anything the caller sees - a tool
@@ -339,6 +352,25 @@ function log(...a) {
 
 function request(url, { method, headers, body, proxy }) {
   const u = new URL(url);
+  // Frame the body explicitly instead of letting Node pick.
+  //
+  // A request that HAS a body and NO Content-Length is sent as
+  // `Transfer-Encoding: chunked`. Some upstreams cannot decode that and answer
+  // a body-level error even though the bytes are valid JSON. Measured
+  // 2026-09-24 against motomoto.lol (a New-API relay), SAME key and SAME body:
+  //
+  //   chunked         -> HTTP 400 `Invalid request: invalid JSON request body`
+  //                      (new_api_error, request id 20260924122122...)
+  //   Content-Length  -> HTTP 200 with a real completion
+  //
+  // The wire bytes of the body are identical either way; only the framing
+  // changes. Every caller here passes a complete string (a JSON body, up to
+  // ~500 KB), so the length is always known.
+  const framed = body !== undefined && body !== null
+    && headers["Content-Length"] === undefined && headers["content-length"] === undefined
+    && headers["Transfer-Encoding"] === undefined && headers["transfer-encoding"] === undefined
+    ? { ...headers, "Content-Length": Buffer.byteLength(body) }
+    : headers;
   if (!proxy) {
     return new Promise((resolve, reject) => {
       const mod = u.protocol === "https:" ? https : http;
@@ -349,7 +381,7 @@ function request(url, { method, headers, body, proxy }) {
           port: u.port || (u.protocol === "https:" ? 443 : 80),
           path: u.pathname + u.search,
           method,
-          headers,
+          headers: framed,
         },
         (res) => resolve(res),
       );
@@ -381,7 +413,7 @@ function request(url, { method, headers, body, proxy }) {
           servername: u.hostname,
           path: u.pathname + u.search,
           method,
-          headers: { ...headers, Host: u.hostname },
+          headers: { ...framed, Host: u.hostname },
         },
         (res) => resolve(res),
       );
@@ -433,6 +465,44 @@ async function requestWithRetry(url, opts, label) {
     log(`!! ${label} answered 429; retrying (${attempt + 1}/${RETRY_MAX}) in ${wait}ms`);
     await new Promise((r) => setTimeout(r, wait));
   }
+}
+
+
+// Idle-timeout guard for an upstream BUSINESS response body (S4). The passthrough
+// and bridge paths register only end/close/error handlers, so an upstream that
+// stops sending after its headers - without ending or erroring - is never noticed
+// and the client waits for its own timeout. This arms a timer that fires only if
+// no chunk arrives for BODY_IDLE_TIMEOUT_MS; every chunk (and a normal end/close/
+// error) rearms or clears it, so a slow-but-live stream is untouched. On idle it
+// runs onIdle() once and destroys the upstream, which lets each caller finish with
+// an explicit terminal state instead of hanging. Returns a disarm() the caller
+// must invoke on its own terminal path. Disabled when the configured value is <= 0.
+function armBodyIdleTimeout(upstream, onIdle) {
+  if (!(BODY_IDLE_TIMEOUT_MS > 0)) return () => {};
+  let fired = false;
+  let timer = null;
+  const disarm = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+  };
+  const trip = () => {
+    if (fired) return;
+    fired = true;
+    disarm();
+    try { onIdle(); } catch {}
+    try { if (!upstream.destroyed) upstream.destroy(); } catch {}
+  };
+  const rearm = () => {
+    if (fired) return;
+    disarm();
+    timer = setTimeout(trip, BODY_IDLE_TIMEOUT_MS);
+    if (typeof timer.unref === "function") timer.unref();
+  };
+  upstream.on("data", rearm);
+  upstream.on("end", disarm);
+  upstream.on("close", disarm);
+  upstream.on("error", disarm);
+  rearm();
+  return disarm;
 }
 
 
@@ -1046,14 +1116,42 @@ const server = http.createServer(async (req, res) => {
       }
     };
 
-    const fail502 = (e) => {
+    // Request clock, started before the FIRST upstream attempt: every terminal
+    // branch below (2xx stream, upstream 4xx/5xx, local 502) records a duration.
+    // One row per client request: the arm-and-retry attempt inside the fallback
+    // window decides the outcome and is what gets booked, the discarded attempt
+    // is not booked a second time. Declared BEFORE fail502 so the 502 closure
+    // only ever reads an initialised binding.
+    const t0 = Date.now();
+
+    // A local/transport failure (requestWithRetry threw) is still a request the
+    // gateway made, so it is booked with ok:false + status 502 exactly like the
+    // passthrough path books its failures. Before this the bridge path recorded
+    // NOTHING here while the passthrough path recorded ok:false - two standards
+    // for the same business event (audit S3). `modelId` is the id actually sent
+    // upstream on the attempt that failed (after a cross-realm fallback that is
+    // the cn id).
+    const fail502 = (e, modelId) => {
+      recordUsage({
+        route: prefix,
+        provider: route.name,
+        model: modelId ?? parsed.model,
+        effort: parsed.reasoning?.effort ?? null,
+        ok: false,
+        status: 502,
+        duration_ms: Date.now() - t0,
+        input_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: 0,
+        cached_tokens: 0,
+      });
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: { message: String(e?.message ?? e) } }));
     };
 
     let attempt = await sendChat(parsed.model);
     if (attempt.error) {
-      fail502(attempt.error);
+      fail502(attempt.error, parsed.model);
       return;
     }
     let upstream = attempt.upstream;
@@ -1075,7 +1173,7 @@ const server = http.createServer(async (req, res) => {
       realmUsed = "cn";
       attempt = await sendChat(fb.upstreamModel);
       if (attempt.error) {
-        fail502(attempt.error);
+        fail502(attempt.error, parsed.model);
         return;
       }
       upstream = attempt.upstream;
@@ -1087,6 +1185,30 @@ const server = http.createServer(async (req, res) => {
       for await (const c of upstream) errChunks.push(c);
       const text = Buffer.concat(errChunks).toString("utf8");
       log(`bridge upstream ${upstream.statusCode}: ${text.slice(0, 200)}`);
+      // Same accounting standard as the passthrough path (audit S3): a bridged
+      // upstream 4xx/5xx is a booked FAILURE row, not a missing one. Before
+      // this /stats could not see a single failed wb2api request that came
+      // through /wb, while the same failure on /ar was recorded - two
+      // standards for one event. Chat-wire usage names are prompt_/completion_;
+      // the responses-style names are accepted as a fallback only because an
+      // error body is the sole usage source here and no counters are invented.
+      let errUsage = null;
+      try {
+        errUsage = JSON.parse(text)?.usage ?? null;
+      } catch {}
+      recordUsage({
+        route: prefix,
+        provider: route.name,
+        model: parsed.model,
+        effort: parsed.reasoning?.effort ?? null,
+        ok: false,
+        status: upstream.statusCode,
+        duration_ms: Date.now() - t0,
+        input_tokens: errUsage?.prompt_tokens ?? errUsage?.input_tokens ?? 0,
+        output_tokens: errUsage?.completion_tokens ?? errUsage?.output_tokens ?? 0,
+        reasoning_tokens: errUsage?.completion_tokens_details?.reasoning_tokens ?? 0,
+        cached_tokens: errUsage?.prompt_tokens_details?.cached_tokens ?? 0,
+      });
       setRealmHeaders(res, realmUsed, realmRetryAt, realmSource);
       res.writeHead(upstream.statusCode, { "Content-Type": "application/json" });
       res.end(text);
@@ -1095,7 +1217,12 @@ const server = http.createServer(async (req, res) => {
     // setHeader before the bridge writes its own head: writeHead merges
     // previously-set headers, so bridge.mjs needs no change.
     setRealmHeaders(res, realmUsed, realmRetryAt, realmSource);
-    const t0 = Date.now();
+    // S4: an upstream that stalls after its headers would hang the bridge, whose
+    // only terminals are end/close/error. Arm an idle guard on the raw upstream; on
+    // idle it destroys the socket, which trips bridgeChatStream's close/error path
+    // and emits response.failed - no phantom success row (the success onUsage below
+    // runs only on finish()). It self-disarms on the upstream's own end/close/error.
+    armBodyIdleTimeout(upstream, () => log(`!! upstream stream idle > ${BODY_IDLE_TIMEOUT_MS}ms (chat bridge, ${route.name}); aborting`));
     bridgeChatStream(upstream, res, parsed.model, parsed.reasoning?.effort, parsed.stream !== false, (u) => {
       recordUsage({
         route: prefix,
@@ -1151,6 +1278,10 @@ const server = http.createServer(async (req, res) => {
     }
     const msg = toAnthropicBody(parsed, parsed.model, toolMap);
     log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${msg.messages.length} tools=${msg.tools?.length ?? 0}`);
+    // Request clock for EVERY terminal branch below (2xx bridge, upstream
+    // 4xx/5xx, local 502). It used to be created only on the success path, so
+    // the failure branches had no duration to report (audit S3).
+    const t0 = Date.now();
     let upstream;
     try {
       upstream = await requestWithRetry(route.base + "/v1/messages", {
@@ -1160,6 +1291,22 @@ const server = http.createServer(async (req, res) => {
         proxy: route.proxy,
       }, `${prefix}${rest} -> ${route.name} model=${parsed.model}`);
     } catch (e) {
+      // A throw from requestWithRetry (DNS/TLS/proxy/connection refused) is a
+      // failed request, not a silent one: book it 502 exactly as the chat bridge
+      // and the passthrough path do (audit S3).
+      recordUsage({
+        route: prefix,
+        provider: route.name,
+        model: parsed.model,
+        effort: parsed.reasoning?.effort ?? null,
+        ok: false,
+        status: 502,
+        duration_ms: Date.now() - t0,
+        input_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: 0,
+        cached_tokens: 0,
+      });
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: { message: String(e?.message ?? e) } }));
       return;
@@ -1169,11 +1316,28 @@ const server = http.createServer(async (req, res) => {
       for await (const c of upstream) errChunks.push(c);
       const text = Buffer.concat(errChunks).toString("utf8");
       log(`bridge upstream ${upstream.statusCode}: ${text.slice(0, 200)}`);
+      // Same accounting standard as the passthrough path (audit S3): a bridged
+      // upstream 4xx/5xx is a booked FAILURE row, not a missing one. Before
+      // this /stats showed zero failed justwoker/anyrouter requests - the
+      // ledger carried successes only. Anthropic error bodies carry no usage;
+      // counters stay 0 rather than being estimated.
+      recordUsage({
+        route: prefix,
+        provider: route.name,
+        model: parsed.model,
+        effort: parsed.reasoning?.effort ?? null,
+        ok: false,
+        status: upstream.statusCode,
+        duration_ms: Date.now() - t0,
+        input_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: 0,
+        cached_tokens: 0,
+      });
       res.writeHead(upstream.statusCode, { "Content-Type": "application/json" });
       res.end(text);
       return;
     }
-    const t0 = Date.now();
     // The toolMap MUST be forwarded (7th argument, after toolGuard). Without it the
     // return direction cannot rebuild a namespaced call: the wire name
     // `multi_agent_v1__spawn_agent` came back as {name: that, namespace: null}, and
@@ -1181,6 +1345,9 @@ const server = http.createServer(async (req, res) => {
     // symptom as the 2026-09-22 report, but on the reply path instead of the request
     // path. Measured 2026-09-24 against the real justwoker upstream: opus-4-8 DID
     // call the tool, and the un-restored name is what made it useless.
+    // S4: same idle guard as the chat bridge - a silent upstream trips the bridge
+    // close/error path (response.failed) instead of hanging; self-disarms on end.
+    armBodyIdleTimeout(upstream, () => log(`!! upstream stream idle > ${BODY_IDLE_TIMEOUT_MS}ms (anthropic bridge, ${route.name}); aborting`));
     bridgeAnthropicStream(upstream, res, parsed.model, parsed.stream !== false, (u) => {
       recordUsage({
         route: prefix,
@@ -1305,9 +1472,42 @@ const server = http.createServer(async (req, res) => {
   // wholesale (buffering would defeat streaming).
   const ct = String(upstream.headers["content-type"] ?? "");
   if (!ct.includes("event-stream")) {
+    // Non-streamed passthrough body. S4: guard against an upstream that sends its
+    // headers (and maybe a partial body) then goes silent without ending. On idle
+    // we end the client response with a clear 504-shaped terminal state (or just
+    // close it if bytes were already flushed) and book a failed, zero-token row -
+    // never a phantom success.
     const parts = [];
+    let settled = false;
+    const disarmIdle = armBodyIdleTimeout(upstream, () => {
+      if (settled) return;
+      settled = true;
+      log(`!! upstream body idle > ${BODY_IDLE_TIMEOUT_MS}ms after ${upstream.statusCode} (${route.name}); aborting`);
+      try {
+        if (!res.headersSent) res.writeHead(504, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "upstream body idle timeout", type: "gateway_timeout" } }));
+      } catch {
+        try { res.destroy(); } catch {}
+      }
+      recordUsage({
+        route: prefix,
+        provider: route.name,
+        model: requestModel,
+        effort: null,
+        ok: false,
+        status: 504,
+        duration_ms: Date.now() - t0,
+        input_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: 0,
+        cached_tokens: 0,
+      });
+    });
     upstream.on("data", (c) => parts.push(c));
     upstream.on("end", () => {
+      disarmIdle();
+      if (settled) return;
+      settled = true;
       const text = Buffer.concat(parts).toString("utf8");
       res.end(text);
       let u = null;
@@ -1331,37 +1531,65 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Streamed passthrough: watch for the final usage-bearing event without
-  // altering the bytes the client receives.
-  let tail = "";
+  // Streamed passthrough: watch for the usage-bearing event without altering the
+  // bytes the client receives.
+  //
+  // S5: parse SSE events INCREMENTALLY as they arrive and keep the last usage seen,
+  // rather than sniffing only the trailing 64KB at end. The old tail window silently
+  // dropped a usage event that arrived earlier than the final 64KB (e.g. usage sent
+  // mid-stream followed by a large body), booking ok:true with 0 tokens. `lineBuf`
+  // only holds a partial trailing line between chunks, so memory stays bounded even
+  // for a very long response.
+  //
+  // S4: the same idle guard as above. On idle we stop piping and book a failed,
+  // zero-token row. Headers are already sent for a stream, so the client simply sees
+  // the connection close rather than a 504 body - the point is that it stops waiting.
+  let lineBuf = "";
   let captured = null;
-  upstream.on("data", (c) => {
-    tail += c.toString("utf8");
-    if (tail.length > 65536) tail = tail.slice(-65536);
-  });
-  upstream.on("end", () => {
-    for (const line of tail.split("\n")) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      try {
-        const j = JSON.parse(t.slice(5).trim());
-        if (j?.response?.usage) captured = j.response.usage;
-        else if (j?.usage) captured = j.usage;
-      } catch {}
-    }
+  const scanLine = (raw) => {
+    const t = raw.trim();
+    if (!t.startsWith("data:")) return;
+    const payload = t.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    try {
+      const j = JSON.parse(payload);
+      if (j?.response?.usage) captured = j.response.usage;
+      else if (j?.usage) captured = j.usage;
+    } catch {}
+  };
+  let streamSettled = false;
+  const bookStream = (ok, status) => {
+    if (streamSettled) return;
+    streamSettled = true;
     recordUsage({
       route: prefix,
       provider: route.name,
       model: requestModel,
       effort: null,
-      ok: upstream.statusCode < 400,
-      status: upstream.statusCode,
+      ok,
+      status,
       duration_ms: Date.now() - t0,
       input_tokens: captured?.input_tokens ?? 0,
       output_tokens: captured?.output_tokens ?? 0,
       reasoning_tokens: captured?.output_tokens_details?.reasoning_tokens ?? 0,
       cached_tokens: captured?.input_tokens_details?.cached_tokens ?? 0,
     });
+  };
+  const disarmStreamIdle = armBodyIdleTimeout(upstream, () => {
+    log(`!! upstream stream idle > ${BODY_IDLE_TIMEOUT_MS}ms after ${upstream.statusCode} (${route.name}); aborting`);
+    try { res.destroy(); } catch {}
+    bookStream(false, 504);
+  });
+  upstream.on("data", (c) => {
+    lineBuf += c.toString("utf8");
+    const lines = lineBuf.split("\n");
+    lineBuf = lines.pop() ?? "";
+    for (const line of lines) scanLine(line);
+  });
+  upstream.on("end", () => {
+    disarmStreamIdle();
+    if (lineBuf) scanLine(lineBuf);
+    bookStream(upstream.statusCode < 400, upstream.statusCode);
   });
   upstream.pipe(res);
   } catch (e) {

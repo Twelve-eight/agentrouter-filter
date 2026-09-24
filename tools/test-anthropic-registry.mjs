@@ -36,6 +36,8 @@ import http from "node:http";
 import https from "node:https";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 let failed = 0;
 const logs = [];
@@ -167,7 +169,23 @@ https.request = stub();
 
 https.request = stub();
 
+// Isolate usage BEFORE the real server (and its usage.mjs) is imported: usage.mjs
+// resolves AR_USAGE_DIR once at module load, so setting it after the import would
+// be too late. Without this line the fixtures below (input_tokens:3 /
+// output_tokens:1) were appended to the PRODUCTION ledger data/usage/*.jsonl on
+// every run of this file (audit S2). Same shape as the other three tests that
+// import server.mjs: an exclusive mkdtemp directory under the project .tmp, with
+// the G: guard so a relocated checkout cannot quietly write elsewhere. Test
+// artifacts are kept for post-run inspection; nothing is deleted recursively.
+const testTmp = fileURLToPath(new URL("../.tmp/", import.meta.url));
+if (process.platform === "win32" && path.parse(testTmp).root.toLowerCase() !== "g:" + path.sep) {
+  throw new Error("Usage isolation tests must run from a project on G:");
+}
+fs.mkdirSync(testTmp, { recursive: true });
+process.env.AR_USAGE_DIR = fs.mkdtempSync(path.join(testTmp, "test-anthropic-registry-usage-"));
+
 await import("../server.mjs");
+out(`测试账本目录: ${process.env.AR_USAGE_DIR}\n`);
 out("");
 
 const fakeRes = () => ({
