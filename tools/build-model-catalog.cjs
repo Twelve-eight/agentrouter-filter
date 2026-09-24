@@ -76,14 +76,24 @@ const DEFAULT_EFFORT = 'max';
 
 // The models a sub-agent may be spawned with: these are the only entries offered in
 // spawn_agent's "Available model overrides" list (see the priority note inside
-// entry()). User decision 2026-09-22: the wb2api deepseek-v4.1-flash family plus the
-// opencode zen mimo. Everything else stays spawnable through inheritance only.
+// entry()). Everything else stays spawnable through inheritance only.
+//
+// The list is CAPPED AT 5 by Codex, so adding an entry means evicting one. Usage
+// counted across data/usage/*.jsonl on 2026-09-24: global:deepseek-v4.1-flash
+// 4956, cn:deepseek-v4.1-flash 1098, mimo-v2.6-flash-free 16, and BOTH
+// global:deepseek-v4.1-flash-sg and zen:mimo-v2.6-flash 0. claude-opus-4-8 was
+// requested by the user, so the never-used sg alias gives up its slot; the zen
+// alias (also 0) was kept because zen:mimo-v2.6-flash is the documented example of
+// a prefixed alias, and evicting both would leave the list with no alias at all.
+//
+// claude-opus-4-8 qualifies only because the anthropic RETURN path now forwards
+// toolMap - see the note at the bridgeAnthropicStream call in server.mjs.
 const OVERRIDE_SLUGS = new Set([
   'global:deepseek-v4.1-flash',
-  'global:deepseek-v4.1-flash-sg',
   'cn:deepseek-v4.1-flash',
   'mimo-v2.6-flash-free',
   'zen:mimo-v2.6-flash',
+  'claude-opus-4-8',
 ]);
 function entry(slug, display, description, efforts, contextWindow) {
   return {

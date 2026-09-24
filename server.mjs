@@ -1164,6 +1164,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const t0 = Date.now();
+    // The toolMap MUST be forwarded (7th argument, after toolGuard). Without it the
+    // return direction cannot rebuild a namespaced call: the wire name
+    // `multi_agent_v1__spawn_agent` came back as {name: that, namespace: null}, and
+    // Codex does not recognise it as spawn_agent - the same "sub-agents invisible"
+    // symptom as the 2026-09-22 report, but on the reply path instead of the request
+    // path. Measured 2026-09-24 against the real justwoker upstream: opus-4-8 DID
+    // call the tool, and the un-restored name is what made it useless.
     bridgeAnthropicStream(upstream, res, parsed.model, parsed.stream !== false, (u) => {
       recordUsage({
         route: prefix,
@@ -1177,7 +1184,7 @@ const server = http.createServer(async (req, res) => {
         reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
         cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
       });
-    });
+    }, isGuardToolName, toolMap);
     return;
   }
 

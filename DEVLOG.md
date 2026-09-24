@@ -1197,3 +1197,64 @@ key.type:      "string"  ->  "<redacted>"
 脱敏的根本难点不是"找到密钥", 而是**区分"值"与"结构"**。一条向下传播的键名规则
 很强, 但它会把 schema / 类型定义 / 枚举这些**非数据**一并吃掉。
 凡是带元结构的协议 (JSON Schema / OpenAPI / 模板), 都需要先声明"这里是结构"。
+
+## 2026-09-24: 允许 claude-opus-4-8 (justwoker) 拉起子代理
+
+用户要求让 opus-4-8 via justwoker 可用于子代理。做之前先验证前提, 结果**发现一个真 bug**。
+
+### 1) 发现的 bug: anthropic 回程丢失 namespace 还原
+
+DEVLOG 09-22 记过: 走 anthropic 线路的模型"无法使用原生子代理", 当时修了**请求方向**的
+命名空间展开, 但留下一句**未验证**: "anthropic 线路只做单元/往返验证, 未做真实上游端到端"。
+
+本次拿真实 justwoker 做端到端, 复现出来: 模型**确实调用了** `spawn_agent`, 但回程是
+
+```
+name=multi_agent_v1__spawn_agent  namespace=null     <- Codex 认不出
+```
+
+应该是
+
+```
+name=spawn_agent  namespace=multi_agent_v1
+```
+
+**根因**: `bridgeAnthropicStream` 有第 7 个参数 `toolMap`, 但 `server.mjs` 调用时**没传**
+(只传了 5 个)。chat 路径传了, anthropic 路径漏了。所以出网名字展开了, 回程却还原不回来。
+
+症状与 09-22 那个报告同类 ("子工具不可见"), 但发生在**回复路径**而不是请求路径。
+
+修法: 在调用处补上 `isGuardToolName, toolMap`。
+
+### 2) 加入子代理覆盖列表
+
+`spawn_agent` 的 "Available model overrides" **上限 5 条**, 当时已满。用用量数据决定驱逐谁
+(统计 `data/usage/*.jsonl`):
+
+| slug | 用量 |
+|---|---|
+| global:deepseek-v4.1-flash | 4956 |
+| cn:deepseek-v4.1-flash | 1098 |
+| mimo-v2.6-flash-free | 16 |
+| global:deepseek-v4.1-flash-sg | **0** |
+| zen:mimo-v2.6-flash | **0** |
+
+驱逐 `global:deepseek-v4.1-flash-sg` (从未使用), 加入 `claude-opus-4-8`。
+保留 `zen:mimo-v2.6-flash` 是因为它是"带前缀别名"的样板条目, 两个都驱逐会让列表里再无别名。
+
+### 验证
+
+- **真实上游 E2E** (隔离实例 7879 打 justwoker): 修复前回程 `namespace=null`,
+  修复后 `name=spawn_agent namespace=multi_agent_v1`, 判定 **"CAN call spawn_agent"**。
+- 出网工具面取证: 命名空间被完整展开为 `multi_agent_v1__spawn_agent` 等, **schema 无损**
+  (无空 schema)。
+- catalog: 覆盖列表恰好 5 条, 含 `claude-opus-4-8` (priority=-1), 且仍在 5 条上限内。
+- 门禁全绿 (10 个测试文件)。
+
+### 诚实边界
+
+- 换掉 `-sg` 是**我的取舍**, 不是用户明确指定。依据是它用量为 0。
+  若要换成别的, 改 `tools/build-model-catalog.cjs` 的 `OVERRIDE_SLUGS` 即可。
+- 端到端验证的是**模型能否发出正确的 spawn_agent 调用**;
+  Codex 侧"真的派生出子代理线程"未在本次验证 (那需要真实 Codex 会话)。
+- **需重启 Codex** 才读到新 catalog (网关已在 16:25 重启过, 含此前修复)。
