@@ -1480,3 +1480,48 @@ last lines: ... "delta":{"content":""}, "finish_reason":"stop" ... [DONE]
 ### 协作事故 (需注意)
 
 修这块时检测到**另一个 Codex 会话 (19:05 那个) 正在并发编辑同一仓库**, 并在 20:38-20:39 执行过 `git checkout`, 把本会话**尚未提交**的 `bridge.mjs` 改动冲掉过一次 (两个文件 mtime 同时变为 20:38:52, reflog 无记录, 内容回到 HEAD)。改动已重做并在本次提交 (`b5d828b`) 落盘。教训: 本仓库只要还有别的会话在跑, 编辑后应**尽快提交**, 不要长时间停留在未提交状态。
+## 2026-09-26: anyrouter claude 模型 503 复查 (上游故障持续, 非我方缺陷)
+
+### 现象
+
+用户报告 `bridge u/v1/responses -> anyrouter model=claude-opus-5-5` 后
+`bridge upstream 503: {"error":{"message":"Service Unavailable","type":"error"},"type":"error"}`。
+
+### 复查结论: 与 2026-09-24 归档的是同一件事, 上游渠道池仍无可用通道
+
+证据 (2026-09-26 12:4x, 全部经 `http://127.0.0.1:7897` CONNECT 隧道直打上游):
+
+1. **key 有效**: `GET /v1/models` 带该 key -> **200**, 返回完整模型列表。不是认证/配额问题。
+2. **请求形态正确**: 不带 beta 头 -> **400** `1m 上下文已经全量可用, 请启用 1m 上下文后重试`;
+   带 `anthropic-beta: context-1m-2025-08-07` -> **503**。错误层推进到 503 正是"头已送达"的正向证据,
+   与 `docs/ANYROUTER-CLAUDE-ACCESS.md` §2.2 记录一致。
+3. **503 是站点级, 不是模型级**: 同一时刻横向扫描 ->
+   `claude-opus-5-5` 503 / `claude-opus-4-7` 503 / `claude-sonnet-4-5-20250929` 503 /
+   `claude-3-5-sonnet-20241022` 503 / `claude-fable-5-1` 503 / `claude-haiku-4-5-20251001` **520**;
+   而 `claude-opus-4-6` 返回 **400** `已下线, 请切换到 claude-opus-4-7` —— 业务层可达, 唯独渠道池空。
+4. **持续性, 不是偶发**: 45 分钟窗口内 22/22 次全部 503 (13 次来自 Codex 会话自身的退避重试,
+   9 次来自本次探测; 另做 3 轮 x 4 次间隔 20 秒的定点观测 -> `[503,503,503,503]` x3)。
+5. **同站其它模型也在劣化**: `gpt-6-astra-an` 当日回 **500** `当前模型 gpt-6-astra 负载已经达到上限`
+   (`get_channel_failed`)。anyrouter 整站通道紧张。
+
+### 为什么不加重试
+
+`docs/ANYROUTER-CLAUDE-ACCESS.md` §7 已明确不做, 本次复查再次印证: 失败码是 **503/520**,
+而网关 `RETRY_STATUS = 429` 只重试 429; 且 anyrouter 渠道池是共享的, 反复打会挤掉同站其它模型
+(09-21~23 实测 astra-an 196 次仅 1 次成功)。**加重试只会放大负载, 不会变出通道。**
+
+### 可用替代 (同一次探测, 实测)
+
+| 模型 | 路由 | 结果 |
+|---|---|---|
+| `claude-opus-4-8` | justwoker (anthropic 桥) | **200** (4.4s, 轮换后的新 key) |
+| `claude-opus-5-5` | anyrouter | 503 (上游) |
+| `claude-fable-5-1` | anyrouter | 503 (上游) |
+| `gpt-6-astra-an` | anyrouter | 500 (上游负载) |
+| `gpt-6-astra-ar` | agentrouter | 402 (额度耗尽) |
+
+### 待办
+
+- 无需改代码。anyrouter claude 能否用**只取决于上游**; 需要时用 `/v1/messages` 带 beta 头重探,
+  恢复判据: 503 -> 200。
+- 若确实需要 Claude 能力, 现在可用的是 **justwoker 的 `claude-opus-4-8`**。
