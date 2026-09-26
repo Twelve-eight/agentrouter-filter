@@ -184,6 +184,19 @@ if (process.platform === "win32" && path.parse(testTmp).root.toLowerCase() !== "
 fs.mkdirSync(testTmp, { recursive: true });
 process.env.AR_USAGE_DIR = fs.mkdtempSync(path.join(testTmp, "test-anthropic-registry-usage-"));
 
+// Test-runner self-sufficiency: the /u route substitutes the upstream provider
+// credential (route.key = process.env[route.keyEnv]) before the anthropic bridge
+// runs, so an anyrouter claude id only reaches the upstream with x-api-key when
+// ANYROUTER_API_KEY is set. This test may run with a stripped environment (the
+// node_repl harness exposes only a dozen vars) and .env.local does not carry this
+// key, so pin a NON-SECRET placeholder here, before server.mjs is imported. Plain
+// assignment (not ||=) keeps the test deterministic even when an inherited value
+// is empty. Same shape as tools/test-egress-guard.mjs pinning USERNAME; no
+// assertion semantics change. Note loadLocalEnv() lets .env.local win over the
+// ambient environment, so if that file ever gains ANYROUTER_API_KEY the test
+// inherits that file value instead - keep it non-empty if it is added.
+process.env.ANYROUTER_API_KEY = "test-anyrouter-key";
+
 await import("../server.mjs");
 out(`测试账本目录: ${process.env.AR_USAGE_DIR}\n`);
 out("");

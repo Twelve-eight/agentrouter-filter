@@ -324,10 +324,21 @@ function modelList() {
 // /v1/messages with x-api-key returned 200, the same call with Bearer 403'd at
 // Cloudflare). Codex sends `Authorization: Bearer ..`, so translate rather than
 // forward.
-function anthropicHeaders(headers, extra = null) {
+//
+// CREDENTIAL PRECEDENCE: client key first, then the registry's own key for this
+// provider (`providerKey` = route.key, i.e. process.env[route.keyEnv]). The
+// unified route already substitutes route.key into `authorization` before this
+// runs, but a caller that sends no credential at all used to reach /v1/messages
+// with no x-api-key and no fallback - the request then failed 401 upstream even
+// though the gateway held a valid key for that provider. Registry key injection
+// must never override an explicit client key; it only fills the empty case.
+function anthropicHeaders(headers, extra = null, providerKey = null) {
   const out = { "Content-Type": "application/json", "anthropic-version": "2023-06-01" };
   const bearer = headers.authorization?.replace(/^Bearer\s+/i, "");
-  const key = headers["x-api-key"] ?? bearer;
+  // Client credential wins; the registry key only fills the empty case. `||`
+  // (not `??`) is deliberate: an empty-string x-api-key must not shadow the
+  // provider key and leave the request unauthenticated.
+  const key = headers["x-api-key"] || bearer || providerKey || undefined;
   if (key) out["x-api-key"] = key;
   // `accept` is deliberately NOT forwarded. This upstream sits behind
   // Cloudflare, and an explicit `accept: */*` intermittently drew a 403
@@ -682,14 +693,29 @@ async function fetchLocalJSON(url, headers, timeoutMs) {
   });
 }
 
-/** Cached GET /status. null when the key is missing or the call fails. */
+/**
+ * Cached GET /status. null when the call fails.
+ *
+ * The probe RUNS even when the registry holds no credential for this provider;
+ * only the Authorization header is dropped in that case.
+ *
+ * Why not skip it (the previous `if (!route || !route.key) return null`):
+ * /status is the only source of a real recovery TIME - account `until` and
+ * `rate_limited_models[].reset_at`. Skipping the probe collapsed every fallback
+ * onto the boolean /healthz answer, which is exactly the shape the contract
+ * forbids: source "health-negative" with NO X-Gateway-Retry-At, even though the
+ * status endpoint had answered. A missing key must not silently downgrade the
+ * evidence - a 401 is one bounded request and is cached like any other failure,
+ * so ask and let the answer decide.
+ */
 async function fetchStatus(route) {
-  if (!route || !route.key) return null;
+  if (!route) return null;
   const hit = statusCache.get(route.base);
   if (hit && Date.now() - hit.at < STATUS_TTL_MS) return hit.value;
+  const headers = route.key ? { authorization: `Bearer ${route.key}` } : {};
   const value = await fetchLocalJSON(
     route.base + "/status",
-    { authorization: `Bearer ${route.key}` },
+    headers,
     STATUS_TIMEOUT_MS,
   );
   statusCache.set(route.base, { at: Date.now(), value });
@@ -1286,7 +1312,7 @@ const server = http.createServer(async (req, res) => {
     try {
       upstream = await requestWithRetry(route.base + "/v1/messages", {
         method: "POST",
-        headers: anthropicHeaders(headers, route.headers),
+        headers: anthropicHeaders(headers, route.headers, route.key),
         body: JSON.stringify(msg),
         proxy: route.proxy,
       }, `${prefix}${rest} -> ${route.name} model=${parsed.model}`);

@@ -69,7 +69,7 @@ function hostIdentities() {
   return [...new Set(names.map((v) => v.trim()))];
 }
 
-const escapeRe = (s) => s.replace(/[.*+?$()|[\]\\]/g, "\\$");
+const escapeRe = (s) => s.replace(/[.*+?$()|[\]\\]/g, "\\$&");
 
 // Field NAMES that imply their value is a secret.
 //

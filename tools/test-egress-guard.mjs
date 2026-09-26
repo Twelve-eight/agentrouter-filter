@@ -1,5 +1,6 @@
 
-import { guardBody, redactText, RULES, summarize } from "../egress-guard.mjs";
+process.env.USERNAME = "o_Obl";
+const { guardBody, redactText, RULES, summarize } = await import("../egress-guard.mjs");
 
 let pass = 0, fail = 0;
 const t = (name, fn) => { try { fn(); console.log("PASS  " + name); pass++; } catch (e) { console.log("FAIL  " + name + "\n      " + e.message); fail++; } };
