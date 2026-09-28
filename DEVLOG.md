@@ -1525,3 +1525,56 @@ last lines: ... "delta":{"content":""}, "finish_reason":"stop" ... [DONE]
 - 无需改代码。anyrouter claude 能否用**只取决于上游**; 需要时用 `/v1/messages` 带 beta 头重探,
   恢复判据: 503 -> 200。
 - 若确实需要 Claude 能力, 现在可用的是 **justwoker 的 `claude-opus-4-8`**。
+## 2026-09-28: 子代理槽位 —— 用 motomoto:gpt-6-astra 换掉零使用的 zen 别名
+
+### 起因
+
+另一个会话 (01a0d279, astra via motomoto) 报告"子代理工具没有提供 `astra via motomoto` 这个可选路由",
+用户问该模型能否用来拉起子代理。复查后确认**该说法准确**, 根因是我们自己的白名单设计:
+
+`spawn_agent` 的 "Available model overrides" 列表**由 catalog 的 `priority < 0` 决定, 硬上限 5 条**
+(2026-09-22 抓包实测, 见本文件更早的条目)。`motomoto:gpt-6-astra` 的 priority 是 0, 所以不在列表里;
+而 `priority: 0` **不影响路由与选择器**, 只是不进子代理覆盖列表。
+
+### 实测: motomoto 本身可用, 但很慢
+
+经线上网关 7878 真实调用 `motomoto:gpt-6-astra`:
+
+| 场景 | 结果 |
+|---|---|
+| 普通调用 | **200**, 128 秒 |
+| 带 tools 调用 | **200**, 230 秒 |
+| **真实工具调用**(要求它调用 exec_command) | **200**, 124 秒, 正确返回 `function_call` + `{"cmd":"echo hi"}` |
+
+对照: `global:deepseek-v4.1-flash` 1.4 秒 / `claude-opus-4-8` 5.7 秒。
+**motomoto 慢 20-150 倍**, 几轮就可能撞上 AGENTS.md Sec 11 的 10 分钟拆分线。
+
+### 决定 (用户选 B)
+
+`data/usage/*.jsonl` 重新统计 (2026-09-28, 15009 行):
+
+| slug | 用量 | 处置 |
+|---|---|---|
+| `global:deepseek-v4.1-flash` | 5662 | 保留 |
+| `claude-opus-4-8` | 2833 | 保留 |
+| `cn:deepseek-v4.1-flash` | 2235 | 保留 |
+| `mimo-v2.6-flash-free` | 17 | 保留 (实际在用的 zen 免费模型) |
+| `zen:mimo-v2.6-flash` | **0** | **换出** -> `motomoto:gpt-6-astra` |
+
+`zen:mimo-v2.6-flash` 当初占位理由是"前缀别名的文档示例", 但 15009 行里**一次都没被调用**,
+而 motomoto 是用户明确要求的子代理路由。零使用别名不值得占一个槽位。带前缀别名这一情形
+仍由注册表覆盖 (`zen:space-bunny` / `motomoto:*` / `global:*`), 只是不再占这 5 个之一。
+
+### 验证
+
+- 重建 catalog: 43 个模型, 构建守卫 (内置负 priority / OVERRIDE_SLUGS > 5) 均未触发。
+- 覆盖列表实测变为 5 条: `global:deepseek-v4.1-flash` / `claude-opus-4-8` / `cn:deepseek-v4.1-flash` /
+  `mimo-v2.6-flash-free` / `motomoto:gpt-6-astra`; `zen:mimo-v2.6-flash` 变 priority 0。
+- **被换出的 slug 仍可正常路由**: `zen:mimo-v2.6-flash` -> **200** (3.8s)。`priority: 0` 只影响子代理列表。
+- 其余 4 个槽位全部实测 200 (0.9s / 1.4s / 2.2s / 4.2s)。
+- 门禁全绿: check-syntax / responses-ids / strict-item-ids / bridge-rude-close / anthropic-registry /
+  realm-fallback / egress-guard。
+
+### 注意
+
+**需重启 Codex 才能生效** —— catalog 在会话启动时读取, 当前会话的 `spawn_agent` 描述仍是旧的 5 条。

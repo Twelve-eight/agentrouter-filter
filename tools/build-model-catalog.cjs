@@ -78,21 +78,38 @@ const DEFAULT_EFFORT = 'max';
 // spawn_agent's "Available model overrides" list (see the priority note inside
 // entry()). Everything else stays spawnable through inheritance only.
 //
-// The list is CAPPED AT 5 by Codex, so adding an entry means evicting one. Usage
-// counted across data/usage/*.jsonl on 2026-09-24: global:deepseek-v4.1-flash
-// 4956, cn:deepseek-v4.1-flash 1098, mimo-v2.6-flash-free 16, and BOTH
-// global:deepseek-v4.1-flash-sg and zen:mimo-v2.6-flash 0. claude-opus-4-8 was
-// requested by the user, so the never-used sg alias gives up its slot; the zen
-// alias (also 0) was kept because zen:mimo-v2.6-flash is the documented example of
-// a prefixed alias, and evicting both would leave the list with no alias at all.
+// The list is CAPPED AT 5 by Codex, so adding an entry means evicting one.
 //
-// claude-opus-4-8 qualifies only because the anthropic RETURN path now forwards
-// toolMap - see the note at the bridgeAnthropicStream call in server.mjs.
+// Usage across data/usage/*.jsonl, re-counted 2026-09-28 (15009 rows):
+//   global:deepseek-v4.1-flash  5662   kept  - the workhorse dev model
+//   claude-opus-4-8             2833   kept  - user-requested; qualifies only
+//                                              because the anthropic RETURN path
+//                                              now forwards toolMap (see the note
+//                                              at the bridgeAnthropicStream call
+//                                              in server.mjs)
+//   cn:deepseek-v4.1-flash      2235   kept  - the fallback realm
+//   mimo-v2.6-flash-free          17   kept  - the zen free model actually in use
+//   zen:mimo-v2.6-flash            0   EVICTED 2026-09-28 for motomoto:gpt-6-astra
+//
+// zen:mimo-v2.6-flash held its slot as "the documented example of a prefixed
+// alias", but it was never called once in 15009 rows while motomoto:gpt-6-astra
+// was explicitly requested as a sub-agent route. A zero-use alias is not worth a
+// slot that a requested model can occupy. The prefixed-alias case is still
+// covered by the registry (zen:space-bunny, motomoto:*, global:*) - it just no
+// longer occupies one of these five.
+//
+// WARNING about motomoto:gpt-6-astra as a sub-agent - it is measured SLOW.
+// 2026-09-28 probes through the live gateway: plain call 128s, call WITH tools
+// 230s, tool-calling call 124s (it DID return a correct function_call for
+// exec_command). Compare global:deepseek-v4.1-flash 1.4s and claude-opus-4-8
+// 5.7s. A sub-agent on this route is 20-150x slower than the others and can cross
+// AGENTS.md Sec 11's 10-minute split threshold in a few turns. It is offered
+// because the user asked for it; prefer the other four for real work.
 const OVERRIDE_SLUGS = new Set([
   'global:deepseek-v4.1-flash',
   'cn:deepseek-v4.1-flash',
   'mimo-v2.6-flash-free',
-  'zen:mimo-v2.6-flash',
+  'motomoto:gpt-6-astra',
   'claude-opus-4-8',
 ]);
 function entry(slug, display, description, efforts, contextWindow) {
