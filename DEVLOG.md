@@ -1654,3 +1654,76 @@ key 的分组最终暴露 5 个 id。**三轮 x 五 id** 的探测结果:
 - **需重启 Codex** 才能在选择器里看到 `ovoapi:gpt-5.6-sol` (catalog 在会话启动时读取)。
 - 网关无需重启: providers.json 是**按请求读**的 (见 `registry()` 的 mtime 缓存), 且线上
   7878 的进程环境里**没有** `OVOAPI_API_KEY` —— 见下条。
+## 2026-09-30: 接入 ovoapi 的第二个 key (OVOAPI_AMZ_API_KEY) —— 七个 Claude 模型
+
+### 与第一个 key 的关系: 同主机, 不同分组, 池子完全不重叠
+
+| | `OVOAPI_API_KEY` (sk-KbyQN) | `OVOAPI_AMZ_API_KEY` (sk-Lvncl) |
+|---|---|---|
+| `/v1/models` | 5 个 (gpt-5.5 / 5.6-sol / 5.6-terra / 6-astra / 6-sol) | **7 个 Claude** |
+| 实际能服务 | **仅 gpt-5.6-sol** | **全部 7 个** |
+
+**为什么注册成两个 provider 而不是一个**: `providers.json` 的 key 是**按 provider** 选
+(`keyEnv`), 不能按模型选。而两个 key 的模型集**零重叠**, 合并会让其中一个池子永远取不到。
+
+### 实测: 七个 id 三轮全绿
+
+三轮 x 七 id = **21 次探测, 全部 HTTP 200**, 没有出现兄弟 key 那种间歇性 503:
+
+```
+claude-fable-5     200 200 200     claude-opus-5      200 200 200
+claude-opus-4-7    200 200 200     claude-opus-5.5    200 200 200
+claude-opus-4-8    200 200 200     claude-sonnet-5    200 200 200
+claude-opus-4.8    200 200 200
+```
+
+**`claude-opus-4-8` 与 `claude-opus-4.8` 是两个不同的真实 id** (连字符 vs 点), 都能服务,
+**没有证据表明它们是同一个模型**, 所以分别注册而不是猜成别名。
+
+### 三个 wire 面全部原生可用
+
+| 面 | 结果 |
+|---|---|
+| `/v1/responses` | 200 (全部 7 个) -> **直通, 无需 chat 桥** |
+| `/v1/messages` | 200 (全部 7 个) |
+| `/v1/chat/completions` | 200 (全部 7 个) |
+
+### id 卫生: 第三种形态, 同样宽容
+
+这个池签发 **`tooluse_...`** 形式的 id (function_call 回来是
+`id=tooluse_GKUuU4VPkFBkZdqweIo6rX`), 与 agentrouter 的 `rs_/msg_/fc_`、relaycat 的 `item_`
+都不同。它**接受外来 id**: 回放 agentrouter 与 relaycat 的条目五种组合全部 **200**。
+**`strictItemIds` 保持关闭。**
+
+### 工具调用与流式
+
+四个 id 实测强制 `exec_command`: 全部 **200** 且正确返回 `function_call`
+(`arguments={"cmd":"echo hi"}`)。`stream=true` 返回完整 SSE (6-7 个事件) 并以
+`response.completed` 收尾。
+
+### 注册
+
+- provider **`ovoapi-amz`**: `base=https://api-console.182yc.xyz`, `wire=responses`,
+  `keyEnv=OVOAPI_AMZ_API_KEY`, 无 proxy / filter / egressGuard / strictItemIds。
+- 七个模型全部以 **`ovoapi:`** 前缀注册 (裸 slug 有冲突: `claude-opus-4-8` 已由 justwoker 服务,
+  `claude-fable-5` / `claude-opus-5` 与 anyrouter 的 id 重叠)。
+- `.env.local` 追加 `OVOAPI_AMZ_API_KEY` (gitignored)。
+- catalog 重建: **51 个模型**。
+
+### 意义
+
+`claude-opus-5` 此前在 `providers.json` 末尾的 `_claude_comment` 里被记为
+"unavailable on every provider we route"。**这个 key 改变了该结论** —— 该注释需要按此更新。
+
+### 验证
+
+- 隔离实例 7879 打真实上游: `/u/v1/models` 51 个 (8 个 ovoapi 条目); `claude-opus-5` **200**
+  (3.7s, 1 个 function_call)、`claude-opus-4-8` **200** (2.8s)、`claude-sonnet-5` **200** (2.8s)、
+  `claude-opus-5.5` **200** (40.5s — 明显更慢)、流式 **200** (3.8s, 6 事件, 收尾正确)。
+- 门禁全绿 (check-syntax / 12 个测试文件 / diff-test 0 mismatches)。
+
+### 待办
+
+- **需重启 Codex** 才能在选择器里看到这 7 个新 id。
+- 网关: 线上 7878 进程环境里**没有** `OVOAPI_AMZ_API_KEY` (key 只在 `.env.local` 与 User 作用域,
+  而 `.env.local` 是**启动时**加载的), 所以经线上网关调用会 401, **需要重启网关**。

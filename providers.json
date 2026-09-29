@@ -90,6 +90,12 @@
       "wire": "responses",
       "keyEnv": "OVOAPI_API_KEY",
       "_comment": "ovoapi - 'AI站长 / OVO API', a New-API relay (v1.0.0-rc.33-ovo.20260928).\n\nHOST: the public site is https://ovoapi.site, but that site's own /api/status\napi_info block names the API host as https://api-console.182yc.xyz/v1. Both\ndomains answer; the console host is used here because that is what the operator\npublishes to clients.\n\nWIRE: responses. Probed 2026-09-30 - /v1/responses 200, /v1/messages 200 (the\nsite also offers an anthropic face), /v1/chat/completions 200. Native responses\nmeans PASSTHROUGH: no chat bridge, no filter (this provider does not need the\nagentrouter character/word rules).\n\nMODEL COVERAGE IS ONE, and that is measured, not assumed. The key's group lists\nfive ids, but only gpt-5.6-sol serves: three rounds x five ids gave gpt-5.6-sol\n9/9 HTTP 200 while gpt-5.5, gpt-5.6-terra, gpt-6-astra and gpt-6-sol answered\n503 'Service temporarily unavailable' on every single attempt. The dead four are\ndeliberately NOT registered - they would appear in the picker and never answer.\nRe-probe before adding them; the announcement feed shows this operator rotates\ngroups often (0.055x, 0.15x, 'no-degradation' groups all advertised in late Sept).\n\nID HYGIENE: this upstream MINTS `item_...` ids - a function_call came back as\nid=item_9d67781de5d75e3c28e3535f, the same shape relaycat uses. Unlike\nagentrouter (see strictItemIds) it ACCEPTS foreign ids: replaying agentrouter's\n`rs_`/`msg_` and relaycat's `item_` items in a follow-up turn all answered 200.\nSo this route must NOT set strictItemIds.\n\nTOOL CALLS work on the responses face: a forced exec_command returned a proper\nfunction_call with arguments {\"cmd\":\"echo hi\"}, and stream=true returned a\ncomplete SSE run ending in response.completed."
+    },
+    "ovoapi-amz": {
+      "base": "https://api-console.182yc.xyz",
+      "wire": "responses",
+      "keyEnv": "OVOAPI_AMZ_API_KEY",
+      "_comment": "The SECOND ovoapi key - same host, DIFFERENT group, entirely different pool.\n\nWhy a separate provider instead of one entry with two keys: providers.json\nselects a key per PROVIDER (keyEnv), not per model, and the two keys' model\nsets do not overlap at all. OVOAPI_API_KEY serves gpt-5.6-sol; this one\nserves seven Claude ids and none of the GPT ones. Merging would make one of\nthe two pools unreachable.\n\nWIRE: responses, native (passthrough). All three faces answered 200 on every\nid: /v1/responses, /v1/messages, /v1/chat/completions. No proxy needed.\n\nID HYGIENE: this pool mints `tooluse_...` ids - a THIRD shape, distinct from\nagentrouter's rs_/msg_/fc_ and relaycat's item_. It ACCEPTS foreign ids:\nreplaying agentrouter's and relaycat's items in a follow-up turn all answered\n200. So strictItemIds must stay OFF here too.\n\nSTABILITY: three rounds x seven ids, all 21 probes HTTP 200 - no intermittent\n503s like the sibling key's dead GPT ids. Re-probe before trusting this for\nanything long-running; the operator rotates groups often.\n\nNOTE: claude-opus-4-8 and claude-opus-4.8 are BOTH real, distinct ids in this\npool (dash vs dot) and both serve. They are registered separately rather than\nguessed to be aliases - nothing in the API says they are the same model."
     }
   },
   "_models_comment": [
@@ -286,9 +292,38 @@
       "p": "ovoapi",
       "m": "gpt-5.6-sol"
     },
+    "ovoapi:claude-fable-5": {
+      "p": "ovoapi-amz",
+      "m": "claude-fable-5"
+    },
+    "ovoapi:claude-opus-4-7": {
+      "p": "ovoapi-amz",
+      "m": "claude-opus-4-7"
+    },
+    "ovoapi:claude-opus-4-8": {
+      "p": "ovoapi-amz",
+      "m": "claude-opus-4-8"
+    },
+    "ovoapi:claude-opus-4.8": {
+      "p": "ovoapi-amz",
+      "m": "claude-opus-4.8"
+    },
+    "ovoapi:claude-opus-5": {
+      "p": "ovoapi-amz",
+      "m": "claude-opus-5"
+    },
+    "ovoapi:claude-opus-5.5": {
+      "p": "ovoapi-amz",
+      "m": "claude-opus-5.5"
+    },
+    "ovoapi:claude-sonnet-5": {
+      "p": "ovoapi-amz",
+      "m": "claude-sonnet-5"
+    },
     "_motomoto_comment": "motomoto.lol - a New-API relay (X-New-Api-Version: v1.0.0-rc.31-motomoto.49).\n\nDIRECT CONNECTIONS DO NOT WORK and they do not fail loudly: a direct HTTPS\nrequest to any path answers `HTTP 200`, `Content-Type: text/plain`, and a\nZERO-LENGTH body. Measured 2026-09-24 - /, /v1, /v1/models, /v1/chat/\ncompletions, /health, even a nonexistent path all answered the same way, so it\nis the CDN, not the API. The same request through the local HTTP proxy returns\nreal JSON. Hence the provider-level `proxy` (same mechanism anyrouter uses).\n\nWIRE: chat/completions only. /v1/responses and /v1/messages both answer\n`Upstream service temporarily unavailable` (upstream_error / nil type) while\n/v1/chat/completions works, so the gateway's chat bridge is the only path.\n\nID COLLISION: all four ids (codex-auto-review, gpt-6-astra, gpt-5.5,\ngpt-5.6-sol) are ALREADY registered against relaycat. They are therefore\nexposed here under a `motomoto:` prefix. Do not overwrite the bare slugs -\nthat would silently reroute every existing caller to a different upstream.\n\nCONCURRENCY: the operator reports a ceiling of one primary + one subagent\n(2 concurrent requests). See the [agents] block in ~/.codex/config.toml.",
     "_justwoker_comment": "justwoker (api.justwoker.icu) is treated as an UNTRUSTED upstream.\n\nRationale: an independent packet scan of this provider reported counts per\nfield name, dominated by credential-shaped data - credentials 37657, API Key\n22734, credential 8216, 令牌 6071, OpenAI Key 3917, 凭证 3191, 密钥 2546, JWT 2187,\n密码 1458, dsn 1201, URL凭据 636, 私钥 469, AccessKey 378, SecretKey 204,\nencryptionkey 184. A capture of a real request to it also showed the host\nusername, absolute workspace paths, the Windows build number, the timezone and\nthe shell name being sent verbatim, plus (because Codex reads files) whole API\nkeys inside tool_result blocks.\n\n`egressGuard: true` therefore runs the FULL rule set from egress-guard.mjs\nbefore the body is converted to the anthropic wire. That guard is FAIL-CLOSED:\nif it throws, the request is refused with 500 rather than forwarded unredacted.\nThis differs from the agentrouter `filter`, which is deliberately fail-open\nbecause it shapes content rather than protecting the host.\n\nWire: anthropic /v1/messages. The chat/completions face is Cloudflare-blocked\nfor this host (returns an HTML challenge page).",
-    "_ovoapi_comment": "gpt-5.6-sol is the ONLY ovoapi id that serves. The other four ids the key's\ngroup exposes (gpt-5.5, gpt-5.6-terra, gpt-6-astra, gpt-6-sol) answered 503 on\nevery probe, so they are not registered - see the provider _comment above.\n\nPREFIXED because the bare slug gpt-5.6-sol is ALREADY served by relaycat. Do not\noverwrite the bare slug; that would silently reroute every existing caller."
+    "_ovoapi_comment": "gpt-5.6-sol is the ONLY ovoapi id that serves. The other four ids the key's\ngroup exposes (gpt-5.5, gpt-5.6-terra, gpt-6-astra, gpt-6-sol) answered 503 on\nevery probe, so they are not registered - see the provider _comment above.\n\nPREFIXED because the bare slug gpt-5.6-sol is ALREADY served by relaycat. Do not\noverwrite the bare slug; that would silently reroute every existing caller.",
+    "_ovoapi_amz_comment": "The seven Claude ids served by the ovoapi-amz key (see that provider's _comment).\n\nPREFIXED with ovoapi: because several bare slugs collide with existing routes:\nclaude-opus-4-8 is already served by justwoker, and claude-fable-5 / claude-opus-5\noverlap the anyrouter ids. Overwriting a bare slug would silently reroute every\nexisting caller.\n\nclaude-opus-5 is the notable one: it was recorded as 'unavailable on every\nprovider we route' (see the _claude_comment at the end of this file) until this\nkey appeared. Verify before assuming that note is still accurate."
   },
   "_claude_comment": "claude-opus-4-8 is served by justwoker over the anthropic-messages wire (see the anthropic bridge in bridge.mjs). It was briefly removed when only agentrouter offered it: agentrouter registers the claude ids on its anthropic-messages face only (messages=402 quota, responses=503, while a nonexistent model is 503 on both) and codex speaks only responses, so selecting them always failed. That is why the responses->messages bridge exists. claude-opus-5 is still unavailable on every provider we route."
 }
