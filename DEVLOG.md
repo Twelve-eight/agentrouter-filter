@@ -1727,3 +1727,63 @@ claude-opus-4.8    200 200 200
 - **需重启 Codex** 才能在选择器里看到这 7 个新 id。
 - 网关: 线上 7878 进程环境里**没有** `OVOAPI_AMZ_API_KEY` (key 只在 `.env.local` 与 User 作用域,
   而 `.env.local` 是**启动时**加载的), 所以经线上网关调用会 401, **需要重启网关**。
+## 2026-09-30: relaycat 第二个 key (0.065 组) + 全站模型显示名重写
+
+### 1) 新 key: relaycat65 (0.065x)
+
+老 key 是 0.2x 组, 新 key 是 **0.065x** 组, 同主机不同分组 -> 独立 provider
+(`relaycat65`, `keyEnv=RELAYCAT65_API_KEY`), 因为 `providers.json` 的 key 是按 provider 选的。
+
+**新 key 实测 (18 个 id, 6 个能服务)**:
+
+| 模型 | 结果 |
+|---|---|
+| `gpt-6-sol` | **200** (1.9s) |
+| `gpt-5.6-sol` | **200** |
+| `gpt-5.6-terra` | **200** |
+| `gpt-6-astra` | **200** |
+| `gpt-5.5` | **200** |
+| `codex-auto-review` | **200** |
+
+其余 9 个 GPT 系是 502/503 (gpt-5.2 / 5.3-codex / 5.3-codex-spark / 5.4 / 5.4-mini /
+5.6-luna / 三个 -openai-compact), 3 个 gpt-image-* 是图像模型未探测。**死 id 不注册。**
+
+**`gpt-6.1-sol` 不存在**: `/v1/models` 里没有, 直接调用回 **404** (真正的 not-found,
+不是渠道问题); 连 `gpt-6.1` / `gpt-6.1-sol-openai-compact` / `gpt-6-sol-openai-compact`
+也都是 404。该站最新就是 **`gpt-6-sol`**。
+
+**xhigh 在 `gpt-6-sol` 上可用**: 四档 effort 全 200, 且 xhigh 确实在做更多工作
+(首次实测 33 秒 vs low/high/max 的 ~1.5 秒)。经网关复测 6/6 全 200。
+
+### 2) 显示名重写 (用户要求)
+
+三条规则, 都写进 `tools/build-model-catalog.cjs`:
+
+- **路由标记用倍率取代 `via`**: 显示名从 `GPT-6-Astra (via relaycat)` 变成 `6-astra (0.2)`。
+  用户原话是"via 这个词直接替换成倍率, 我读得懂有路由的意思"。倍率来自 `providers.json` 的
+  **`ratio`** 字段 (新增), 只有已知的才标; 未知的回退到短 provider 名 (`(wb)` / `(an)` / `(moto)` …),
+  **绝不编造数字**。
+- **模型名缩写**: `shortModel()` 保守地只重写我们实际服务的形态, 未知 id 原样通过而不是被乱改。
+  例: `gpt-6-sol` -> `6-sol`, `claude-opus-5` -> `opus-5`, `deepseek-v4.1-flash` -> `dsv4.1-flash`,
+  `mimo-v2.6-flash-free` -> `mimo2.6f`。
+- **realm 前缀保留**: `global:` / `cn:` 是有意义的池子标记, 缩成词而不是让它把名字撑长 ->
+  `global dsv4.1-flash (wb)` / `cn glm-5.3 (wb)`。
+
+**已记录倍率**: relaycat `0.2`, relaycat65 `0.065`。其余 provider 的倍率用户未提供, 所以显示为短名。
+
+### 3) antigravity 重测: 仍然不通 (账号/地区问题, 非我方)
+
+三次独立探测 (每次换新 session id, 排除粘性会话), `gemini-3.8-flash` 全部:
+`400 User location is not supported for the API use.`
+
+日志给出两个账号各自的原因:
+
+| 账号 | 结果 | 原因 |
+|---|---|---|
+| `onelastsakiko@gmail.com` | 403 | `Verify your account to continue.` (账号未验证) |
+| `twelve20212021@gmail.com` | 400 | `User location is not supported` (地区) |
+
+关键旁证: `antigravity-tools` 进程对本地代理 **7897 的连接数为 0** —— 它没有真正走那个代理,
+尽管 `proxy.upstream_proxy.enabled = true` 且 url 指向 7897。而 7897 本身实测可用
+(出口 `66.90.99.58`, 东京 JP)。所以地区问题出在**应用没把业务请求交给代理**。
+未注册该模型: 它当前不可调用, 注册只会给选择器加一个必然报错的项。

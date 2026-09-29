@@ -112,6 +112,59 @@ const OVERRIDE_SLUGS = new Set([
   'motomoto:gpt-6-astra',
   'claude-opus-4-8',
 ]);
+// Display names. Two rules, both requested by the user:
+//   1. the route marker is the GROUP MULTIPLIER, not the word "via" - "(0.065)"
+//      reads as "served through the 0.065x group" and is shorter;
+//   2. model ids are abbreviated (gpt-6-sol -> 6sol, claude-opus-5 -> opus5), so
+//      the picker line stays readable.
+// A provider with no known ratio falls back to its short name in the marker, so
+// nothing is ever left unlabelled.
+const PROVIDER_ABBR = {
+  agentrouter: 'ar',
+  relaycat: 'rc',
+  relaycat65: 'rc65',
+  'relaycat-cn': 'cn',
+  wb2api: 'wb',
+  anyrouter: 'an',
+  justwoker: 'jw',
+  'opencode-zen': 'zen',
+  motomoto: 'moto',
+  ovoapi: 'ovo',
+  'ovoapi-amz': 'ovo',
+};
+
+// Shorten a model id for display. Deliberately conservative: only the shapes we
+// actually serve are rewritten, so an unknown id passes through untouched rather
+// than being mangled.
+function shortModel(id) {
+  let s = String(id);
+  // A realm prefix is meaningful (global vs cn pool), so keep it as a word
+  // rather than letting it inflate the model name.
+  let prefix = '';
+  const realm = s.match(/^(global|cn):/);
+  if (realm) { prefix = realm[1] + ' '; s = s.slice(realm[0].length); }
+  s = s
+    .replace(/^gpt-/, '')
+    .replace(/^claude-/, '')
+    .replace(/^deepseek-v/, 'dsv')
+    .replace(/^deepseek-/, 'ds')
+    .replace(/^gemini-/, 'gem')
+    .replace(/^mimo-v/, 'mimo')
+    .replace(/-flash-free$/, 'f')
+    .replace(/-free$/, 'f')
+    .replace(/-openai-compact$/, '-c')
+    .replace(/-thinking$/, '-t')
+    .replace(/-preview$/, '');
+  return prefix + s;
+}
+
+/** The "(marker)" shown after a display name: the ratio when known, else the short provider name. */
+function routeMarker(slug, spec) {
+  const ratio = REGISTRY.providers[spec?.p]?.ratio;
+  if (typeof ratio === 'number') return String(ratio);
+  return PROVIDER_ABBR[spec?.p] ?? spec?.p ?? '?';
+}
+
 function entry(slug, display, description, efforts, contextWindow) {
   return {
     slug,
@@ -248,7 +301,7 @@ const ours = Object.entries(REGISTRY.models)
     const upstream = spec.m ?? slug;
     return entry(
       slug,
-      `${spec.m ?? slug} (via ${prov})`,
+      `${shortModel(spec.m ?? slug)} (${routeMarker(slug, spec)})`,
       `${upstream} served by ${prov} through the local gateway`,
       clampWindow(slug) ?? EFF[slug] ?? EFFORTS_DEFAULT,
       CTX[slug] ?? CTX_YML[spec.m ?? slug] ?? CTX_YML[slug] ?? CTX_PREV[slug] ?? CTX_DEFAULT,
@@ -340,9 +393,12 @@ for (const m of merged.models) {
 // relaycat / agentrouter / anyrouter / wb2api all serve the same model id. Entries
 // that already say "(via X)" are left exactly as they are.
 for (const m of merged.models) {
-  if (/\(via /.test(m.display_name ?? "")) continue;
-  const prov = REGISTRY.models[m.slug]?.p;
-  if (prov) m.display_name = `${m.display_name} (via ${prov})`;
+  const spec = REGISTRY.models[m.slug];
+  if (!spec) continue;
+  // Rebuild from the model id so a built-in entry gets the same short name as
+  // our own entries; drop any previous marker first.
+  const base = shortModel(spec.m ?? m.slug);
+  m.display_name = `${base} (${routeMarker(m.slug, spec)})`;
 }
 
 // 5) Per-model auto-compaction limits.

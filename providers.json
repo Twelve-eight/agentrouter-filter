@@ -45,7 +45,15 @@
     "relaycat": {
       "base": "https://api.relaycat.top",
       "wire": "responses",
-      "keyEnv": "RELAYCAT_API_KEY"
+      "keyEnv": "RELAYCAT_API_KEY",
+      "ratio": 0.2
+    },
+    "relaycat65": {
+      "base": "https://api.relaycat.top",
+      "wire": "responses",
+      "keyEnv": "RELAYCAT65_API_KEY",
+      "ratio": 0.065,
+      "_comment": "relaycat, SECOND key - same host, cheaper group: 0.065x vs the 0.2x of the\n`relaycat` entry. Kept separate because providers.json selects a key per\nprovider; the two keys see different model sets and different prices.\n\nMODEL OVERLAP: this key's group lists 18 ids, of which 6 serve. The 0.2x key\nlists 27 and serves 6, and the SERVING SETS OVERLAP on gpt-5.6-sol,\ngpt-5.6-terra, gpt-6-astra, gpt-5.5 and codex-auto-review. Those ids are\ntherefore registered under BOTH providers, and the display name carries the\nratio so the cheaper one is obvious when picking.\n\nTHIS KEY'S EXCLUSIVE: gpt-6-sol, which is the reason to use it - it accepts\nreasoning effort `xhigh` (probed 200) and the xhigh run really does more work\n(33s vs 1.5s at low/high/max), so it is not being silently downgraded.\n\nDEAD IDS (502/503 on probe, deliberately NOT registered): gpt-5.2,\ngpt-5.3-codex, gpt-5.3-codex-spark, gpt-5.4, gpt-5.4-mini, gpt-5.6-luna,\ngpt-5.5-openai-compact, gpt-5.6-sol-openai-compact,\ngpt-5.6-terra-openai-compact. The three gpt-image-* ids are image models and\nwere not probed.\n\ngpt-6.1-sol DOES NOT EXIST on this key: /v1/models omits it and a direct call\nanswers 404 (a real not-found, not a channel problem). The newest id here is\ngpt-6-sol."
     },
     "relaycat-cn": {
       "base": "https://api.relaycat.top",
@@ -217,6 +225,30 @@
     },
     "codex-auto-review": {
       "p": "relaycat"
+    },
+    "rc65:6sol": {
+      "p": "relaycat65",
+      "m": "gpt-6-sol"
+    },
+    "rc65:5.6sol": {
+      "p": "relaycat65",
+      "m": "gpt-5.6-sol"
+    },
+    "rc65:5.6terra": {
+      "p": "relaycat65",
+      "m": "gpt-5.6-terra"
+    },
+    "rc65:6astra": {
+      "p": "relaycat65",
+      "m": "gpt-6-astra"
+    },
+    "rc65:5.5": {
+      "p": "relaycat65",
+      "m": "gpt-5.5"
+    },
+    "rc65:review": {
+      "p": "relaycat65",
+      "m": "codex-auto-review"
     },
     "gpt-6-astra-ar": {
       "p": "agentrouter",
