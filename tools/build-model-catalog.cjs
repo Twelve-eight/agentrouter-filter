@@ -131,6 +131,7 @@ const PROVIDER_ABBR = {
   motomoto: 'moto',
   ovoapi: 'ovo',
   'ovoapi-amz': 'ovo',
+  antigravity: 'ag',
 };
 
 // Shorten a model id for display. Deliberately conservative: only the shapes we
@@ -138,11 +139,11 @@ const PROVIDER_ABBR = {
 // than being mangled.
 function shortModel(id) {
   let s = String(id);
-  // A realm prefix is meaningful (global vs cn pool), so keep it as a word
-  // rather than letting it inflate the model name.
+  // A realm prefix is meaningful (global vs cn pool) and stays, but as a compact
+  // tag rather than a word that eats the line: 'global x' -> 'G x', 'cn x' -> 'C x'.
   let prefix = '';
   const realm = s.match(/^(global|cn):/);
-  if (realm) { prefix = realm[1] + ' '; s = s.slice(realm[0].length); }
+  if (realm) { prefix = (realm[1] === 'global' ? 'G ' : 'C '); s = s.slice(realm[0].length); }
   s = s
     .replace(/^gpt-/, '')
     .replace(/^claude-/, '')
@@ -150,11 +151,16 @@ function shortModel(id) {
     .replace(/^deepseek-/, 'ds')
     .replace(/^gemini-/, 'gem')
     .replace(/^mimo-v/, 'mimo')
-    .replace(/-flash-free$/, 'f')
-    .replace(/-free$/, 'f')
+    // Word-level shorthands. Order matters: longest first, so '-flash-free'
+    // is not half-eaten by '-free'.
+    .replace(/codex-auto-review/g, 'review')
     .replace(/-openai-compact$/, '-c')
+    .replace(/-flash-free$/, 'f')
+    .replace(/-flash$/, 'f')
+    .replace(/-free$/, 'f')
     .replace(/-thinking$/, '-t')
-    .replace(/-preview$/, '');
+    .replace(/-preview$/, '')
+    .replace(/-tiered$/, '-t');
   return prefix + s;
 }
 

@@ -1787,3 +1787,77 @@ claude-opus-4.8    200 200 200
 尽管 `proxy.upstream_proxy.enabled = true` 且 url 指向 7897。而 7897 本身实测可用
 (出口 `66.90.99.58`, 东京 JP)。所以地区问题出在**应用没把业务请求交给代理**。
 未注册该模型: 它当前不可调用, 注册只会给选择器加一个必然报错的项。
+## 2026-09-30 (续): antigravity 真相 —— Claude 能用, Gemini 不能用; 全站名字缩短
+
+### 1) antigravity 重测 (用户要求"最后测一次"): 找到真正的分界线
+
+之前只测了 `gemini-3.8-flash`, 得出"整个 provider 不可用"的结论。**这次把模型族横着扫了一遍,
+发现分界线不在 provider 上, 而在模型族上**:
+
+| 模型 | 结果 |
+|---|---|
+| `claude-opus-4-6` | **200** |
+| `claude-opus-4-6-thinking` | **200** |
+| `claude-sonnet-4-5` | **200** |
+| `claude-sonnet-4-6` | **200** |
+| `claude-haiku-4-5` | **200** |
+| `gemini-3.8-flash` (及全部变体) | 400 `User location is not supported` |
+| `gemini-3-pro-high` / `gemini-3.1-pro` / `gemini-2.5-flash` | 400 同上 |
+| `gemini-2.5-pro` / `gpt-4o` | 403 `Verify your account to continue.` |
+
+**Claude 族全部可用, Gemini 族全部被地区/账号拦。** 所以注册了 5 个 Claude id
+(`ag:opus4-6` / `ag:opus4-6t` / `ag:sonnet4-5` / `ag:sonnet4-6` / `ag:haiku4-5`),
+**一个 gemini id 都没注册** —— 它们现在调不通。
+
+地区问题的机制不变: 该应用的业务请求不走它自己配置的上游代理 (实测进程对 7897 的连接数为 0,
+而 7897 本身可用, 出口 66.90.99.58 东京)。Claude 走的是另一条上游路径, 所以不受影响。
+
+### 2) 工具调用: 一个测试方法学教训
+
+第一次测工具调用时**全部 400**, 报
+`Thinking may not be enabled when tool_choice forces tool use.`
+
+那是**我的探测方式**造成的: 我用了 `tool_choice: "required"` 强制工具调用, 而 thinking 类模型
+不允许这样做。**Codex 实际发送的形状不带 `tool_choice`**(给 tools 让模型自己决定)。改用真实形状后
+**5/5 全部 200 且正确返回 function_call**:
+
+```
+ag:opus4-6     fcall=1 args={"cmd":"echo hi"}
+ag:opus4-6t    fcall=1
+ag:sonnet4-5   fcall=1
+ag:sonnet4-6   fcall=1
+ag:haiku4-5    fcall=1
+```
+
+**教训**: 强制 `tool_choice: required` 对 thinking 模型是非法组合, 用它做能力探测会得到假阴性。
+
+### 3) 全站显示名最终缩短
+
+在上一轮 (倍率取代 via) 的基础上继续压:
+
+| 之前 | 现在 |
+|---|---|
+| `global dsv4.1-flash (wb)` | `G dsv4.1f (wb)` |
+| `cn glm-5.3 (wb)` | `C glm-5.3 (wb)` |
+| `codex-auto-review (0.2)` | `review (0.2)` |
+| `mimo2.6f` | `mimo2.6f` (已短) |
+| `space-bunnyf` | `space-bunnyf` (已短) |
+| `deepseek-v4-flash` | `dsv4f` |
+
+规则 (都在 `tools/build-model-catalog.cjs`): realm 前缀 `global:`/`cn:` 缩成 `G`/`C` 保留池子语义;
+`codex-auto-review` -> `review`; `-flash`/`-free`/`-flash-free` -> `f`; `-thinking` -> `-t`;
+`-openai-compact` -> `-c`。倍率标记不变 (`0.2` / `0.065`), 未知 provider 用短名 (`wb`/`an`/`ar`/
+`moto`/`ovo`/`zen`/`jw`/`ag`)。
+
+### 4) 一个自己引入又修掉的 bug
+
+注册 antigravity 时, 我的脚本把模型值写成了**裸字符串**而不是 `{p, m}` 对象。网关的 `modelList()`
+只收 `typeof === "object"` 的条目, 于是这 5 个模型**在 providers.json 里存在、却不出现在
+`/u/v1/models`**, 调用一律 404。改成正确的 `{p, m}` 后 62 个模型全部可见。
+**记这个是因为症状很误导**: 配置文件看起来是对的, 只有网关的过滤规则知道它不算数。
+
+### 验证
+
+- 隔离实例 7879: `/u/v1/models` **62 个** (含 5 个 `ag:`); 5 个 Claude id 全部 **200**;
+  自然形状的工具调用 **5/5** 返回 function_call; 流式 **200** (18 个事件, 收尾正确)。
+- 门禁全绿 (check-syntax / 12 个测试文件 / diff-test 0 mismatches)。

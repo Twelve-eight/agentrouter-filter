@@ -77,6 +77,12 @@
       "keyEnv": "JUSTWOKER_API_KEY",
       "egressGuard": true
     },
+    "antigravity": {
+      "base": "http://127.0.0.1:8045",
+      "wire": "responses",
+      "keyEnv": "ANTIGRAVITY_API_KEY",
+      "_comment": "antigravity-tools (Antigravity Manager), a LOCAL proxy on 127.0.0.1:8045 that\nfronts Google's Antigravity/Gemini Code Assist backends. Not a remote relay:\nit is a desktop app the user runs, with its own account pool.\n\nWIRE: responses is native. /v1/responses, /v1/chat/completions and\n/v1/messages all exist. No proxy needed (the app dials upstream itself).\n\nGEMINI IS GEO-BLOCKED, CLAUDE IS NOT - measured 2026-09-30, and this is the\nsingle most important fact about this provider:\n  claude-opus-4-6, claude-opus-4-6-thinking, claude-sonnet-4-5,\n  claude-sonnet-4-6, claude-haiku-4-5          -> HTTP 200\n  gemini-3.8-flash (and every variant), gemini-3-pro-high, gemini-3.1-pro,\n  gemini-2.5-flash                             -> HTTP 400\n        'User location is not supported for the API use.'\n  gemini-2.5-pro, gpt-4o                       -> HTTP 403\n        'Verify your account to continue.'\nSo ONLY the Claude ids are registered. Do not add a gemini id here until a\nprobe returns 200 - the request never leaves the account's region for those.\n\nWHY the block: the app's business requests do NOT go through the configured\nupstream proxy. Measured: `proxy.upstream_proxy` points at\nhttp://127.0.0.1:7897 and that proxy works (exit 66.90.99.58, Tokyo JP), but\nthe antigravity-tools process holds ZERO connections to it. Its own update\nchecker DOES use the proxy, so the config is read - the model traffic just\ntakes a different path. Fixing that is an app-side setting, not ours.\n\nACCOUNT NOTE: the app's pool has two Google accounts; one is flagged\n`proxy_disabled: true` and the other answers 403 'Verify your account'.\nBoth states are visible in its own logs. Neither is ours to change."
+    },
     "opencode-zen": {
       "base": "http://127.0.0.1:7901/zen",
       "wire": "chat",
@@ -260,6 +266,26 @@
     },
     "claude-opus-4-8": {
       "p": "justwoker"
+    },
+    "ag:opus4-6": {
+      "p": "antigravity",
+      "m": "claude-opus-4-6"
+    },
+    "ag:opus4-6t": {
+      "p": "antigravity",
+      "m": "claude-opus-4-6-thinking"
+    },
+    "ag:sonnet4-5": {
+      "p": "antigravity",
+      "m": "claude-sonnet-4-5"
+    },
+    "ag:sonnet4-6": {
+      "p": "antigravity",
+      "m": "claude-sonnet-4-6"
+    },
+    "ag:haiku4-5": {
+      "p": "antigravity",
+      "m": "claude-haiku-4-5"
     },
     "cn:deepseek-v4.1-flash": {
       "p": "wb2api"
