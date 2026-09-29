@@ -1578,3 +1578,79 @@ last lines: ... "delta":{"content":""}, "finish_reason":"stop" ... [DONE]
 ### 注意
 
 **需重启 Codex 才能生效** —— catalog 在会话启动时读取, 当前会话的 `spawn_agent` 描述仍是旧的 5 条。
+## 2026-09-30: 接入 ovoapi (AI站长 / OVO API, New-API)
+
+### 站点身份
+
+用户给的 `https://ovoapi.site` 是**控制台**; 它自己的 `/api/status` 的 `api_info` 块写明 API 地址是
+**`https://api-console.182yc.xyz/v1`** (两个域名都能通, 取控制台公布的那个)。
+New-API `v1.0.0-rc.33-ovo.20260928.settled-balance`。
+
+### 踩坑一: key 的分组被删过 (用户侧修好)
+
+首次探测时**任何模型名都返回同一个 503**:
+`No available channel for model <X> under group default`, 连不存在的模型名也一样。
+后续 `/v1/models` 能通但调用回 **403 `API Key 所属分组已删除`** —— 这是 key 记录绑定的分组
+已被删除。New API 的 `/v1/models` 只查 key 有效性, 而计费调用要解析分组, 所以两者会不一致。
+**这是账号侧问题, 不是接入问题**; 用户在控制台重新选分组后恢复。
+
+(记录这个错误形态: `API Key 所属分组已删除` 与 `No available channel ... under group X`
+是两种不同的失败, 前者是 key 的分组没了, 后者是分组里没有该模型的渠道。)
+
+### 实测: 五个 id 只有一个能服务
+
+key 的分组最终暴露 5 个 id。**三轮 x 五 id** 的探测结果:
+
+| id | 三轮结果 |
+|---|---|
+| **`gpt-5.6-sol`** | **200 / 200 / 200** (9/9) |
+| `gpt-5.5` | 503 / 503 / 503 |
+| `gpt-5.6-terra` | 503 / 503 / 503 |
+| `gpt-6-astra` | 503 / 503 / 503 |
+| `gpt-6-sol` | 503 / 503 / 503 |
+
+那四个的 503 是 `Service temporarily unavailable`。**只注册能服务的那个** —— 注册四个死 id 只会
+让选择器里出现永远不回答的模型。该站公告显示分组轮换频繁 (0.055x / 0.15x / 不降智组等),
+所以将来要重新探测再加。
+
+### wire 面: responses 原生直通
+
+| 面 | gpt-5.6-sol |
+|---|---|
+| `/v1/responses` | **200** |
+| `/v1/messages` (anthropic) | **200** |
+| `/v1/chat/completions` | **200** |
+
+`/v1/responses` 原生可用 -> **直通 (passthrough), 不需要 chat 桥, 不需要 filter**。
+
+### id 卫生: 会签发 `item_`, 但接受外来 id
+
+该上游**签发 `item_...` 形式的 id** (function_call 回来是 `id=item_9d67781de5d75e3c28e3535f`,
+与 relaycat 同形)。但与 agentrouter 不同, 它**接受外来 id**: 回放 agentrouter 的 `rs_`/`msg_`
+和 relaycat 的 `item_` 条目, 五种组合全部 **200**。**所以这个路由不能设 `strictItemIds`**。
+
+### 工具调用与流式
+
+- 强制 `exec_command` -> 正确返回 `function_call`, `arguments={"cmd":"echo hi"}`。
+- `stream=true` -> 完整 SSE, 9 个事件, 以 `response.completed` 收尾。
+
+### 注册
+
+- provider `ovoapi`: `base=https://api-console.182yc.xyz`, `wire=responses`,
+  `keyEnv=OVOAPI_API_KEY`, 无 proxy, 无 filter, 无 egressGuard, 无 strictItemIds。
+- 模型 **`ovoapi:gpt-5.6-sol`** (带前缀: 裸 slug `gpt-5.6-sol` 已被 relaycat 占用, 覆盖它会
+  静默改写所有现有调用方的路由)。
+- `.env.local` 追加 `OVOAPI_API_KEY` (gitignored)。
+- catalog 重建: **44 个模型**。
+
+### 验证
+
+- 隔离实例 7879 打真实上游: `/u/v1/models` 44 个含 ovoapi; 普通调用 **200** (3.2s)、
+  带工具 **200** (3.1s, 1 个 function_call)、流式 **200** (2.6s)。
+- 门禁全绿 (check-syntax / 12 个测试文件 / diff-test 0 mismatches)。
+
+### 待办
+
+- **需重启 Codex** 才能在选择器里看到 `ovoapi:gpt-5.6-sol` (catalog 在会话启动时读取)。
+- 网关无需重启: providers.json 是**按请求读**的 (见 `registry()` 的 mtime 缓存), 且线上
+  7878 的进程环境里**没有** `OVOAPI_API_KEY` —— 见下条。
