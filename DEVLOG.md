@@ -1861,3 +1861,66 @@ ag:haiku4-5    fcall=1
 - 隔离实例 7879: `/u/v1/models` **62 个** (含 5 个 `ag:`); 5 个 Claude id 全部 **200**;
   自然形状的工具调用 **5/5** 返回 function_call; 流式 **200** (18 个事件, 收尾正确)。
 - 门禁全绿 (check-syntax / 12 个测试文件 / diff-test 0 mismatches)。
+## 2026-09-30 (再扫): `gpt-6.1-sol` 出现了 —— 三个 key 全有, xhigh 可用
+
+### 结论: 之前"不存在"的判断只对了半天
+
+上午扫描时 `gpt-6.1-sol` 在两个 relaycat key 上都是 **404 (真正的 not-found)**。本轮重扫,
+**三个 key 全都有它, 且都能服务**:
+
+| key | `/v1/models` | `gpt-6.1-sol` |
+|---|---|---|
+| relaycat **0.2** (`RELAYCAT_API_KEY`) | 36 个 | **200** |
+| relaycat **0.065** (`RELAYCAT65_API_KEY`) | 18 个 | **200** |
+| ovo **0.1** (`OVOAPI_API_KEY`) | 6 个 | **200** |
+
+**effort 全档实测 (经网关, 三个路由各 3 档)**:
+
+| 路由 | low | **xhigh** | max |
+|---|---|---|---|
+| `rc:6.1sol` (0.2) | 200 | **200** | 200 |
+| `rc65:6.1sol` (0.065) | 200 | **200** | 200 |
+| `ovoapi:6.1sol` (ovo) | 200 | **200** | 200 |
+
+**你要的 xhigh 拿到了**, 而且 **0.065 那条最便宜** —— 建议优先用它。
+
+工具调用也实测通过: `rc65:6.1sol` 与 `ovoapi:6.1sol` 都返回了正确的 `function_call`。
+
+**教训 (已写进 relaycat65 的注释)**: 上游是**当天中途上架**的。一个 negative probe 只代表那一刻,
+不代表永远; 隔几小时重扫就有收获。
+
+### 本轮新增注册 (13 条, 模型总数 62 -> 75)
+
+**relaycat 0.2 (重扫 36 个 id, 13 个能服务)**: 之前只注册了 8 个, 这次补上
+`gpt-6.1-sol` / `gpt-6` / `gpt-5.6-luna` / `gpt-5.5-openai-compact` / `gpt-5.6-openai-compact` /
+`gpt-5.6-sol-openai-compact` / `gpt-reserve`。
+
+**relaycat 0.065**: 补上 `gpt-6.1-sol` / `gpt-5.6-luna`。
+
+**ovo 0.1**: 这一组现在**整个 GPT 集都在服务** —— 补上 `gpt-6.1-sol` / `gpt-6-sol` /
+`gpt-6-astra` / `gpt-5.6-terra` (之前只注册了 `gpt-5.6-sol`)。只有 `gpt-5.5` 仍是 503。
+
+死 id 一律不注册 (0.2 有 23 个不服务, 0.065 有 10 个, 其中 8-9 个是 `gpt-image-*` 图像模型未探测)。
+
+### 一个环境变量的坑 (已记进 relaycat 注释)
+
+`RELAYCAT_API_KEY` (0.2 那个) **不在 `.env.local` 里** —— 它来自 **User 作用域环境变量**。
+`.env.local` 优先于环境变量, 但**那里根本没有这个键**, 所以环境变量的值留了下来, 功能正常。
+风险是: 如果那个 User 变量丢了, 这条路由会静默失效。已记在注释里。
+
+### 显示名
+
+新条目自动继承缩写规则:
+
+```
+rc:6.1sol       -> 6.1-sol (0.2)
+rc65:6.1sol     -> 6.1-sol (0.065)
+ovoapi:6.1sol   -> 6.1-sol (ovo)
+rc:reserve      -> reserve (0.2)
+```
+
+### 验证
+
+- 隔离实例 7879: `/u/v1/models` **75 个**; 三个 `6.1sol` 路由各 3 档 effort 全 **200**;
+  工具调用 **2/2** 返回 function_call; 其余 7 个新 id 全 **200**。
+- 门禁全绿 (check-syntax / 12 个测试文件 / diff-test 0 mismatches)。
