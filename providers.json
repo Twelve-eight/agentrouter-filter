@@ -47,14 +47,14 @@
       "wire": "responses",
       "keyEnv": "RELAYCAT_API_KEY",
       "ratio": 0.2,
-      "_comment": "relaycat, the 0.2x group. NOTE: this key is NOT in .env.local - it is supplied\nby the User-scope environment variable RELAYCAT_API_KEY. .env.local wins over\nthe ambient environment, but an ABSENT key there leaves the ambient one in\nplace, which is why this still works. Adding it to .env.local is the more\nrobust setup if the User variable is ever lost.\n\nRESCAN 2026-09-30 (36 ids): 13 serve. Compared with the earlier probe this key\nnow also serves gpt-6.1-sol, gpt-6, gpt-5.6-luna, gpt-5.5-openai-compact,\ngpt-5.6-openai-compact, gpt-5.6-sol-openai-compact and gpt-reserve. The dead 23\nare mostly 502 (gpt-5.2*, gpt-5.4*, gpt-5.5-pro, gpt-6-luna, gpt-5.3-codex-spark)\nplus 8 gpt-image-* ids that are image models and were not probed.\n\ngpt-6.1-sol IS here now, and it accepts reasoning effort xhigh (probed 200) -\nthis is the model the user wanted for xhigh."
+      "_comment": "relaycat, the 0.2x group. NOTE: this key is NOT in .env.local - it is supplied\nby the User-scope environment variable RELAYCAT_API_KEY. .env.local wins over\nthe ambient environment, but an ABSENT key there leaves the ambient one in\nplace, which is why this still works. Adding it to .env.local is the more\nrobust setup if the User variable is ever lost.\n\nRESCAN 2026-10-01 (36 ids): 13 serve. Newly registered this round: gpt-5.6 and\ngpt-6-sol, both confirmed 4/4 HTTP 200 before being added (this key has many\nflaky ids, so a single 200 is not evidence). gpt-6-sol also accepts xhigh.\n\nFLAKY, left registered but NOT reliably serving - re-probe before relying on\nthem: gpt-5.2, gpt-5.4 and gpt-reserve answer a MIX of 429 and 502 across\nattempts (measured 429/502/429 and similar), never a clean 200 in this round;\ngpt-5.3-codex answered 502 three times. They stay listed because the ids are\nreal and this group's availability moves, but they are not dependable.\n\nThe remaining 15 ids are hard 502 (gpt-4o-audio/realtime, gpt-5.2-*,\ngpt-5.4-* variants, gpt-5.5-pro, gpt-6-luna, gpt-5.3-codex-spark) plus 8\ngpt-image-* image models that were not probed."
     },
     "relaycat65": {
       "base": "https://api.relaycat.top",
       "wire": "responses",
       "keyEnv": "RELAYCAT65_API_KEY",
       "ratio": 0.065,
-      "_comment": "relaycat, SECOND key - same host, cheaper group: 0.065x vs the 0.2x of the\n`relaycat` entry. Kept separate because providers.json selects a key per\nprovider; the two keys see different model sets and different prices.\n\nMODEL OVERLAP: this key's group lists 18 ids, of which 6 serve. The 0.2x key\nlists 27 and serves 6, and the SERVING SETS OVERLAP on gpt-5.6-sol,\ngpt-5.6-terra, gpt-6-astra, gpt-5.5 and codex-auto-review. Those ids are\ntherefore registered under BOTH providers, and the display name carries the\nratio so the cheaper one is obvious when picking.\n\nTHIS KEY'S EXCLUSIVE: gpt-6-sol, which is the reason to use it - it accepts\nreasoning effort `xhigh` (probed 200) and the xhigh run really does more work\n(33s vs 1.5s at low/high/max), so it is not being silently downgraded.\n\nDEAD IDS (502/503 on probe, deliberately NOT registered): gpt-5.2,\ngpt-5.3-codex, gpt-5.3-codex-spark, gpt-5.4, gpt-5.4-mini, gpt-5.6-luna,\ngpt-5.5-openai-compact, gpt-5.6-sol-openai-compact,\ngpt-5.6-terra-openai-compact. The three gpt-image-* ids are image models and\nwere not probed.\n\ngpt-6.1-sol NOW EXISTS here (rescan 2026-09-30): it was absent earlier the same\nday and a direct call then answered 404. It now serves, and accepts xhigh. The\nupstream evidently added it mid-day - re-probe rather than trusting a negative."
+      "_comment": "relaycat, SECOND key - same host, cheaper group: 0.065x vs the 0.2x of the\n`relaycat` entry. Kept separate because providers.json selects a key per\nprovider; the two keys see different model sets and different prices.\n\nMODEL OVERLAP: this key's group lists 18 ids, of which 6 serve. The 0.2x key\nlists 27 and serves 6, and the SERVING SETS OVERLAP on gpt-5.6-sol,\ngpt-5.6-terra, gpt-6-astra, gpt-5.5 and codex-auto-review. Those ids are\ntherefore registered under BOTH providers, and the display name carries the\nratio so the cheaper one is obvious when picking.\n\nTHIS KEY'S EXCLUSIVE: gpt-6-sol, which is the reason to use it - it accepts\nreasoning effort `xhigh` (probed 200) and the xhigh run really does more work\n(33s vs 1.5s at low/high/max), so it is not being silently downgraded.\n\nDEAD IDS (502/503 on probe, deliberately NOT registered): gpt-5.2,\ngpt-5.3-codex, gpt-5.3-codex-spark, gpt-5.4, gpt-5.4-mini, gpt-5.6-luna,\ngpt-5.5-openai-compact, gpt-5.6-sol-openai-compact,\ngpt-5.6-terra-openai-compact. The three gpt-image-* ids are image models and\nwere not probed.\n\ngpt-6.1-sol NOW EXISTS here (first seen 2026-09-30; still serving 2026-10-01):\nit was absent earlier that day and a direct call then answered 404. It accepts\nxhigh. The upstream added it mid-day - re-probe rather than trusting a negative."
     },
     "relaycat-cn": {
       "base": "https://api.relaycat.top",
@@ -434,6 +434,14 @@
     "ovoapi:5.6terra": {
       "p": "ovoapi",
       "m": "gpt-5.6-terra"
+    },
+    "rc:5.6": {
+      "p": "relaycat",
+      "m": "gpt-5.6"
+    },
+    "rc:6sol": {
+      "p": "relaycat",
+      "m": "gpt-6-sol"
     }
   },
   "_claude_comment": "claude-opus-4-8 is served by justwoker over the anthropic-messages wire (see the anthropic bridge in bridge.mjs). It was briefly removed when only agentrouter offered it: agentrouter registers the claude ids on its anthropic-messages face only (messages=402 quota, responses=503, while a nonexistent model is 503 on both) and codex speaks only responses, so selecting them always failed. That is why the responses->messages bridge exists. claude-opus-5 WAS unavailable on every provider we route until 2026-09-30, when\nthe ovoapi-amz key appeared; it is now served as `ovoapi:claude-opus-5` (probed\nthree rounds, 200 every time, with working tool calls). The same key also brings\nclaude-fable-5, claude-opus-4-7, claude-opus-4.8, claude-opus-5.5 and\nclaude-sonnet-5 - see the ovoapi-amz provider comment."
