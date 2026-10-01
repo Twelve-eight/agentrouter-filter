@@ -394,6 +394,36 @@ for (const m of merged.models) {
   }
 }
 
+// User-pinned context windows.
+//
+// Applied AFTER the recorded-value loop above, on purpose: that loop only ever
+// RAISES a window (from models.yml / the previous catalog), so a pin placed
+// earlier would be silently overwritten. Keyed by UPSTREAM model id, so one pin
+// covers every route that serves that model (rc / rc65 / ovoapi all serve
+// gpt-6-sol, and all three should read the same).
+//
+// Why a pin at all: the relaycat and ovo providers publish no context_length, so
+// these ids fell back to CTX_DEFAULT (200000) marked UNVERIFIED. The user states
+// the real limit is 240k. A pin beats a guess.
+//
+// NOTE: gpt-6-astra is deliberately NOT pinned - models.yml records 1050000 for
+// it, and this file's own precedence rule is that a recorded value beats a
+// blanket default. Only the sol/base ids are pinned.
+const CTX_PIN = {
+  'gpt-6': 240000,
+  'gpt-6-sol': 240000,
+  'gpt-6.1-sol': 240000,
+};
+for (const m of merged.models) {
+  const spec = REGISTRY.models[m.slug];
+  const upstream = spec?.m ?? m.slug;
+  const pin = CTX_PIN[upstream];
+  if (pin) {
+    m.context_window = pin;
+    m.max_context_window = pin;
+  }
+}
+
 // Name the upstream on every entry. The built-in entries are taken verbatim from
 // codex, so their display names are bare ("GPT-6-Astra") - ambiguous here, where
 // relaycat / agentrouter / anyrouter / wb2api all serve the same model id. Entries

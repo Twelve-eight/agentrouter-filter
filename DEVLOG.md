@@ -2037,3 +2037,51 @@ claude-sonnet-5   200 200 200
 - 隔离实例 7879: `/u/v1/models` **80 个** (含 3 个 `ovo05:`); 三个 id 全 **200**;
   xhigh **200**; 工具调用返回 function_call。
 - 门禁全绿 (check-syntax / 12 个测试文件 / diff-test 0 mismatches)。
+## 2026-10-02: 子代理上限解除 + gpt-6/6.1 上下文钉到 240k
+
+### 1) `[agents] max_concurrent_threads_per_session: 8 -> 1000000`
+
+用户要求"解除 codex 的子代理上限"。**Codex 没有 unlimited 字面语义** —— 源码 (`codex-rs/core/src/config/mod.rs`)
+里 `DEFAULT_AGENT_MAX_THREADS = Some(6)`，删掉这个键只是退回内置的 6 (上次就是这么踩的)。schema
+(`codex-rs/core/config.schema.json`) 把该键定义为 `uint` + `minimum: 1` + **无 maximum**，所以只能用一个
+远超实际扇出的哨兵值把上限推成不可达。
+
+取 **1000000**：本工作区最多跑 5-8 路；limiter 实现 (`agent/control/execution.rs`) 是普通 `AtomicUsize`
+计数 (`has_capacity = active < max_threads`)，不是 tokio Semaphore，没有 permit 上限会触发 panic。
+V2 路径的 `+1`/`-1` 换算在百万量级仍然精确。
+
+验证: `codex doctor --json` -> `config.load = ok`，`config.toml parse = ok`。
+
+**注意**: 上限解除只对**之后启动**的 Codex 进程生效。当前 app-server (PID 13680，启动于 2026-10-02 01:24:13)
+仍持有旧的 8，需要重启 Codex 才吃到 1000000。
+
+### 2) `gpt-6` / `gpt-6-sol` / `gpt-6.1-sol` 上下文钉到 240k
+
+`tools/build-model-catalog.cjs` 新增 `CTX_PIN`，插在"记录值循环"**之后** (那个循环只会抬高窗口，放前面会被
+覆盖)，按**上游 model id** 匹配，一条 pin 覆盖所有路由。
+
+catalog 实测 (重建后 80 个模型，命中 15 条):
+
+| slug | context_window | auto_compact_token_limit |
+|---|---|---|
+| `rc:6.1sol` | 240000 | 219808 |
+| `rc65:6.1sol` | 240000 | 219808 |
+| `ovoapi:6.1sol` | 240000 | 219808 |
+| `rc:6sol` | 240000 | 219808 |
+| `rc65:6sol` | 240000 | 219808 |
+| `ovoapi:6sol` | 240000 | 219808 |
+
+`gpt-6-astra` 系列**故意未 pin** —— `models.yml` 记录 1050000，该文件自身的优先级规则是"记录值胜过默认值"。
+**待用户确认**是否也要压到 240k。
+
+### 门禁
+
+- `check-syntax` ok (含 collapsed-spread sweep)
+- `diff-test` 45 samples + 1 tree, **0 mismatches**
+- 12 个测试文件全绿: anthropic-registry / bridge-indices / bridge-request 32 / bridge-rude-close 8 /
+  egress-guard 16 / egress-scan 28 / filter-failopen / realm-fallback / responses-ids 16 /
+  stream-terminal 48 / strict-item-ids / usage-pricing
+
+### 备份
+
+改动前的 `config.toml` 存于 `G:\tmp\config.toml.bak-20261002-agents` (9205 字节)。
