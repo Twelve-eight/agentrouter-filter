@@ -2050,6 +2050,15 @@ claude-sonnet-5   200 200 200
 计数 (`has_capacity = active < max_threads`)，不是 tokio Semaphore，没有 permit 上限会触发 panic。
 V2 路径的 `+1`/`-1` 换算在百万量级仍然精确。
 
+**V1 / V2 两条路径都查过了** (codex 0.159.0 源码):
+
+- V1 (本机 `multi_agent stable true` / `multi_agent_v2 stable false` 走这条):
+  `config.effective_agent_max_threads()` -> `self.agent_max_threads.or(DEFAULT_AGENT_MAX_THREADS)`
+  (mod.rs:1618)，再由 `registry.reserve_spawn_slot(agent_max_threads)` 强制执行
+  (agent/control/spawn.rs:652,677 与 :1360,1364)。设了值就走我们的 1000000。
+- V2 (未启用): `multi_agent_v2.max_concurrent_threads_per_session` 默认 4，从 `[agents]` 派生时
+  `+1` 再 `-1` 还原 (mod.rs:2761 / 1615)。
+
 验证: `codex doctor --json` -> `config.load = ok`，`config.toml parse = ok`。
 
 **注意**: 上限解除只对**之后启动**的 Codex 进程生效。当前 app-server (PID 13680，启动于 2026-10-02 01:24:13)
