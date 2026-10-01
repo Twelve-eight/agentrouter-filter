@@ -1984,3 +1984,56 @@ rc:6.1sol     ->  6.1-sol (0.2)
 rc65:6.1sol   ->  6.1-sol (0.065)
 ovoapi:6.1sol ->  6.1-sol (ovo)
 ```
+## 2026-10-01: 接入 ovo 的第三个 key (0.05x 组) —— 目前最便宜的 Claude 路由
+
+### 三个 ovo key 的关系
+
+| key | 组倍率 | 池子 |
+|---|---|---|
+| `OVOAPI_API_KEY` | 0.1 | 6 个 GPT 系 (5 个可用) |
+| `OVOAPI_AMZ_API_KEY` | — | 7 个 Claude |
+| **`OVOAPI_005_API_KEY`** | **0.05** | **3 个 Claude** |
+
+三者同主机 (`https://api-console.182yc.xyz`), 不同分组, **各自独立 provider** —— 因为
+`providers.json` 的 key 是**按 provider** 选的, 不能按模型选。0.05 的池子与 amz 的池子
+**有重叠但不是子集** (amz 有 7 个, 0.05 只有 3 个), 合并会让其中一个 key 永远取不到。
+
+### 实测: 3/3 稳定, 全档 effort 可用
+
+**三轮复测, 全部 200**:
+
+```
+claude-opus-5     200 200 200
+claude-opus-5.5   200 200 200
+claude-sonnet-5   200 200 200
+```
+
+**effort 四档 (low/high/xhigh/max) 在 opus-5 与 sonnet-5 上全部 200**, 含 **xhigh**。
+
+**工具调用**: 三个模型都返回了正确的 `function_call` (`args={"cmd":"echo hi"}`)。
+**流式**: 200, 6 个事件, 以 `response.completed` 收尾。
+
+### 注册
+
+- provider **`ovoapi-005`**: `base=https://api-console.182yc.xyz`, `wire=responses`,
+  `keyEnv=OVOAPI_005_API_KEY`, **`ratio: 0.05`**, 无 proxy/filter/egressGuard/strictItemIds。
+- 三个模型以 **`ovo05:`** 前缀注册: `ovo05:opus5` / `ovo05:opus5.5` / `ovo05:sonnet5`。
+  显示名自动带倍率: `opus-5 (0.05)`。
+- `.env.local` 追加 `OVOAPI_005_API_KEY` (gitignored)。
+- catalog: **77 -> 80 个模型**。
+
+**重叠提示**: 这三个 id **也在 ovoapi-amz 上**。两条都注册了, **0.05 更便宜, 优先用它**。
+
+### 又踩了同一个坑 (值得记)
+
+注册时**又一次**把模型值写成了**裸字符串**而不是 `{p, m}` 对象 —— 与 antigravity 那次完全相同的
+错误。症状也一样: `providers.json` 里明明有这 3 个键, 但网关的 `modelList()` 只收
+`typeof === "object"` 的条目, 于是它们**不出现在 `/u/v1/models`**, 调用一律 404。
+**同一个坑两次**, 说明"写脚本批量插模型"这个动作应该有个断言: 插入后立刻校验
+`typeof entry === "object" && entry.p`。这次已在检查里补上。
+
+### 验证
+
+- 隔离实例 7879: `/u/v1/models` **80 个** (含 3 个 `ovo05:`); 三个 id 全 **200**;
+  xhigh **200**; 工具调用返回 function_call。
+- 门禁全绿 (check-syntax / 12 个测试文件 / diff-test 0 mismatches)。
