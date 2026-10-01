@@ -74,11 +74,19 @@ const BASE = 'You are Codex, a coding agent. You and the user share the same wor
 // verified accepted by both the agentrouter and wb2api paths.
 const DEFAULT_EFFORT = 'max';
 
-// The models a sub-agent may be spawned with: these are the only entries offered in
-// spawn_agent's "Available model overrides" list (see the priority note inside
-// entry()). Everything else stays spawnable through inheritance only.
+// A 5-slot HINT list shown to the model as "Available model overrides".
 //
-// The list is CAPPED AT 5 by Codex, so adding an entry means evicting one.
+// CORRECTED 2026-10-02 after reading codex 0.159.0 source: this is NOT a whitelist.
+// spawn_agent validates a requested model with find_spawn_agent_model_name()
+// (codex-rs/core/src/agent/child_config.rs), which accepts ANY catalog entry whose
+// multi_agent_version is not Disabled - priority is never consulted. Measured: a
+// live spawn_agent with model="space-bunny-free" (priority 0, absent from this
+// list) was accepted and its session metadata recorded that exact model.
+//
+// So every registered model is already spawnable; this list only controls which 5
+// names are SUGGESTED in the tool description, because Codex hard-codes
+// MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5 (child_config.rs:20) for that text.
+// Prioritize the models the user actually reaches for.
 //
 // Usage across data/usage/*.jsonl, re-counted 2026-09-28 (15009 rows):
 //   global:deepseek-v4.1-flash  5662   kept  - the workhorse dev model
@@ -185,13 +193,12 @@ function entry(slug, display, description, efforts, contextWindow) {
     // `priority` has TWO independent meanings, both verified on 2026-09-22 by
     // capturing the request body with a local proxy:
     //   priority > 0  - ordering among the built-in entries in the picker list.
-    //   priority < 0  - the entry is offered in spawn_agent's "Available model
-    //                   overrides" list. The list is capped at 5 entries and only
-    //                   negative priorities qualify; built-ins (1..43) and every
-    //                   other entry stay out of it. So 0 (default) keeps an entry
-    //                   routable and pickable while leaving the override list alone.
-    // OVERRIDE_SLUGS below is the single place that decides which models a
-    // sub-agent may be spawned with.
+    //   priority < 0  - the entry is listed in spawn_agent's "Available model
+    //                   overrides" HINT text (max 5 shown). Negative priority does
+    //                   NOT gate spawning: the validator accepts any catalog entry.
+    //                   So 0 (default) keeps an entry routable and pickable while
+    //                   leaving the hint list alone.
+    // OVERRIDE_SLUGS below only chooses which 5 models get advertised in the hint.
     priority: OVERRIDE_SLUGS.has(slug) ? -1 : 0,
     supports_reasoning_summaries: true,
     default_reasoning_summary: 'none',
@@ -382,6 +389,36 @@ for (const m of merged.models) {
   const best = PREFERENCE.find((e) => supported.includes(e)) ?? supported[supported.length - 1];
   m.default_reasoning_level = best;
 }
+// Every gpt-* route must offer `xhigh`.
+//
+// User requirement 2026-10-02: "all GPT models should be usable at xhigh". The
+// catalog's supported_reasoning_levels is what Codex validates a requested effort
+// against (agent/child_config.rs -> validate_spawn_agent_reasoning_effort), so a
+// level missing here is a level the user cannot pick - even when the upstream
+// accepts it. Probed through the live gateway 2026-10-02: gpt-5.5, gpt-5.6-sol,
+// global:gpt-5.3-codex, rc:6, rc65:6sol and ovoapi:gpt-5.6-sol all answered 200
+// with reasoning.effort=xhigh. The two that failed (gpt-5.2 = 502, motomoto =
+// 503) are broken models, not an xhigh rejection.
+//
+// Inserted AFTER the default-level normalization above on purpose: that step
+// picks a default from the levels present, and adding xhigh first would silently
+// move a medium-only entry's default (gpt-5.3-codex) up to xhigh. This only
+// widens what may be selected; defaults stay as normalized.
+//
+// The match is on the UPSTREAM id with any realm prefix stripped, so one rule
+// covers rc:/rc65:/ovoapi:/motomoto:/global:/cn: aliases of the same model.
+const EFFORT_RANK = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'persistent'];
+for (const m of merged.models) {
+  const spec = REGISTRY.models[m.slug];
+  const upstream = (spec?.m ?? m.slug).replace(/^(global|cn):/, '');
+  if (!/^gpt/i.test(upstream)) continue;
+  const list = m.supported_reasoning_levels ?? [];
+  if (list.some((l) => l.effort === 'xhigh')) continue;
+  list.push({ effort: 'xhigh', description: LEVELS.xhigh });
+  list.sort((a, b) => EFFORT_RANK.indexOf(a.effort) - EFFORT_RANK.indexOf(b.effort));
+  m.supported_reasoning_levels = list;
+}
+
 // Prefer the recorded context limit over codex's built-in value. Codex ships
 // conservative numbers for the built-in slugs (gpt-6-astra: 272000), while
 // models.yml records what the upstream actually accepts (1050000). Leaving the

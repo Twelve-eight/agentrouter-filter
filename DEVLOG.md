@@ -2094,3 +2094,80 @@ catalog 实测 (重建后 80 个模型，命中 15 条):
 ### 备份
 
 改动前的 `config.toml` 存于 `G:\tmp\config.toml.bak-20261002-agents` (9205 字节)。
+## 2026-10-02 (2): 所有模型可用于子代理 + 所有 GPT 支持 xhigh
+
+### 1) "所有模型可用于子代理" —— 查源码后确认：本来就成立
+
+用户要求"使所有模型都可被用于子代理"。**读完 codex 0.159.0 源码后，结论是这不需要改配置** ——
+之前 `build-model-catalog.cjs` 的注释写错了，我按错误注释以为那 5 条清单是白名单。
+
+**真实机制** (`codex-rs/core/src/agent/child_config.rs`):
+
+- `find_spawn_agent_model_name()` (:318) 校验 spawn 的 `model` 参数时，只检查
+  `model_supports_multi_agent_backend()`，即 **`multi_agent_version != Disabled`**。
+  **`priority` 根本不参与校验。**
+- `MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5` (:20) 只用于**生成提示文本** ——
+  `spawn_agent_models_description()` (multi_agents_spec.rs:823) 与
+  `ModelCatalogState::new()` (context/world_state/model_catalog.rs:31) 用它 `take(5)`，
+  决定工具描述里列哪 5 个名字。这是 Codex 硬编码的，改不了。
+- `priority < 0` 只影响这 5 个**提示位**的占用。
+
+**实测证据** (不是推理):
+
+| spawn 目标 | 是否在 5 条清单 | 结果 | 会话元数据 |
+|---|---|---|---|
+| `space-bunny-free` | 否 (priority=0) | 成功 | `"model":"space-bunny-free"` |
+| `gpt-5.5` + xhigh | 否 (priority=0) | 成功 | `"model":"gpt-5.5"` `"effort":"xhigh"` |
+
+两条都是本会话真实 spawn 出来的子代理线程，不是脚本模拟；元数据取自
+`~/.codex/sessions/2026/10/02/rollout-*-<agent_id>.jsonl` 的 `turn_context`。
+
+同时确认 catalog 覆盖：注册表 87 个键（其中 7 个是 `_comment` 字符串），80 个真实模型**全部**在
+catalog 里，`multi_agent_version=disabled` 的条目 **0 个**。所以没有模型被 V2 排除。
+
+改动：只修正了 `build-model-catalog.cjs` 里两处误导性注释（原来写"only entries offered"、
+"single place that decides which models a sub-agent may be spawned with"，都是错的），
+不改任何 catalog 字段。
+
+### 2) 所有 GPT 模型支持 xhigh
+
+用户要求"所有 gpt 模型应可使用 xhigh"。**catalog 的 `supported_reasoning_levels` 就是校验依据** ——
+`validate_spawn_agent_reasoning_effort()` (child_config.rs:345) 拿请求的 effort 去比这个数组，
+缺了就报 `Reasoning effort xhigh is not supported for model`。所以缺 xhigh = 用户选不到。
+
+改前：41 个 GPT 条目里 **30 个没有 xhigh**（relaycat 系、motomoto 系、ovoapi 系、部分 wb2api 系）。
+
+**先实测上游是否真接受 xhigh**（经线上网关 7878，`reasoning.effort=xhigh`）:
+
+| 模型 | 结果 |
+|---|---|
+| `gpt-5.5` | **200** 2.6s |
+| `gpt-5.6-sol` | **200** 2.3s |
+| `global:gpt-5.3-codex` | **200** 2.8s |
+| `rc:6` | **200** 7.6s |
+| `rc65:6sol` | **200** 2.0s |
+| `ovoapi:gpt-5.6-sol` | **200** 3.6s |
+| `gpt-5.2` | 502（该模型本身 flaky，非 xhigh 被拒）|
+| `motomoto:gpt-6-astra` | 503 维护中（非 xhigh 被拒）|
+
+**改动**: `build-model-catalog.cjs` 新增一段循环，对**上游 id**（剥掉 `global:`/`cn:` 前缀）匹配
+`/^gpt/i` 的条目补上 xhigh，插在"默认层级归一化"**之后** —— 顺序有意为之：
+归一化会用 `PREFERENCE = [max, xhigh, high]` 挑默认值，若先加 xhigh，`gpt-5.3-codex`
+（原本 medium-only）的默认会被静默抬到 xhigh。只放宽可选集合，默认值不动。
+
+改后：**41/41 GPT 条目都有 xhigh**，0 遗漏。抽查:
+
+```
+rc:6.1sol              levels=[low,medium,high,xhigh,max]  default=max  ctx=240000
+global:gpt-5.3-codex   levels=[medium,xhigh]                default=medium  ctx=272000
+gpt-5.2                levels=[low,medium,high,xhigh,max]   default=max
+```
+
+### 门禁
+
+- `check-syntax` ok / `diff-test` 45 samples + 1 tree, **0 mismatches**
+- 12 个测试文件全绿
+
+### 生效条件
+
+**需重启 Codex** —— catalog 在会话启动时读取，当前进程仍持旧目录。
