@@ -2413,3 +2413,121 @@ global:deepseek-v4.1-flash-sg  -> 200 Pink
 - 视觉能力只实测了上面 6 个 id；`cn:deepseek-v4-pro`、`cn:glm-5.3`、`cn:minimax-m3`
   等同在 wb2api 上的条目**没有**测，仍标 text。
 - 图片是**经 chat 桥**转发的，上游 wb2api 若对 base64 体积有限制，未做压力测试。
+
+## 2026-10-03 (凌晨) 缓存用量被两个桥接器漏读 —— 补回并分开读/写两个桶
+
+上一轮顺手记下的疑点（「wb2api 报的是 Anthropic 风格字段，可能没计进价」）查实了，
+而且比疑点更严重：**两个桥接器都没读上游的缓存计数**，缓存份额一直被按全价输入计费。
+
+### 证据（先量化，再动手）
+
+全量 35,729 行 usage 按 provider 统计 `cached_tokens > 0` 的占比：
+
+| provider | 行数 | cached>0 | 占比 | 输入 token |
+|---|---|---|---|---|
+| **wb2api** | 20,590 | **0** | **0.0%** | 2,768,692,700 |
+| ovoapi | 7,681 | 7,464 | 97.2% | 853,430,481 |
+| agentrouter | 2,716 | 707 | 26.0% | 65,111,566 |
+| **justwoker** | 2,397 | **0** | **0.0%** | 423,360,142 |
+| relaycat-cn | 584 | 551 | 94.3% | 81,461,062 |
+
+27.7 亿输入 token 的 provider 一次缓存都没记到 —— 不是上游没报，是网关没读。
+
+### 直连上游取证（2026-10-03）
+
+**wb2api（chat 线）**，同一段 4038-token 前缀连打两次：
+
+```
+call#1  prompt_tokens_details.cached_tokens = 0     prompt_cache_miss_tokens = 4038
+call#2  prompt_tokens_details.cached_tokens = 3840  prompt_cache_hit_tokens  = 3840
+```
+
+流式和非流式**都带**这个字段（流式在最后一个 chunk 的 usage 里）。
+桥接器只读了 `completion_tokens_details`（reasoning），`prompt_tokens_details` 整块没读。
+
+**justwoker（anthropic 线）**：`message_start` 的 usage 全是 0，真实数字在 `message_delta`：
+
+```
+message_start: {input_tokens:0, output_tokens:0}
+message_delta: {input_tokens:17564, output_tokens:4,
+                cache_creation_input_tokens:17562,
+                cache_creation:{ephemeral_5m_input_tokens:17562}}
+```
+
+桥接器**只从 message_delta 读了 output_tokens**，`input_tokens` 和 `cache_creation_input_tokens` 都丢了。
+
+### 顺带测出的语义：`input_tokens` 已包含 cache_creation
+
+尺寸阶梯（system 从 29 字符加到 4.5k 字符）：
+
+| system 字符 | input_tokens | cache_creation |
+|---|---|---|
+| 29 | 10,369 | 10,367 |
+| 929 | 10,729 | 10,727 |
+| 4,529 | 12,169 | 12,167 |
+
+恒有 `input_tokens = cache_creation + 2`（那 2 个是用户那轮）。所以缓存是**子集**，
+不能加在 input 之上，否则整段 prompt 双计费。
+
+### 改动
+
+1. **`bridge.mjs` chat 侧**：读 `prompt_tokens_details.cached_tokens`（回退 `cached_tokens`
+   → `prompt_cache_hit_tokens` → `cache_read_input_tokens`），填进
+   `input_tokens_details.cached_tokens`。
+2. **`bridge.mjs` anthropic 侧**：`cachedTokens` 拆成 `cacheReadTokens` / `cacheWriteTokens`
+   两个桶。原来把两者**相加**，等于把写入按读取价计（opus-4-8 上是 $0.5/M vs $6.25/M，差 12.5 倍）。
+   两个计数器都用 `max()` 更新，`?? ` 回退，message_delta 缺字段时不会把 message_start 学到的值清零。
+3. **`usage.mjs`**：`priceFor` 现在同时传 `cached_tokens` 和 `cache_write_tokens`。
+4. **`server.mjs`**：4 个 `recordUsage` 站点（chat 流、anthropic 流、passthrough 非流、passthrough 流）
+   都转发 `cache_write_tokens`。
+5. **`pricing.mjs`**：`billableIn` 同时减去读和写两个桶；并加**自适应口径判定** ——
+   当 `cacheRead + cacheWrite > inTok` 时说明该上游的 `input_tokens` **不含**缓存（严格 Anthropic 读法），
+   此时不扣减，否则会把未缓存的那部分也抹掉。
+
+### 验证（隔离实例 7879 打真实上游，未碰线上 7878）
+
+```
+wb2api  call#2  usage: input_tokens 4038, cached_tokens 3840        <- 读命中
+justwoker call#2 usage: input_tokens 17564, cache_write_tokens 17562 <- 写命中
+```
+
+落盘账目（data/usage/2026-10-03.jsonl）两条：
+
+```
+wb2api   in=4038  cached=3840 cw=0      total=$0.0000484  (输入部分只算 198 个 token)
+justwoker in=17564 cached=0   cw=17562  total=$0.1098725  (写入按 $6.25/M，不是 $0.5/M)
+```
+
+### 影响面（诚实标注为估算）
+
+wb2api 有 **17,764 行已计价、合计 $599.65**。修复后这些行的实际花费取决于真实缓存命中率，
+而**历史命中率无法回填**（当时就没记）。按几个假设量化：
+
+| 假设命中率 | 修正后应为 | 高估额 | 高估比例 |
+|---|---|---|---|
+| 50% | $325.17 | $274.48 | 45.8% |
+| 70% | $215.38 | $384.27 | 64.1% |
+| 90% | $105.59 | $494.06 | 82.4% |
+| 95% | $78.14 | $521.51 | 87.0% |
+
+**这些是假设值，不是测量值**。能确定的是方向：历史 wb2api 成本被高估，量级在 1.8x 到 7.7x 之间。
+justwoker 那 2,397 行同理：写入被按读取价计，**低估**约 12.5 倍。
+
+### 门禁
+
+- `check-syntax` ok（含 collapsed-spread sweep）/ `diff-test` 45 样本 + 1 树 **0 mismatches**
+- 12 个测试文件全绿；`test-bridge-request` 由 38 增至 **43 checks**（新增 5 条缓存断言），
+  `test-usage-pricing` 新增 5 条（写入价、不重复计费、两种 input 口径、读写互斥）
+
+### 诚实边界
+
+- 历史行**不追溯**（写入时定价），修正只对新请求生效。
+- justwoker 的 `cache_read_input_tokens` 在这次探针里**没出现过**（它每次都报写入，可能是
+  5 分钟 ephemeral 缓存到期即重写）。读侧分支有单元测试覆盖，但没有真实上游样本。
+- 命中率估算基于假设；若日后能拿到 ovo/justwoker 的对账面板数字，应回头校准。
+
+### 过程失误（记录以免重犯）
+
+改 `server.mjs` 时写了一个 `while (s.includes(old)) s = s.replace(old, new)` 循环，
+而 `new` **包含** `old`，导致死循环（100% CPU 直到被杀）。因为杀得及时，那次**没有写盘**，
+文件未被污染；随后改用 `split/join` 一次完成。教训：替换串包含搜索串时，永远不要用循环替换。

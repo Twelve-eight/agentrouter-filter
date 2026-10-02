@@ -203,7 +203,28 @@ function priceFor(model, usage, provider = null) {
 
   // Cached input is billed at the cache rate, so it must not also be charged at
   // the full input rate. Upstreams report cached_tokens as part of input_tokens.
-  const billableIn = Math.max(0, inTok - cacheRead);
+  //
+  // The WRITE bucket is subtracted too. On the Anthropic wire `input_tokens`
+  // already INCLUDES cache_creation (measured 2026-10-03: a 10367-token write
+  // reported input_tokens 10369), so billing the full input rate on those tokens
+  // AND the write rate on top would double-charge the whole prompt. Read and
+  // write are never both non-zero in one turn, so the subtraction is safe even
+  // when a provider reports them separately.
+  const billableIn = Math.max(0, inTok - cacheRead - cacheWrite);
+  // Two upstream conventions exist and both reach this function:
+  //   (a) cache is a SUBSET of input_tokens  (wb2api / OpenAI-style
+  //       prompt_tokens, and the Anthropic wire as justwoker reports it -
+  //       measured 2026-10-03), so the cache share is subtracted above;
+  //   (b) cache is NOT part of input_tokens (the strict Anthropic reading).
+  //       Subtracting there would under-bill the uncached remainder, because
+  //       cacheRead + cacheWrite can exceed inTok and clamp billableIn to 0.
+  // Detect (b) arithmetically and undo the subtraction for that row only.
+  // Real rows sit far from the boundary (a ~350k-token Claude turn reports a
+  // few hundred UNcached tokens beside a ~350k cache write), so the test is
+  // unambiguous in practice; a provider that reports cache > input is
+  // self-identifying as convention (b).
+  const cacheIsSubset = cacheRead + cacheWrite <= inTok;
+  const billableUncached = cacheIsSubset ? billableIn : inTok;
   const perM = (tok, rate) => (tok / 1e6) * (rate ?? 0);
 
   // Off-peak discount (deepseek-style: reduced rate outside the peak windows).
@@ -222,7 +243,7 @@ function priceFor(model, usage, provider = null) {
   }
 
   const parts = {
-    input: perM(billableIn, c.input) * discount,
+    input: perM(billableUncached, c.input) * discount,
     cacheRead: perM(cacheRead, c.cacheRead) * discount,
     cacheWrite: perM(cacheWrite, c.cacheWrite) * discount,
     output: perM(outTok, c.output) * discount,

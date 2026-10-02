@@ -540,6 +540,87 @@ check("system turns stay text-only even with an image present", () => {
   assert.ok(!sys.content.includes("base64"));
 });
 
+// --- cache counters must survive the bridge (2026-10-03) ---------------------
+//
+// The gateway booked 20590 wb2api rows with cached_tokens:0 and 2397 justwoker
+// rows the same way, because neither bridge read the upstream's cache fields.
+// The cached share was then charged at the FULL input rate. Both upstreams do
+// report it: wb2api puts it in prompt_tokens_details.cached_tokens (mirrored in
+// prompt_cache_hit_tokens) and justwoker puts cache_creation/read_input_tokens
+// on message_delta while message_start carries zeros.
+async function runChatBridge(chunks) {
+  const out = [];
+  const res = { writeHead() {}, write(x) { out.push(x); }, end() {} };
+  bridgeChatStream(Readable.from(chunks), res, "m", null, true, null, null, null);
+  await new Promise((r) => setTimeout(r, 60));
+  return out.join("");
+}
+const usageOf = (text) => {
+  const m = [...text.matchAll(/data: (\{"type":"response\.completed".*?\})\n\n/g)].map((x) => JSON.parse(x[1]));
+  return m.at(-1)?.response?.usage;
+};
+
+check("chat bridge: prompt_tokens_details.cached_tokens reaches input_tokens_details", async () => {
+  const u = usageOf(await runChatBridge([
+    'data: {"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":null}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4038,"completion_tokens":2,"total_tokens":4040,"prompt_tokens_details":{"cached_tokens":3840},"prompt_cache_hit_tokens":3840}}\n\n',
+    'data: [DONE]\n\n',
+  ]));
+  assert.ok(u, "no usage in the completed event");
+  assert.strictEqual(u.input_tokens_details?.cached_tokens, 3840, "cached_tokens was dropped");
+});
+
+check("chat bridge: a cacheless response keeps input_tokens_details absent", async () => {
+  const u = usageOf(await runChatBridge([
+    'data: {"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":0}}}\n\n',
+    'data: [DONE]\n\n',
+  ]));
+  assert.ok(!u.input_tokens_details, "zero cache must not invent a details object");
+});
+
+async function runAnthropicBridge(chunks) {
+  const out = [];
+  const res = { writeHead() {}, write(x) { out.push(x); }, end() {} };
+  bridgeAnthropicStream(Readable.from(chunks), res, "m", true, null, null, null);
+  await new Promise((r) => setTimeout(r, 60));
+  return out.join("");
+}
+
+check("anthropic bridge: cache_creation on message_delta becomes cache_write_tokens", async () => {
+  // Exactly the justwoker shape: message_start all zeros, message_delta carrying
+  // input_tokens 17564 (which already INCLUDES the 17562 write) + the write.
+  const u = usageOf(await runAnthropicBridge([
+    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"OK"}}\n\n',
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":17564,"output_tokens":4,"cache_creation_input_tokens":17562}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+  ]));
+  assert.ok(u, "no usage in the completed event");
+  assert.strictEqual(u.input_tokens, 17564, "late input_tokens was dropped");
+  assert.strictEqual(u.input_tokens_details?.cache_write_tokens, 17562, "cache write was dropped");
+  assert.ok(!u.input_tokens_details?.cached_tokens, "a write must not be booked as a read");
+});
+
+check("anthropic bridge: cache_read on message_delta becomes cached_tokens", async () => {
+  const u = usageOf(await runAnthropicBridge([
+    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}\n\n',
+    'event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":{"input_tokens":17564,"output_tokens":4,"cache_read_input_tokens":17562}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+  ]));
+  assert.strictEqual(u.input_tokens_details?.cached_tokens, 17562);
+  assert.ok(!u.input_tokens_details?.cache_write_tokens, "a read must not be booked as a write");
+});
+
+check("anthropic bridge: a delta without cache fields cannot reset what start learned", async () => {
+  const u = usageOf(await runAnthropicBridge([
+    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":900,"output_tokens":0,"cache_read_input_tokens":800}}}\n\n',
+    'event: message_delta\ndata: {"type":"message_delta","delta":{},"usage":{"output_tokens":7}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+  ]));
+  assert.strictEqual(u.input_tokens, 900, "input_tokens was reset by a cacheless delta");
+  assert.strictEqual(u.input_tokens_details?.cached_tokens, 800, "cache read was reset by a cacheless delta");
+});
+
 // --- return direction: upstream calls the flattened name -> Codex gets name+namespace
 const CHAT_CALL_CHUNKS = [
   'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"multi_agent_v1__spawn_agent","arguments":""}}]}}]}\n\n',

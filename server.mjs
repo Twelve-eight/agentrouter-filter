@@ -1261,6 +1261,7 @@ const server = http.createServer(async (req, res) => {
         output_tokens: u?.output_tokens ?? 0,
         reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
         cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
+        cache_write_tokens: u?.input_tokens_details?.cache_write_tokens ?? 0,
       });
     }, isGuardToolName, toolMap);
     return;
@@ -1386,6 +1387,7 @@ const server = http.createServer(async (req, res) => {
         output_tokens: u?.output_tokens ?? 0,
         reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
         cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
+        cache_write_tokens: u?.input_tokens_details?.cache_write_tokens ?? 0,
       });
     }, isGuardToolName, toolMap);
     return;
@@ -1552,6 +1554,7 @@ const server = http.createServer(async (req, res) => {
         output_tokens: u?.output_tokens ?? 0,
         reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
         cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
+        cache_write_tokens: u?.input_tokens_details?.cache_write_tokens ?? 0,
       });
     });
     return;
@@ -1599,6 +1602,7 @@ const server = http.createServer(async (req, res) => {
       output_tokens: captured?.output_tokens ?? 0,
       reasoning_tokens: captured?.output_tokens_details?.reasoning_tokens ?? 0,
       cached_tokens: captured?.input_tokens_details?.cached_tokens ?? 0,
+      cache_write_tokens: captured?.input_tokens_details?.cache_write_tokens ?? 0,
     });
   };
   const disarmStreamIdle = armBodyIdleTimeout(upstream, () => {

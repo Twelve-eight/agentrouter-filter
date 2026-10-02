@@ -742,6 +742,24 @@ function bridgeChatStream(upstream, res, model, effort, stream = true, onUsage =
         u.output_tokens_details = u.output_tokens_details ?? {};
         u.output_tokens_details.reasoning_tokens = j.usage.completion_thinking_tokens;
       }
+      // PROMPT-side cache counters, which the responses wire expresses as
+      // input_tokens_details.cached_tokens. This block was missing entirely:
+      // wb2api reports the cache on prompt_tokens_details.cached_tokens (and
+      // mirrors it in prompt_cache_hit_tokens) in BOTH streaming and
+      // non-streaming mode - measured 2026-10-03, 3840 of 4038 prompt tokens
+      // cached on the second call - but the bridge only read
+      // completion_tokens_details, so every wb2api row was booked with
+      // cached_tokens:0 and the cached share was charged at the full input
+      // rate. usage.mjs already consumes input_tokens_details.
+      const pd = j.usage.prompt_tokens_details;
+      const cached =
+        (pd && typeof pd === "object" ? pd.cached_tokens : undefined) ??
+        j.usage.cached_tokens ??
+        j.usage.prompt_cache_hit_tokens ??
+        j.usage.cache_read_input_tokens;
+      if (typeof cached === "number" && cached > 0) {
+        u.input_tokens_details = { cached_tokens: cached };
+      }
       em.setUsage(u);
     }
     const choice = j.choices?.[0];
@@ -815,14 +833,24 @@ function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = nu
   const em = createResponsesEmitter({ res, model, stream, onUsage, toolGuard, toolMap });
   let buf = "";
   let inputTokens = 0;
-  let cachedTokens = 0;
+  // Cache READ and cache WRITE are separate buckets: the responses wire has
+  // cached_tokens (billed at the read rate) and cache_write_tokens (billed at
+  // the write rate, ~10x the read rate). Summing them - which this bridge used
+  // to do - silently bills every write at the read rate. The two are never
+  // both non-zero in one turn: a prompt is either written to the cache or read
+  // from it.
+  let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
   let outputTokens = 0;
   const applyUsage = () => {
+    const details = {};
+    if (cacheReadTokens) details.cached_tokens = cacheReadTokens;
+    if (cacheWriteTokens) details.cache_write_tokens = cacheWriteTokens;
     em.setUsage({
       input_tokens: inputTokens,
       output_tokens: outputTokens,
       total_tokens: inputTokens + outputTokens,
-      ...(cachedTokens ? { input_tokens_details: { cached_tokens: cachedTokens } } : {}),
+      ...(Object.keys(details).length ? { input_tokens_details: details } : {}),
     });
   };
   upstream.on("data", (chunk) => {
@@ -844,7 +872,8 @@ function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = nu
         case "message_start": {
           const u = j.message?.usage ?? {};
           inputTokens = u.input_tokens ?? 0;
-          cachedTokens = (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+          cacheReadTokens = u.cache_read_input_tokens ?? 0;
+          cacheWriteTokens = u.cache_creation_input_tokens ?? 0;
           applyUsage();
           break;
         }
@@ -866,6 +895,30 @@ function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = nu
         }
         case "message_delta": {
           outputTokens = j.usage?.output_tokens ?? outputTokens;
+          // The cache counters can arrive HERE instead of on message_start.
+          // justwoker (and any Anthropic-compatible relay that reports late)
+          // sends the real input_tokens and cache_creation_input_tokens on
+          // message_delta while message_start carries zeros - measured
+          // 2026-10-03: message_start had input_tokens:0, message_delta had
+          // input_tokens:17564 + cache_creation_input_tokens:17562. Only
+          // output_tokens was read from this event, so both the input total
+          // and the cache write were booked as zero. Use ?? so a delta that
+          // omits a field cannot reset a value already learned, and max() so a
+          // relay that repeats an already-counted prefix cannot double it.
+          // NOTE: input_tokens ALREADY INCLUDES cache_creation on this wire -
+          // measured 2026-10-03: a 10367-token cache write reported
+          // input_tokens 10369 (10367 + the 2-token user turn). So the cache
+          // bucket must stay a SUBSET of input_tokens; adding it on top would
+          // bill the prompt twice.
+          const u = j.usage ?? {};
+          inputTokens = u.input_tokens ?? inputTokens;
+          const lateRead =
+            (u.cache_read_input_tokens ?? 0) +
+            (u.cached_tokens ?? 0) +
+            (u.prompt_cache_hit_tokens ?? 0);
+          const lateWrite = u.cache_creation_input_tokens ?? 0;
+          if (lateRead > cacheReadTokens) cacheReadTokens = lateRead;
+          if (lateWrite > cacheWriteTokens) cacheWriteTokens = lateWrite;
           applyUsage();
           break;
         }

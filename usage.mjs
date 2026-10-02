@@ -62,7 +62,15 @@ function record(row) {
       cost = priceFor(row.model, {
         input_tokens: row.input_tokens,
         output_tokens: row.output_tokens,
-        input_tokens_details: { cached_tokens: row.cached_tokens },
+        // Both cache buckets must be forwarded: cached_tokens is billed at
+        // the READ rate and cache_write_tokens at the WRITE rate (Anthropic
+        // models: 0.5 vs 6.25 per M on opus-4-8). Forwarding only the read
+        // bucket made every cache WRITE bill at the read rate - a 12.5x
+        // undercount on justwoker rows, which are ~70% cache writes.
+        input_tokens_details: {
+          cached_tokens: row.cached_tokens,
+          cache_write_tokens: row.cache_write_tokens,
+        },
       });
     } catch {
       /* pricing must never break accounting */

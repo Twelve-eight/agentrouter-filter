@@ -161,6 +161,52 @@ check("gpt-6.1-sol: every gateway spelling resolves to the same price", () => {
   if (new Set(totals.map((t) => String(t))).size !== 1) throw new Error(`spellings disagree: ${JSON.stringify(totals)}`);
 });
 
+// --- cache WRITE billing and the two input conventions (2026-10-03) ----------
+//
+// usage.mjs used to forward only cached_tokens, so every cache WRITE billed at
+// the read rate: 0.5/M instead of 6.25/M on opus-4-8 (12.5x undercount). It now
+// forwards cache_write_tokens too, and priceFor() subtracts both buckets from
+// the full-rate input.
+const opus = (inTok, cacheRead, cacheWrite) =>
+  priceFor("claude-opus-4-8", { input_tokens: inTok, output_tokens: 0, input_tokens_details: { cached_tokens: cacheRead, cache_write_tokens: cacheWrite } });
+
+check("cache write bills at the WRITE rate, not the read rate", () => {
+  // 17562 written tokens at $6.25/M = $0.1097625, plus the 2 uncached at $5/M.
+  const p = opus(17564, 0, 17562);
+  const expected = 17562 / 1e6 * 6.25 + 2 / 1e6 * 5;
+  if (Math.abs(p.total - expected) > 1e-9) throw new Error(`total ${p.total}, expected ${expected}`);
+});
+
+check("a write is never billed at the read rate", () => {
+  const p = opus(17564, 0, 17562);
+  const asRead = 17562 / 1e6 * 0.5;
+  if (Math.abs(p.cacheRead - 0) > 1e-12) throw new Error(`write leaked into cacheRead: ${p.cacheRead}`);
+  if (Math.abs(p.total - asRead) < 1e-6) throw new Error("write was billed at the read rate");
+});
+
+check("input_tokens INCLUDING the write must not double-charge the prompt", () => {
+  // Convention (a): input_tokens 17564 already contains the 17562 write.
+  const p = opus(17564, 0, 17562);
+  const doubleCharged = p.total + 17562 / 1e6 * 5;
+  if (p.total >= doubleCharged) throw new Error("sanity");
+  if (p.input > 2 / 1e6 * 5 + 1e-12) throw new Error(`uncached input part ${p.input} still includes the written tokens`);
+});
+
+check("convention (b) - cache NOT inside input_tokens - bills identically", () => {
+  // Same real turn, reported the strict Anthropic way: input_tokens holds only
+  // the 2 uncached tokens. The cache + write rates must not change, and the 2
+  // uncached tokens must still be billed.
+  const p = opus(2, 0, 17562);
+  const expected = 17562 / 1e6 * 6.25 + 2 / 1e6 * 5;
+  if (Math.abs(p.total - expected) > 1e-9) throw new Error(`total ${p.total}, expected ${expected}`);
+});
+
+check("cache read and write are mutually exclusive in the rate lines", () => {
+  const read = opus(17564, 17562, 0);
+  if (read.cacheWrite !== 0) throw new Error("read turn produced a write charge");
+  if (Math.abs(read.cacheRead - 17562 / 1e6 * 0.5) > 1e-9) throw new Error(`read line ${read.cacheRead}`);
+});
+
 // --- malformed historical values ---------------------------------------------
 
 check("a missing cost key (pre-pricing rows) is not priced", () => {
