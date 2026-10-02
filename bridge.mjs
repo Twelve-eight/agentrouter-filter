@@ -171,17 +171,34 @@ function toChatMessages(body, toolMap = null) {
     }
     const role = it.role ?? "user";
     const parts = Array.isArray(it.content) ? it.content : [{ type: "input_text", text: String(it.content ?? "") }];
-    const text = parts
-      .map((p) => {
-        if (typeof p === "string") return p;
-        if (p.type === "input_text" || p.type === "output_text" || p.type === "text") return p.text ?? "";
-        if (p.type === "input_image") return "";
-        return "";
-      })
-      .join("");
+    // Images are forwarded as chat/completions `image_url` parts instead of
+    // being dropped. Dropping them was invisible: the text beside the image
+    // still reached the model, so a screenshot question answered confidently
+    // about a picture the model never saw. Only user turns carry images; a
+    // system/developer turn keeps its text-only shape.
+    const chatParts = [];
+    for (const p of parts) {
+      if (typeof p === "string") { if (p) chatParts.push({ type: "text", text: p }); continue; }
+      if (p.type === "input_text" || p.type === "output_text" || p.type === "text") {
+        if (p.text) chatParts.push({ type: "text", text: p.text });
+        continue;
+      }
+      if (p.type === "input_image" && p.image_url) {
+        // Responses carries the detail level as a sibling field; chat/completions
+        // nests it inside image_url. "auto" is the documented default and is
+        // omitted so the upstream keeps its own default.
+        const url = { url: p.image_url };
+        if (p.detail === "low" || p.detail === "high") url.detail = p.detail;
+        chatParts.push({ type: "image_url", image_url: url });
+        continue;
+      }
+      // Unknown part types are still dropped, but the text ones above are not.
+    }
+    const text = chatParts.filter((p) => p.type === "text").map((p) => p.text).join("");
+    const images = chatParts.filter((p) => p.type === "image_url");
     if (role === "system" || role === "developer") sys.push(text);
     else {
-      const msg = { role, content: text };
+      const msg = { role, content: images.length ? chatParts : text };
       // Attach accumulated reasoning to the assistant turn it belongs to.
       if (role === "assistant" && pendingReasoning.length) {
         msg.reasoning_content = pendingReasoning.splice(0).join("\n\n");
@@ -319,14 +336,24 @@ function toAnthropicBody(body, model, toolMap = null) {
     }
     const role = it.role === "assistant" ? "assistant" : "user";
     const parts = Array.isArray(it.content) ? it.content : [{ type: "input_text", text: String(it.content ?? "") }];
-    const text = parts
-      .map((p) => {
-        if (typeof p === "string") return p;
-        if (p.type === "input_text" || p.type === "output_text" || p.type === "text") return p.text ?? "";
-        return "";
-      })
-      .join("");
-    if (text) pushBlocks(messages, role, [{ type: "text", text }]);
+    const blocks = [];
+    for (const p of parts) {
+      if (typeof p === "string") { if (p) blocks.push({ type: "text", text: p }); continue; }
+      if (p.type === "input_text" || p.type === "output_text" || p.type === "text") {
+        if (p.text) blocks.push({ type: "text", text: p.text });
+        continue;
+      }
+      if (p.type === "input_image" && p.image_url) {
+        // Anthropic wants the base64 payload WITHOUT the data: URL prefix, plus
+        // an explicit media type. A remote https image_url cannot be expressed
+        // in a base64 source block; those are dropped rather than forwarded as
+        // a malformed block.
+        const m = /^data:([^;,]+);base64,(.*)$/s.exec(p.image_url);
+        if (m) blocks.push({ type: "image", source: { type: "base64", media_type: m[1], data: m[2] } });
+        continue;
+      }
+    }
+    if (blocks.length) pushBlocks(messages, role, blocks);
   }
   // Anthropic requires a non-empty message list starting with `user`.
   if (!messages.length || messages[0].role !== "user") messages.unshift({ role: "user", content: [{ type: "text", text: "." }] });

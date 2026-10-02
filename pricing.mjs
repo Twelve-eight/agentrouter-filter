@@ -45,22 +45,35 @@ const VENDORS = new Set([
 // These are NOT guesses. Each entry records where the number came from so a
 // future reader can re-derive it instead of trusting it.
 //
-// gpt-6.1-sol: the upstream (ovo) bills per its own panel. One measured request
-//   - input 41863, output 100, cacheRead 40192, group multiplier 0.24x
-//   - was charged $0.00286, so the official (un-multiplied) total is $0.011917.
-//   Input $2/M and output $10/M are published by the operator; solving for the
-//   cache-read line gives $0.1885/M. Two candidate clean values bracket it:
-//     $0.19/M -> $0.011978 official -> $0.002875 charged  (off by $0.000015)
-//     $0.20/M -> $0.012380 official -> $0.002971 charged  (off by $0.000111)
-//   $0.19 reproduces the invoice to within the panel's own rounding, and it is
-//   NOT the sol-family convention ($0.4 cacheRead on a $4 input = 10%), so the
-//   observed number wins over the pattern. If a second invoice ever shows a
-//   clean $0.20/M, revisit this.
+// gpt-6.1-sol: the upstream (ovo) bills per its own panel. TWO measured
+// requests, both 0.24x group and both listing input $2/M / output $10/M:
+//   P1: input 41863, output 100, cacheRead 40192, charged $0.00286
+//       -> official total $0.011917 -> implied cacheRead  $0.18846/M
+//   P2: input 149785, output 419, cacheRead 145664, charged $0.009332
+//       -> official total $0.038883 -> implied cacheRead  $0.18159/M
+//   The two disagree by 3.8%, so the panel's own multi-stage rounding is wider
+//   than any single clean candidate: the sol-family convention from models.db
+//   ($0.2/M = 10% of a $0.4 input on gpt-5.6) misses BOTH invoices by more than
+//   $0.185 does. $0.185/M is the value that minimises the worst relative error
+//   across the two observations (+/-1.3%):
+//     P1 -> $0.002827 charged (actual $0.00286)
+//     P2 -> $0.009451 charged (actual $0.009332)
+//   The 口径 check lives in the previous commit: cached tokens are billed at the
+//   cache rate AND excluded from full-rate input; nothing else reproduces the
+//   panel. If a third invoice points at a cleaner value, revisit.
+//
+//   LONG CONTEXT: the operator doubles EVERY line once the input passes 248k
+//   tokens (measured on the same panel, 2026-10-03). The doubling is written out
+//   explicitly rather than derived, because priceFor() replaces the rate set
+//   wholesale.
 const MANUAL = {
   "gpt-6.1-sol": {
-    cost: { input: 2, output: 10, cacheRead: 0.19, cacheWrite: 2.5 },
-    provider: "ovo (operator invoice 2026-10-03)",
-    note: "cacheRead solved from a measured 0.24x invoice; see comment above",
+    cost: {
+      input: 2, output: 10, cacheRead: 0.185, cacheWrite: 2.5,
+      longContext: { inputThreshold: 248000, input: 4, output: 20, cacheRead: 0.37, cacheWrite: 5 },
+    },
+    provider: "ovo (operator invoices 2026-10-03)",
+    note: "cacheRead fitted to two 0.24x invoices; all rates double above 248k input",
   },
 };
 
@@ -175,13 +188,17 @@ function priceFor(model, usage, provider = null) {
   let c = hit.cost;
   let tier = "base";
   if (c.longContext && inTok > (c.longContext.inputThreshold ?? Infinity)) {
+    // Read the threshold BEFORE overwriting the rate set: the tier label used to
+    // be built from c.longContext after reassignment, so it always printed
+    // "long (?+ input)" instead of the real threshold.
+    const threshold = c.longContext.inputThreshold;
     c = {
       input: c.longContext.input,
       output: c.longContext.output,
       cacheRead: c.longContext.cacheRead,
       cacheWrite: c.longContext.cacheWrite,
     };
-    tier = `long (${c.longContext?.inputThreshold ?? "?"}+ input)`;
+    tier = `long (${threshold}+ input)`;
   }
 
   // Cached input is billed at the cache rate, so it must not also be charged at

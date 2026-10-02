@@ -2288,3 +2288,128 @@ ovoapi:6.1sol   $0.011978
 - 已有的历史行 `cost` 仍是 `null`（写入时就算好了），**不会追溯**。新请求才会带价。
 - 统计口径是**官方挂牌价**，不是 ovo 的折后实收 —— 与 `pricing.mjs` 既有的
   "vendor list price, not reseller charge" 约定一致。
+
+## 2026-10-03 (凌晨) 第二张 6.1sol 账单 + 248k 翻倍 + 图片输入打通
+
+两件事：① 用第二张实测账单收窄 `gpt-6.1-sol` 的缓存价，并把运营方新给的
+「context > 248k 全部计费翻倍」写进网关；② 让所有 deepseek-v4.1-flash 路由
+接受图片输入（Codex 的 catalog 之前把它们标成纯文本）。
+
+### 1) 第二张账单推翻了 $0.19，改用 $0.185
+
+用户给的第二笔（同为 0.24x 分组、同为输入 $2/M 输出 $10/M）:
+
+| | 输入 | 输出 | 缓存读取 | 实收 |
+|---|---|---|---|---|
+| P1 | 41,863 | 100 | 40,192 | $0.00286 |
+| P2 | 149,785 | 419 | 145,664 | $0.009332 |
+
+两笔各自反推缓存价：P1 -> $0.18846/M，P2 -> $0.18159/M，**互相差 3.8%**。
+这说明面板自身的多段四舍五入比任何单一「漂亮数字」都宽：
+
+| 候选 | P1 折后 | P2 折后 | 最差相对误差 |
+|---|---|---|---|
+| $0.18/M | $0.002778 | $0.009276 | 0.87% |
+| $0.1816/M | $0.002794 | $0.009332 | 0.71% |
+| **$0.185/M** | **$0.002827** | **$0.009451** | **1.28%** |
+| $0.1885/M | $0.002860 | $0.009574 | 2.59% |
+| $0.19/M | $0.002875 | $0.009626 | 3.15% |
+| $0.20/M | $0.002971 | $0.009976 | 6.90% |
+
+取 **$0.185/M**（P1 差 1.17%、P2 差 1.28%），并记录：sol 系列在 models.db 里的
+惯例是 $0.4 缓存 / $4 输入 = 10%（`gpt-5.6-sol`），即 $0.2/M —— 它比 $0.185
+**更差**（6.9%），所以「实测赢过模式」的结论这次更强，不再是 P1 单点的巧合。
+
+### 2) 248k 长上下文翻倍
+
+运营方口径：**输入超过 248k token 时所有费率 ×2**（用户实测，2026-10-03）。
+写进 `MANUAL['gpt-6.1-sol'].cost.longContext`：
+
+```
+inputThreshold: 248000
+input 2 -> 4 | output 10 -> 20 | cacheRead 0.185 -> 0.37 | cacheWrite 2.5 -> 5
+```
+
+阈值判定沿用既有 `priceFor()` 的**严格大于**（248000 仍按 base，248001 起翻倍），
+与用户「<240k 才安全」的设置不冲突。
+
+### 顺带修掉一个既有 bug：tier 标签永远是 `long (?+ input)`
+
+`priceFor()` 先用 `c.longContext.inputThreshold` 覆盖了 `c`，再回头读 `c.longContext`
+拼标签 —— 那时 `c` 已经是扁平费率对象，`c.longContext` 恒为 undefined。
+改成**覆盖前**取出 `threshold`，现在标签是 `long (248000+ input)`。
+这个 bug 对金额无影响，但统计页的长上下文分档一直无法区分。
+
+### 3) 所有 deepseek-v4.1-flash 路由现在接受图片
+
+**根因**: `tools/build-model-catalog.cjs:213` 无条件写死 `input_modalities: ['text']`，
+不是实测结果。Codex 靠这个字段决定能否收图，标成 text 后发图会被拦。
+
+**实测**（2026-10-03，1x1 红 PNG）:
+
+| 路由 | 直连 wb2api(7863) | 经网关(7878 /u) |
+|---|---|---|
+| `deepseek-v4.1-flash` | 200 Pink | 200 Pink |
+| `global:deepseek-v4.1-flash` | 200 Pink | 200 Pink |
+| `global:deepseek-v4.1-flash-sg` | 200 | 200 Pink |
+| `cn:deepseek-v4.1-flash` | 200 | 200 Pink |
+| `deepseek-v4-flash` | 200 Red | - |
+| `cn:deepseek-v4-flash` | 200 Maroon | - |
+
+六个 id 全部 200 且答对颜色 —— 图确实进了模型，不是被丢掉后猜的。
+
+### 4) 两个桥接器此前会**静默丢弃**图片（这是真正的功能缺口）
+
+即使 catalog 放行，`bridge.mjs` 也会把 `input_image` 部分丢掉：
+
+- `toChatMessages()`: `if (p.type === 'input_image') return ''` —— 图没了，
+  旁边的文字照常发出，于是模型对着一张没见过的图**自信作答**。静默失败最难查。
+- `toAnthropicBody()`: 连分支都没有，`input_image` 直接落进 `return ''`。
+
+**改法**:
+
+- chat 侧转成 `{type:'image_url', image_url:{url, detail?}}`；`detail` 从 responses 的
+  兄弟字段搬进 `image_url` 内部（chat 线格式），`auto` 不写以保留上游默认。
+- anthropic 侧转成 `{type:'image', source:{type:'base64', media_type, data}}`，
+  **剥掉 `data:...;base64,` 前缀**；非 data: 的远程 URL 没有 base64 source 形态，
+  选择丢弃而不是伪造畸形块。
+- 纯文字轮次仍走 `content: "..."` 字符串（不发 parts 数组），保持既有形状不变；
+  system/developer 轮次永远只取文字，不夹带 base64。
+
+### 5) catalog 改为按 slug 可配视觉能力
+
+`entry()` 增加 `modalities` 参数，新增 `VISION_SLUGS` 表（只有实测过的 id 才进），
+默认仍是 `['text']` —— 误标 image 会让 picker 放出上游拒绝的图，
+而误标 text 是**静默丢图**（旧 bug），后者更糟。
+
+重建后 catalog: 6 个 deepseek 条目变 `['text','image']`，支持图片的条目共 13 个。
+
+### 验证
+
+**隔离实例 7879（真实上游，未碰线上 7878）**:
+用 Codex 的 responses 形状（`input_image` + `input_text`）打 `/u/v1/responses`：
+
+```
+deepseek-v4.1-flash            -> 200 Pink
+global:deepseek-v4.1-flash     -> 200 Pink
+cn:deepseek-v4.1-flash         -> 200 Pink
+global:deepseek-v4.1-flash-sg  -> 200 Pink
+```
+
+注：`cn:` 第一次报 502 是**我给 max_output_tokens=64 太小**，推理就吃光了额度、
+正文为空，桥接按失败收尾；放宽到 800 后 200 Pink。不是路由问题。
+
+**门禁**: `check-syntax` ok（含 collapsed-spread sweep）/ `diff-test` 45 样本 + 1 树,
+**0 mismatches** / 12 个测试文件全绿；`test-bridge-request` 由 32 增至 **38 checks**
+（新增 6 条图片断言）/ `test-usage-pricing` 新增 5 条 sol 计价断言（两笔账单、
+缓存不重复计费、248k 边界、五种拼写一致）。
+
+### 诚实边界
+
+- `$0.185/M` 是**拟合值**，不是运营方公布的价目。两笔账单只能把它夹到 ±1.3%，
+  第三笔账单若指向别的数就回来改。
+- 248k 翻倍是**用户口述的运营方口径**，没有拿到面板页面的独立证据；
+  边界（严格大于 248000）也是按现有代码语义定的，未逐 token 探测。
+- 视觉能力只实测了上面 6 个 id；`cn:deepseek-v4-pro`、`cn:glm-5.3`、`cn:minimax-m3`
+  等同在 wb2api 上的条目**没有**测，仍标 text。
+- 图片是**经 chat 桥**转发的，上游 wb2api 若对 base64 体积有限制，未做压力测试。

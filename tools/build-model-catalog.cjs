@@ -179,7 +179,7 @@ function routeMarker(slug, spec) {
   return PROVIDER_ABBR[spec?.p] ?? spec?.p ?? '?';
 }
 
-function entry(slug, display, description, efforts, contextWindow) {
+function entry(slug, display, description, efforts, contextWindow, modalities = ["text"]) {
   return {
     slug,
     display_name: display,
@@ -210,10 +210,32 @@ function entry(slug, display, description, efforts, contextWindow) {
     max_context_window: contextWindow,
     effective_context_window_percent: 95,
     experimental_supported_tools: [],
-    input_modalities: ['text'],
+    input_modalities: modalities,
     supports_search_tool: false,
   };
 }
+
+// Models that accept IMAGE input, measured through the gateway - not inferred from
+// the model family and not copied from a vendor page.
+//
+// Why this table exists: `input_modalities` was hardcoded to ['text'] for every
+// entry, so Codex believed no routed model could read a picture and refused to
+// attach one. The DeepSeek flash routes do accept images - verified 2026-10-03 by
+// POSTing a 1x1 PNG through the live gateway (port 7878, /u/v1/chat/completions)
+// and through wb2api directly (7863): all six ids below answered 200 and named the
+// colour, so the picture reached the model rather than being dropped.
+//
+// Add an id here only after that probe. A wrong "image" claim makes the picker
+// offer a picture the upstream will reject; a wrong "text" claim silently strips
+// the image (the old bug), which is worse because it fails without an error.
+const VISION_SLUGS = new Set([
+  'deepseek-v4.1-flash',
+  'global:deepseek-v4.1-flash',
+  'global:deepseek-v4.1-flash-sg',
+  'cn:deepseek-v4.1-flash',
+  'deepseek-v4-flash',
+  'cn:deepseek-v4-flash',
+]);
 
 // The model list comes from providers.json - the same file the gateway routes on.
 // Hand-maintaining a second list here is how the picker and the gateway would
@@ -318,6 +340,7 @@ const ours = Object.entries(REGISTRY.models)
       `${upstream} served by ${prov} through the local gateway`,
       clampWindow(slug) ?? EFF[slug] ?? EFFORTS_DEFAULT,
       CTX[slug] ?? CTX_YML[spec.m ?? slug] ?? CTX_YML[slug] ?? CTX_PREV[slug] ?? CTX_DEFAULT,
+      VISION_SLUGS.has(slug) ? ['text', 'image'] : ['text'],
     );
   })
   // The registry also lists codex's built-in slugs (the gateway must route them),

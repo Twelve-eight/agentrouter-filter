@@ -15,6 +15,7 @@
 //
 // Run: node tools/test-usage-pricing.mjs   (exits non-zero on failure)
 import { summarize, costOf } from "../usage.mjs";
+import { priceFor } from "../pricing.mjs";
 
 let failed = 0;
 
@@ -109,6 +110,55 @@ check("all-unpriced rows: cost_usd 0 AND priced_requests 0", () => {
 check("empty row set: cost_usd 0, priced_requests 0", () => {
   const t = totalsOf([]);
   if (t.cost_usd !== 0 || t.priced_requests !== 0) throw new Error(JSON.stringify(t));
+});
+
+// --- the two ovo invoices that pin gpt-6.1-sol rates (2026-10-03) -------------
+//
+// Neither invoice required a new rate formula; they pin the cache-read value and
+// the 248k long-context doubling. Historical rows keep cost:null (pricing runs at
+// write time), so these must be asserted against priceFor directly.
+const solPrice = (inTok, outTok, cacheRead) =>
+  priceFor("gpt-6.1-sol", { input_tokens: inTok, output_tokens: outTok, input_tokens_details: { cached_tokens: cacheRead } });
+
+check("gpt-6.1-sol P1: reproduces the 0.00286 invoice within 2%", () => {
+  const p = solPrice(41863, 100, 40192);
+  if (!p) throw new Error("gpt-6.1-sol is unpriced - the MANUAL entry vanished");
+  const charged = p.total * 0.24;
+  const rel = Math.abs(charged - 0.00286) / 0.00286;
+  if (rel > 0.02) throw new Error(`charged ${charged.toFixed(6)}, invoice $0.00286 (${(rel * 100).toFixed(2)}% off)`);
+});
+
+check("gpt-6.1-sol P2: reproduces the 0.009332 invoice within 2%", () => {
+  const p = solPrice(149785, 419, 145664);
+  if (!p) throw new Error("gpt-6.1-sol is unpriced");
+  const charged = p.total * 0.24;
+  const rel = Math.abs(charged - 0.009332) / 0.009332;
+  if (rel > 0.02) throw new Error(`charged ${charged.toFixed(6)}, invoice $0.009332 (${(rel * 100).toFixed(2)}% off)`);
+});
+
+check("gpt-6.1-sol: cached tokens are NOT also charged at the full input rate", () => {
+  // 200k cached tokens at $0.185/M. Double billing would add 200k at $2/M.
+  const p = solPrice(200000, 0, 200000);
+  if (Math.abs(p.total - 0.037) > 1e-9) throw new Error(`total ${p.total}, expected $0.037 (double billing?)`);
+});
+
+check("gpt-6.1-sol: rates double ONCE past 248k input, at the boundary", () => {
+  const at = solPrice(248000, 0, 0);
+  const over = solPrice(248001, 0, 0);
+  if (at.tier !== "base") throw new Error(`248000 must stay base, got ${at.tier}`);
+  if (over.tier !== "long (248000+ input)") throw new Error(`unexpected tier label: ${over.tier}`);
+  // Compare RATES, not totals: 248001 tokens cost one token more than 248000 even
+  // at an unchanged rate. The long tier is $4/M against the base $2/M, i.e. x2.
+  const baseRate = at.total / 248000 * 1e6;
+  const longRate = over.total / 248001 * 1e6;
+  if (Math.abs(baseRate - 2) > 1e-9) throw new Error(`base input rate ${baseRate}/M, expected $2/M`);
+  if (Math.abs(longRate - 4) > 1e-9) throw new Error(`long input rate ${longRate}/M, expected $4/M (x2)`);
+});
+
+check("gpt-6.1-sol: every gateway spelling resolves to the same price", () => {
+  const ids = ["gpt-6.1-sol", "rc:6.1sol", "rc65:6.1sol", "ovoapi:6.1sol", "6.1sol"];
+  const totals = ids.map((id) => priceFor(id, { input_tokens: 41863, output_tokens: 100, input_tokens_details: { cached_tokens: 40192 } })?.total);
+  if (new Set(totals.map((t) => String(t))).size !== 1) throw new Error(`spellings disagree: ${JSON.stringify(totals)}`);
 });
 
 // --- malformed historical values ---------------------------------------------

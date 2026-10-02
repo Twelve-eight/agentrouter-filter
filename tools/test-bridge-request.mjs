@@ -473,6 +473,73 @@ check("namespace: anthropic history replay rebuilds the wire name", () => {
   assert.strictEqual(use.name, "multi_agent_v1__close_agent");
 });
 
+// --- images must survive the bridge (2026-10-03) ------------------------------
+//
+// Both converters used to drop `input_image` parts entirely. The failure was
+// silent: the text next to the picture still reached the model, so a screenshot
+// question got a confident answer about a picture the model never saw.
+const IMG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const imgBody = (content) => ({ input: [{ type: "message", role: "user", content }] });
+
+check("chat bridge: input_image becomes an image_url part, text kept", () => {
+  const msgs = toChatMessages(imgBody([
+    { type: "input_image", image_url: IMG, detail: "high" },
+    { type: "input_text", text: "what colour" },
+  ]));
+  const user = msgs.find((m) => m.role === "user");
+  assert.ok(Array.isArray(user.content), "a turn with an image must use the parts form");
+  const img = user.content.find((p) => p.type === "image_url");
+  assert.ok(img, "image part missing - it was dropped again");
+  assert.strictEqual(img.image_url.url, IMG);
+  assert.strictEqual(img.image_url.detail, "high", "detail rides inside image_url on the chat wire");
+  assert.strictEqual(user.content.find((p) => p.type === "text").text, "what colour");
+});
+
+check("chat bridge: an image-only turn still reaches the upstream", () => {
+  const msgs = toChatMessages(imgBody([{ type: "input_image", image_url: IMG }]));
+  const user = msgs.find((m) => m.role === "user");
+  assert.ok(Array.isArray(user.content) && user.content[0].type === "image_url");
+});
+
+check("chat bridge: text-only turns keep the plain-string shape (no regression)", () => {
+  const msgs = toChatMessages(imgBody([{ type: "input_text", text: "hi" }]));
+  assert.strictEqual(msgs.find((m) => m.role === "user").content, "hi");
+});
+
+check("anthropic bridge: input_image becomes a base64 image block", () => {
+  const out = toAnthropicBody({ model: "m", ...imgBody([
+    { type: "input_image", image_url: IMG },
+    { type: "input_text", text: "what colour" },
+  ]) }, "m");
+  const blocks = out.messages[0].content;
+  const img = blocks.find((b) => b.type === "image");
+  assert.ok(img, "anthropic image block missing");
+  assert.strictEqual(img.source.type, "base64");
+  assert.strictEqual(img.source.media_type, "image/png");
+  assert.strictEqual(img.source.data, IMG.slice(IMG.indexOf(",") + 1), "data: prefix must be stripped");
+  assert.strictEqual(blocks.find((b) => b.type === "text").text, "what colour");
+});
+
+check("anthropic bridge: a remote https image is dropped, not malformed", () => {
+  const out = toAnthropicBody({ model: "m", ...imgBody([
+    { type: "input_image", image_url: "https://example.invalid/x.png" },
+    { type: "input_text", text: "hi" },
+  ]) }, "m");
+  const blocks = out.messages[0].content;
+  assert.ok(!blocks.some((b) => b.type === "image"), "a non-data URL has no base64 source block");
+  assert.strictEqual(blocks.find((b) => b.type === "text").text, "hi");
+});
+
+check("system turns stay text-only even with an image present", () => {
+  const msgs = toChatMessages({ input: [
+    { type: "message", role: "developer", content: [{ type: "input_text", text: "rules" }, { type: "input_image", image_url: IMG }] },
+    { type: "message", role: "user", content: [{ type: "input_text", text: "go" }] },
+  ] });
+  const sys = msgs.find((m) => m.role === "system");
+  assert.strictEqual(typeof sys.content, "string");
+  assert.ok(!sys.content.includes("base64"));
+});
+
 // --- return direction: upstream calls the flattened name -> Codex gets name+namespace
 const CHAT_CALL_CHUNKS = [
   'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"multi_agent_v1__spawn_agent","arguments":""}}]}}]}\n\n',
