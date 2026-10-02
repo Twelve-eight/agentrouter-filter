@@ -2171,3 +2171,43 @@ gpt-5.2                levels=[low,medium,high,xhigh,max]   default=max
 ### 生效条件
 
 **需重启 Codex** —— catalog 在会话启动时读取，当前进程仍持旧目录。
+## 2026-10-03: ovo 换域名了 —— 网关还指着旧地址，6.1sol 卡死一个多小时
+
+用户报: 「其它 codex 会话里的 6.1sol(ovo) 在一个多小时前就不动了。」
+
+### 根因: 上游换了 API 域名
+
+`providers.json` 里 ovoapi 的 `base` 是 `https://api-console.182yc.xyz`（那是运营方
+`/api/status` 当初公布的地址）。实测它已经**不再响应**:
+
+| 目标 | TCP 443 | /v1/models | /v1/responses |
+|---|---|---|---|
+| `api-console.182yc.xyz` | **通** | `UND_ERR_CONNECT_TIMEOUT` 10.7s | 挂到 60s 超时中止 |
+| `ovoapi.site` | 通 | **200 / 0.9s, 6 个模型** | **200 / 1.8s** |
+
+关键点: **TCP 能握手、TLS/HTTP 层不回** —— 所以表现不是"连不上"，而是"请求发出去石沉大海"。
+Codex 那边没有超时错误、只有一直等，正好对上"一个多小时不动"。同一个 key 在 `ovoapi.site`
+上 0.9s 就返回，所以**不是 key 失效、不是模型下架、不是限流**，纯粹是域名迁移。
+
+### 修复
+
+`providers.json` -> `providers.ovoapi.base`: `https://api-console.182yc.xyz` -> `https://ovoapi.site`。
+providers.json 是**按请求读**的（mtime 缓存），所以无需重启网关即生效。
+
+### 验证（经线上网关 7878，不是直连）
+
+```
+ovoapi:6.1sol          200 2.4s
+ovoapi:6sol            200 1.9s
+ovoapi:6astra          200 3.8s
+ovoapi:5.6terra        200 3.5s
+ovoapi:gpt-5.6-sol     200 2.3s
+```
+
+五个路由全部恢复。`_comment` 里已写明这次的症状与"复发时先探 ovoapi.site"，
+并纠正了原先"两个域名都可用、选 console 是因为运营方公布它"的记述 —— 那个前提已经不成立。
+
+### 遗留
+
+- 旧域名何时恢复未知，也不重要: `ovoapi.site` 是公开域名，本次故障中它是活的。
+- 若再次出现"请求不返回也不报错"，先按本条的形态查 base 域名，而不是查 key/模型。
