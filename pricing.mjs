@@ -40,6 +40,30 @@ const VENDORS = new Set([
   "qwen",
 ]);
 
+// Models missing from models.db, priced by hand from the operator's own invoice.
+//
+// These are NOT guesses. Each entry records where the number came from so a
+// future reader can re-derive it instead of trusting it.
+//
+// gpt-6.1-sol: the upstream (ovo) bills per its own panel. One measured request
+//   - input 41863, output 100, cacheRead 40192, group multiplier 0.24x
+//   - was charged $0.00286, so the official (un-multiplied) total is $0.011917.
+//   Input $2/M and output $10/M are published by the operator; solving for the
+//   cache-read line gives $0.1885/M. Two candidate clean values bracket it:
+//     $0.19/M -> $0.011978 official -> $0.002875 charged  (off by $0.000015)
+//     $0.20/M -> $0.012380 official -> $0.002971 charged  (off by $0.000111)
+//   $0.19 reproduces the invoice to within the panel's own rounding, and it is
+//   NOT the sol-family convention ($0.4 cacheRead on a $4 input = 10%), so the
+//   observed number wins over the pattern. If a second invoice ever shows a
+//   clean $0.20/M, revisit this.
+const MANUAL = {
+  "gpt-6.1-sol": {
+    cost: { input: 2, output: 10, cacheRead: 0.19, cacheWrite: 2.5 },
+    provider: "ovo (operator invoice 2026-10-03)",
+    note: "cacheRead solved from a measured 0.24x invoice; see comment above",
+  },
+};
+
 let INDEX = null;
 let LOADED_FROM = null;
 
@@ -73,7 +97,15 @@ function load() {
       }
     }
     db.close();
-    LOADED_FROM = `${n} priced models from ${DB}`;
+    // Hand-priced entries win over models.db: they exist precisely because the
+    // DB has no row for that id, and if it ever gains one we still trust the
+    // invoice-derived number until someone re-derives it.
+    let m = 0;
+    for (const [id, entry] of Object.entries(MANUAL)) {
+      INDEX.set(id, { cost: entry.cost, provider: entry.provider, vendor: false, manual: true });
+      m++;
+    }
+    LOADED_FROM = `${n} priced models from ${DB}, ${m} hand-priced`;
   } catch (e) {
     LOADED_FROM = `read failed: ${e?.message ?? e}`;
   }
@@ -95,6 +127,14 @@ const ALIAS = {
   "cn:deepseek-v4-flash": "deepseek-v4-flash",
   "deepseek-v4-pro": "deepseek-v4-pro",
   "cn:deepseek-v4-pro": "deepseek-v4-pro",
+  // Gateway-namespaced spellings of gpt-6.1-sol. The gateway records the CLIENT's
+  // model string, and clients pick from the catalog where these appear as
+  // rc:6.1sol / rc65:6.1sol / ovoapi:6.1sol. Stripping the prefix alone yields
+  // "6.1sol", which matches nothing, so each needs an explicit alias.
+  "rc:6.1sol": "gpt-6.1-sol",
+  "rc65:6.1sol": "gpt-6.1-sol",
+  "ovoapi:6.1sol": "gpt-6.1-sol",
+  "6.1sol": "gpt-6.1-sol",
 };
 
 /** Strip a routing namespace so `global:gpt-5.6-sol` can match `gpt-5.6-sol`. */
