@@ -27,3 +27,19 @@
 ## 测试账本隔离补充
 
 AR_USAGE_DIR 可显式覆写 usage 目录, 未设置时默认目录不变. 导入真实 server 的测试必须先设置独占项目 .tmp 目录, 不使用生产账本作为测试输出. 仅确认写入风险, 尚未证明历史账本污染, 不清洗或截断已有账本.
+
+## 2026-10-03 wb2api 不可用池的跨域降级契约（本轮）
+
+### 故障
+`global:deepseek-v4.1-flash` 的 global 请求在上游 429/503 后会进入 CN fallback；但如果 CN 对同一 bare model 也处于 6004 cooldown，旧实现仍然把请求发到 CN。两边都返回 `no_healthy_account` 时，客户端只能收到没有明确重试建议的错误；Codex 可能保持“思考中”而没有可见的重连进度。
+
+### 不变量
+- 只有在观察到 global 的实际 429/503 后才允许考虑 fallback；健康探针不能单独触发降级。
+- fallback 目标必须先通过同一个 wb2api `/status` 证明该 realm 和 bare model 当前可选；CN 不可用时绝不发送 CN 请求。
+- global 瞬时失败但 `/status` 仍显示 global 可选时，不得把请求转给 CN；返回有界、可重试的 503。
+- wb2api 的池耗尽错误向 Codex 暴露 `503 + error.code=server_is_overloaded + Retry-After`，使 Codex 的 Responses 重试逻辑获得明确的重试时刻；`Retry-After` 只给短探测间隔，真实恢复时间放在 `X-Gateway-Retry-At`。
+- 进入 fallback 后，如果 global 与 CN 都不可用，快速返回同样的可重试 503，不等待上游连接或保持假流。
+- 所有其它 provider 的既有重试和响应形状保持不变。
+
+### 验证
+隔离测试必须覆盖：global exhausted + CN unavailable 不发 CN；fallback 窗口内 CN 失效不发 CN；CN 恢复后才发 CN；wb2api 503/429 带 `Retry-After`，且既有 global->cn 正常路径继续通过。

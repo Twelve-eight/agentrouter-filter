@@ -2531,3 +2531,47 @@ justwoker 那 2,397 行同理：写入被按读取价计，**低估**约 12.5 �
 改 `server.mjs` 时写了一个 `while (s.includes(old)) s = s.replace(old, new)` 循环，
 而 `new` **包含** `old`，导致死循环（100% CPU 直到被杀）。因为杀得及时，那次**没有写盘**，
 文件未被污染；随后改用 `split/join` 一次完成。教训：替换串包含搜索串时，永远不要用循环替换。
+
+
+## 2026-10-03（续）跨域降级误发 CN 与 Codex 假死修复
+
+### 已确认问题
+
+`global:deepseek-v4.1-flash` 的 global 请求在 wb2api 返回 429/503 后，旧网关会进入 CN fallback，但只检查 global 的恢复状态，不检查 CN 对同一 bare model 是否仍可选。于是 CN 也在 6004 cooldown 时，网关仍会发出 CN 请求，得到 `no_healthy_account`；该 503 没有 `Retry-After` 和 Codex 可识别的 `error.code=server_is_overloaded`，Codex UI 可能一直显示“正在思考”，实际请求已经终止。
+
+### 本轮实现
+
+- `requestWithRetry()` 增加可选 `retryStatuses`；只有 wb2api chat bridge 启用 `[429, 503]`，其它 provider 的默认策略仍是 429-only。
+- 泛化 `/status` 与 `/healthz` 的 realm 检查，分别检查 global/CN 和 bare model。
+- 进入 fallback 后同时检查两个 realm；CN 只有在 `/status` 明确显示有可选账号时才允许发送。CN 不可用、状态未知或探针超时时，网关不发 CN，直接返回有界 503。
+- global 瞬时失败但 `/status` 仍显示 global 可选时，不消耗 CN，直接返回可重试 503。
+- wb2api 的终端 503 规范化为 `error.code=server_is_overloaded`、`type=api_error`，并补 `Retry-After: 5`；已知恢复时刻通过 `X-Gateway-Retry-At`，realm 来源通过 `X-Gateway-Realm-Source`。
+- `tools/test-realm-fallback.mjs` 增加 CN 不可用、窗口内 CN 失效、CN 恢复、未知探针 fail-closed、503 重试和探针超时取消测试。
+
+### 中央验证
+
+以下命令均已在隔离测试中通过：
+
+```text
+node tools/check-syntax.mjs
+node tools/test-realm-fallback.mjs
+node tools/test-bridge-request.mjs
+node tools/test-bridge-indices.mjs
+node tools/test-usage-pricing.mjs
+node tools/diff-test.mjs
+git diff --check
+```
+
+`test-realm-fallback.mjs` 使用桩 HTTP/HTTPS，不绑定端口、不访问真实上游；所有测试账本写入项目 `.tmp` 独占目录。尚未重启线上网关，也未把本轮代码称为线上实机验证。
+
+### 恢复说明
+
+改动落在 `server.mjs`，需要用户在没有活跃会话时重启网关后才会加载；Codex 会话本身不需要重启。重启前，线上 PID 仍运行旧逻辑。重启后应重点观察：
+
+```text
+bridge ... model=global:deepseek-v4.1-flash
+!! cross-realm: ... target=...
+Retry-After: 5
+```
+
+本轮没有自动重启网关。

@@ -438,22 +438,23 @@ function request(url, { method, headers, body, proxy }) {
 }
 
 // ---------------------------------------------------------------------------
-// 429 retry
+// bounded upstream retry + client retry signal
 // ---------------------------------------------------------------------------
 //
 // wb2api answers 429 when the account its pool picked cannot serve the request
-// (the pool holds several accounts and picks again on the next attempt). A 429
-// that reaches Codex aborts the whole turn, so a transient account exhaustion
-// used to kill a live session. Retrying here keeps that from happening.
+// (the pool holds several accounts and picks again on the next attempt). It can
+// also answer 503 when no account is selectable at all. A terminal error that
+// reaches Codex without Retry-After can leave the UI looking like it is still
+// thinking, so the gateway both retries the wb2api chat hop and emits a short
+// retry signal on the terminal response.
 //
-// Only 429 is retried. A 400/401/403/404/422 describes the request itself and
-// would fail identically on a replay; 5xx is deliberately left alone so a
-// genuinely broken upstream stays visible instead of being hidden behind three
-// silent retries. The backoff is bounded (<= ~3s by default) so a real outage
-// still fails fast enough for the client to react.
+// The default remains 429-only for native/passthrough routes. The wb2api chat
+// bridge opts into [429, 503] explicitly; other chat providers keep their old
+// behaviour and do not acquire a hidden fallback retry policy.
 const RETRY_STATUS = 429;
 const RETRY_MAX = 3; // extra attempts after the first
 const RETRY_BASE_MS = 400;
+const RETRY_SIGNAL_MS = Number(process.env.AR_RETRY_SIGNAL_MS ?? 5_000);
 
 function retryAfterMs(res, attempt) {
   const raw = res?.headers?.["retry-after"];
@@ -466,14 +467,15 @@ function retryAfterMs(res, attempt) {
 
 async function requestWithRetry(url, opts, label) {
   const retry = opts.retry !== false;
+  const retryStatuses = Array.isArray(opts.retryStatuses) ? opts.retryStatuses : [RETRY_STATUS];
   let res;
   for (let attempt = 0; ; attempt++) {
     res = await request(url, opts);
-    if (res.statusCode !== RETRY_STATUS || !retry || attempt >= RETRY_MAX) return res;
+    if (!retryStatuses.includes(res.statusCode) || !retry || attempt >= RETRY_MAX) return res;
     const wait = retryAfterMs(res, attempt);
     // Drain the discarded attempt; an unconsumed response keeps its socket open.
     res.resume();
-    log(`!! ${label} answered 429; retrying (${attempt + 1}/${RETRY_MAX}) in ${wait}ms`);
+    log(`!! ${label} answered ${res.statusCode}; retrying (${attempt + 1}/${RETRY_MAX}) in ${wait}ms`);
     await new Promise((r) => setTimeout(r, wait));
   }
 }
@@ -754,9 +756,9 @@ async function fetchHealth(route) {
  * human re-login, so counting them would produce a recovery time that never
  * arrives.
  */
-function globalRealmState(status, bareModel) {
+function realmState(status, bareModel, realm) {
   const accounts = Array.isArray(status?.accounts)
-    ? status.accounts.filter((a) => a && a.realm === "global")
+    ? status.accounts.filter((a) => a && a.realm === realm)
     : null;
   if (!accounts) return null;
   if (!accounts.length) return { ok: false, at: null, source: "no-account" };
@@ -801,58 +803,131 @@ function globalRealmState(status, bareModel) {
   return { ok: false, at: minAt, source: minLevel === "model" ? "status-model" : "status-account" };
 }
 
+function globalRealmState(status, bareModel) {
+  return realmState(status, bareModel, "global");
+}
+
 /**
- * Combined check used both to arm and to leave the fallback window.
- * Prefers /status (per-model, absolute times); falls back to /healthz, which
- * only answers "is any account of that realm selectable at all".
+ * Can any account in `realm` serve `bareModel` right now, and if not, when is
+ * the earliest one expected back? The status endpoint is per-account and per-
+ * model; healthz is only a boolean fallback when status cannot be read.
  */
-async function globalAvailability(route, bareModel) {
+async function realmAvailability(route, bareModel, realm) {
   const status = await fetchStatus(route);
   if (status) {
-    const st = globalRealmState(status, bareModel);
+    const st = realmState(status, bareModel, realm);
     if (st) return st;
   }
   const health = await fetchHealth(route);
-  if (typeof health?.realm_servable?.global === "boolean") {
-    const ok = health.realm_servable.global === true;
-    return { ok, at: null, source: ok ? "health" : "health-negative" };
+  const servable = health?.realm_servable?.[realm];
+  if (typeof servable === "boolean") {
+    return { ok: servable, at: null, source: servable ? "health" : "health-negative" };
   }
   return { ok: false, at: null, source: "unknown" };
 }
 
-/**
- * Arm the fallback window for `clientModel` after an observed failure, and work
- * out when global is expected back. Returns { retryAt: Date|null, source }.
- *
- * The window is always armed, even when the recovery time is unknown - staying
- * on the fallback briefly is strictly better than hammering a dead domain on
- * every request. It is cleared early the moment globalAvailability reports a
- * selectable account.
- */
-async function armFallback(clientModel, route, status, errText) {
-  const bare = bareModelOf(route.upstreamModel);
-  let retryAt = null;
-  let source = "unknown";
-  const rec = await globalAvailability(route, bare);
-  if (rec.at) {
-    retryAt = new Date(rec.at);
-    source = rec.source;
-  } else if (rec.ok) {
-    // /status already shows a selectable global account, yet the upstream just
-    // answered 429/503. Treat it as transient: keep the fallback for this
-    // request, but re-try global on the very next one.
-    retryAt = new Date(Date.now() + 5_000);
-    source = "transient";
-  } else {
-    source = rec.source;
+/** Same availability check for the source realm of the existing fallback. */
+async function globalAvailability(route, bareModel) {
+  return realmAvailability(route, bareModel, "global");
+}
+
+/** Return the earliest known recovery time from one or more availability states. */
+function earliestRecovery(...states) {
+  let earliest = null;
+  for (const state of states) {
+    const at = Number(state?.at);
+    if (!Number.isFinite(at) || at <= Date.now()) continue;
+    if (earliest === null || at < earliest) earliest = at;
   }
+  return earliest;
+}
+
+function retrySignalSeconds() {
+  const ms = Number.isFinite(RETRY_SIGNAL_MS) && RETRY_SIGNAL_MS > 0 ? RETRY_SIGNAL_MS : 5_000;
+  return Math.max(1, Math.ceil(ms / 1000));
+}
+
+const WB_UNAVAILABLE_MESSAGE = "wb2api has no confirmed available account for global or its CN fallback";
+
+/**
+ * Convert a wb2api 503 into the Responses retry shape Codex understands. Keep
+ * any extra upstream fields, but make the overload code and type stable.
+ */
+function retryableWbBody(text, fallbackMessage = WB_UNAVAILABLE_MESSAGE) {
+  let parsed = null;
+  try { parsed = JSON.parse(String(text ?? "")); } catch {}
+  const base = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  const oldError = base.error && typeof base.error === "object" && !Array.isArray(base.error)
+    ? base.error
+    : {};
+  return JSON.stringify({
+    ...base,
+    error: {
+      ...oldError,
+      code: "server_is_overloaded",
+      type: "api_error",
+      message: oldError.message || fallbackMessage,
+    },
+  });
+}
+
+/** Send a bounded, explicit retry response without pretending a realm answered. */
+function sendRetryableWbUnavailable(res, { retryAt = null, source = null, message = WB_UNAVAILABLE_MESSAGE } = {}) {
+  res.setHeader("Retry-After", String(retrySignalSeconds()));
+  if (retryAt !== null && retryAt !== undefined) {
+    const date = new Date(retryAt);
+    if (Number.isFinite(date.getTime())) res.setHeader("X-Gateway-Retry-At", date.toISOString());
+  }
+  if (source) res.setHeader("X-Gateway-Realm-Source", source);
+  res.writeHead(503, { "Content-Type": "application/json" });
+  res.end(retryableWbBody(null, message));
+}
+
+/**
+ * Arm the fallback window after an OBSERVED global failure. The fallback is
+ * allowed only when the CN target is positively confirmed by /status. Healthz
+ * is useful for recovery/diagnostics, but a boolean health result is not enough
+ * to spend the scarce CN account when status is unavailable.
+ */
+async function armFallback(clientModel, route, fallback, status, errText) {
+  const sourceBare = bareModelOf(route.upstreamModel);
+  const targetBare = bareModelOf(fallback.upstreamModel ?? fallback.id);
+  const sourceRealm = realmOfModel(clientModel);
+  const targetRealm = realmOfModel(fallback.id);
+  const [sourceState, targetState] = await Promise.all([
+    realmAvailability(route, sourceBare, sourceRealm),
+    realmAvailability(route, targetBare, targetRealm),
+  ]);
   const now = Date.now();
-  const until = retryAt ? retryAt.getTime() : now + FALLBACK_UNKNOWN_WINDOW_MS;
-  fallbackUntil.set(clientModel, Math.min(until, now + FALLBACK_MAX_WINDOW_MS));
+  const configuredGlobalAt = sourceState.at === null || sourceState.at === undefined
+    ? null
+    : (Number.isFinite(Number(sourceState.at)) ? Number(sourceState.at) : null);
+  const globalRetryAt = sourceState.ok
+    ? now + (Number.isFinite(RETRY_SIGNAL_MS) && RETRY_SIGNAL_MS > 0 ? RETRY_SIGNAL_MS : 5_000)
+    : configuredGlobalAt;
+  const nextProbeAt = sourceState.ok
+    ? globalRetryAt
+    : (earliestRecovery(sourceState, targetState) ?? now + FALLBACK_UNKNOWN_WINDOW_MS);
+  const until = Math.min(nextProbeAt, now + FALLBACK_MAX_WINDOW_MS);
+  fallbackUntil.set(clientModel, until);
+
+  // Only /status can prove that the target has a selectable account. A positive
+  // healthz result is deliberately not enough for this destructive cross-realm hop.
+  const targetConfirmed = targetState.ok && targetState.source === "status";
+  const canFallback = !sourceState.ok && targetConfirmed;
   const body = String(errText ?? "").replace(/\s+/g, " ").slice(0, 160);
   log(`!! cross-realm: ${clientModel} exhausted (upstream ${status}); fallback armed until ` +
-      `${new Date(fallbackUntil.get(clientModel)).toISOString()} source=${source}; upstream said: ${body}`);
-  return { retryAt, source };
+      `${new Date(until).toISOString()} source=${sourceState.source} target=${targetState.source}` +
+      ` canFallback=${canFallback}; upstream said: ${body}`);
+  return {
+    retryAt: new Date(nextProbeAt),
+    globalRetryAt: globalRetryAt === null ? null : new Date(globalRetryAt),
+    source: sourceState.source,
+    canFallback,
+    sourceState,
+    targetState,
+    windowUntil: until,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,6 +1157,34 @@ const server = http.createServer(async (req, res) => {
     let realmUsed = fb ? realmOfModel(clientModel) : null;
     let realmRetryAt = null;
     let realmSource = null;
+    const t0 = Date.now();
+
+    // One failure-accounting path is shared by an upstream error and by the
+    // local fail-closed response below. This keeps /stats honest even when the
+    // gateway refuses to send a request to an unconfirmed CN account.
+    const recordBridgeFailure = (status, modelId, text = "") => {
+      let errUsage = null;
+      try {
+        errUsage = JSON.parse(text)?.usage ?? null;
+      } catch {}
+      recordUsage({
+        route: prefix,
+        provider: route.name,
+        model: modelId ?? parsed.model,
+        effort: parsed.reasoning?.effort ?? null,
+        ok: false,
+        status,
+        duration_ms: Date.now() - t0,
+        input_tokens: errUsage?.prompt_tokens ?? errUsage?.input_tokens ?? 0,
+        output_tokens: errUsage?.completion_tokens ?? errUsage?.output_tokens ?? 0,
+        reasoning_tokens: errUsage?.completion_tokens_details?.reasoning_tokens ?? 0,
+        cached_tokens: errUsage?.prompt_tokens_details?.cached_tokens ?? 0,
+      });
+    };
+    const rejectWbUnavailable = (retryAt, source, text = "") => {
+      recordBridgeFailure(503, clientModel, text);
+      sendRetryableWbUnavailable(res, { retryAt, source });
+    };
 
     if (fb) {
       const armed = fallbackUntil.get(clientModel);
@@ -1091,18 +1194,27 @@ const server = http.createServer(async (req, res) => {
           fallbackUntil.delete(clientModel);
           log(`cross-realm: ${clientModel} fallback window expired; back on global`);
         } else {
-          // Inside the window. Leaving it requires POSITIVE evidence that
-          // global can serve again - never a bare healthy count.
+          // Inside the window, check BOTH realms. Global recovery is positive
+          // evidence for leaving; CN routing also requires a positive /status
+          // result for the target model. Unknown CN state is fail-closed.
           const avail = await globalAvailability(route, bareModelOf(clientModel));
           if (avail.ok) {
             fallbackUntil.delete(clientModel);
             log(`cross-realm: ${clientModel} global recovered early (source=${avail.source}); leaving fallback`);
           } else {
-            parsed.model = fb.upstreamModel;
-            realmUsed = "cn";
-            realmSource = avail.source;
-            realmRetryAt = avail.at ? new Date(avail.at) : new Date(armed);
-            log(`cross-realm: ${clientModel} served from ${fb.id} (window armed, source=${avail.source})`);
+            const target = await realmAvailability(route, bareModelOf(fb.upstreamModel), realmOfModel(fb.id));
+            if (target.ok && target.source === "status") {
+              parsed.model = fb.upstreamModel;
+              realmUsed = "cn";
+              realmSource = avail.source;
+              realmRetryAt = avail.at ? new Date(avail.at) : new Date(armed);
+              log(`cross-realm: ${clientModel} served from ${fb.id} (window armed, source=${avail.source}, target=${target.source})`);
+            } else {
+              const retryAt = earliestRecovery(avail, target) ?? armed;
+              log(`!! cross-realm: ${clientModel} remains unavailable; refusing CN (source=${avail.source}, target=${target.source})`);
+              rejectWbUnavailable(new Date(retryAt), avail.source);
+              return;
+            }
           }
         }
       }
@@ -1135,20 +1247,13 @@ const server = http.createServer(async (req, res) => {
           headers,
           body: JSON.stringify(chat),
           proxy: route.proxy,
+          retryStatuses: route.name === "wb2api" ? [429, 503] : undefined,
         }, `${prefix}${rest} -> ${route.name} model=${modelId}`);
         return { upstream, toolMap };
       } catch (e) {
         return { error: e };
       }
     };
-
-    // Request clock, started before the FIRST upstream attempt: every terminal
-    // branch below (2xx stream, upstream 4xx/5xx, local 502) records a duration.
-    // One row per client request: the arm-and-retry attempt inside the fallback
-    // window decides the outcome and is what gets booked, the discarded attempt
-    // is not booked a second time. Declared BEFORE fail502 so the 502 closure
-    // only ever reads an initialised binding.
-    const t0 = Date.now();
 
     // A local/transport failure (requestWithRetry threw) is still a request the
     // gateway made, so it is booked with ok:false + status 502 exactly like the
@@ -1192,9 +1297,14 @@ const server = http.createServer(async (req, res) => {
       for await (const c of upstream) errChunks.push(c);
       const text = Buffer.concat(errChunks).toString("utf8");
       log(`bridge upstream ${upstream.statusCode}: ${text.slice(0, 200)}`);
-      const armed = await armFallback(clientModel, route, upstream.statusCode, text);
-      realmRetryAt = armed.retryAt;
+      const armed = await armFallback(clientModel, route, fb, upstream.statusCode, text);
+      realmRetryAt = armed.globalRetryAt ?? armed.retryAt;
       realmSource = armed.source;
+      if (!armed.canFallback) {
+        log(`!! cross-realm: ${clientModel} fallback blocked; no confirmed CN account`);
+        rejectWbUnavailable(armed.retryAt, armed.source, text);
+        return;
+      }
       parsed.model = fb.upstreamModel;
       realmUsed = "cn";
       attempt = await sendChat(fb.upstreamModel);
@@ -1218,26 +1328,24 @@ const server = http.createServer(async (req, res) => {
       // standards for one event. Chat-wire usage names are prompt_/completion_;
       // the responses-style names are accepted as a fallback only because an
       // error body is the sole usage source here and no counters are invented.
-      let errUsage = null;
-      try {
-        errUsage = JSON.parse(text)?.usage ?? null;
-      } catch {}
-      recordUsage({
-        route: prefix,
-        provider: route.name,
-        model: parsed.model,
-        effort: parsed.reasoning?.effort ?? null,
-        ok: false,
-        status: upstream.statusCode,
-        duration_ms: Date.now() - t0,
-        input_tokens: errUsage?.prompt_tokens ?? errUsage?.input_tokens ?? 0,
-        output_tokens: errUsage?.completion_tokens ?? errUsage?.output_tokens ?? 0,
-        reasoning_tokens: errUsage?.completion_tokens_details?.reasoning_tokens ?? 0,
-        cached_tokens: errUsage?.prompt_tokens_details?.cached_tokens ?? 0,
-      });
+      recordBridgeFailure(upstream.statusCode, parsed.model, text);
       setRealmHeaders(res, realmUsed, realmRetryAt, realmSource);
-      res.writeHead(upstream.statusCode, { "Content-Type": "application/json" });
-      res.end(text);
+      if (route.name === "wb2api" && (upstream.statusCode === 429 || upstream.statusCode === 503)) {
+        // Do not pass through wb2api's missing Retry-After. Codex's server
+        // overload retry path needs the signal, while the true recovery time is
+        // carried separately in X-Gateway-Retry-At when we know it.
+        res.setHeader("Retry-After", String(retrySignalSeconds()));
+        if (upstream.statusCode === 503) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(retryableWbBody(text));
+        } else {
+          res.writeHead(429, { "Content-Type": "application/json" });
+          res.end(text);
+        }
+      } else {
+        res.writeHead(upstream.statusCode, { "Content-Type": "application/json" });
+        res.end(text);
+      }
       return;
     }
     // setHeader before the bridge writes its own head: writeHead merges
