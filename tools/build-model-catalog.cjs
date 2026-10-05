@@ -348,6 +348,93 @@ const ours = Object.entries(REGISTRY.models)
   // but their catalog entries already exist and are richer. Drop them here: the
   // built-in entry wins below, and reporting that as a "collision" would be noise.
   .filter((m) => !builtin.models.some((b) => b.slug === m.slug));
+// ---------------------------------------------------------------------------
+// Ordering: most-used first, from the gateway's own ledger.
+//
+// The picker renders this catalog sorted by `priority` ascending and breaks ties
+// on ARRAY ORDER - both verified 2026-10-06 against a synthetic catalog:
+// `zz-b(-2), zz-d(-1), zz-a(0), zz-c(1)` came back in exactly that order, and
+// seven entries all sharing `-1` came back in the order they were written.
+//
+// So moving a model up the picker means moving it up this array. That is also
+// the ONLY lever available here, because `priority` is already spoken for in
+// both directions: values < 0 additionally fill spawn_agent's override hint (the
+// five smallest win - measured with 7 negatives, only the first 5 were listed)
+// and the built-ins own the positive band (1..43). Reordering the array leaves
+// both of those semantics exactly as they are.
+//
+// (Fractional priorities are not an option either: a catalog using them was
+// rejected outright and codex fell back to its built-in five. Integers only.)
+//
+// The signal is the gateway's usage ledger (`data/usage/YYYY-MM-DD.jsonl`, one
+// row per completed request - see usage.mjs). Recency is weighted with a 7-day
+// half-life so the picker surfaces what is in use NOW rather than what a one-off
+// probe session hammered two weeks ago. Models with no recorded traffic score 0
+// and keep their registry position, below everything that has traffic.
+//
+// Only day-named files are read: `*.phantom-merged.jsonl` is a repaired copy of
+// a single day and was verified on 2026-10-06 to be a 100% subset of that day's
+// file, so globbing it would double-count those rows.
+//
+// Degrades safely: a missing or unreadable ledger leaves the order untouched
+// (the pre-existing registry order) rather than failing the build.
+const USAGE_HALF_LIFE_DAYS = 7;
+function usageScores() {
+  const dir = process.env.AR_USAGE_DIR
+    ? path.resolve(process.env.AR_USAGE_DIR)
+    : path.join(__dirname, "..", "data", "usage");
+  const scores = new Map();
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f));
+  } catch {
+    return scores;
+  }
+  const now = Date.now();
+  for (const name of names) {
+    let text;
+    try {
+      text = fs.readFileSync(path.join(dir, name), "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      let row;
+      try {
+        row = JSON.parse(line);
+      } catch {
+        continue; // a torn last line after a crash
+      }
+      if (!row || typeof row.model !== "string" || typeof row.provider !== "string") continue;
+      const ts = Date.parse(row.ts);
+      const ageDays = Number.isFinite(ts) ? Math.max(0, (now - ts) / 86400000) : 0;
+      const key = `${row.provider}|${row.model}`;
+      scores.set(key, (scores.get(key) ?? 0) + Math.pow(0.5, ageDays / USAGE_HALF_LIFE_DAYS));
+    }
+  }
+  return scores;
+}
+const USAGE_SCORES = usageScores();
+function usageScoreOf(slug) {
+  const spec = REGISTRY.models[slug];
+  if (!spec || typeof spec !== "object") return 0;
+  return USAGE_SCORES.get(`${spec.p}|${spec.m ?? slug}`) ?? 0;
+}
+const oursOrdered = (() => {
+  // The pinned entries keep their registry order: they already lead the picker
+  // through priority -1, and that same order is what spawn_agent's hint lists.
+  const pinned = ours.filter((m) => OVERRIDE_SLUGS.has(m.slug));
+  const ranked = ours
+    .filter((m) => !OVERRIDE_SLUGS.has(m.slug))
+    .map((m, i) => ({ m, i, score: usageScoreOf(m.slug) }))
+    // Stable: equal scores - including the whole no-traffic tail - keep registry order.
+    .sort((a, b) => (b.score - a.score) || (a.i - b.i))
+    .map((x) => x.m);
+  const top = ranked.slice(0, 8).map((m) => `${m.slug}(${Math.round(usageScoreOf(m.slug))})`);
+  console.log(`order: gateway usage, ${USAGE_HALF_LIFE_DAYS}d half-life; top: ${top.join(', ')}`);
+  return [...pinned, ...ranked];
+})();
 
 // 3) merge, built-ins first.
 //
@@ -362,8 +449,8 @@ const ours = Object.entries(REGISTRY.models)
 // nothing. Report every ignored field difference instead.
 const RICH_ONLY = ['base_instructions', 'model_messages', 'tool_mode', 'multi_agent_version'];
 const have = new Set(builtin.models.map((m) => m.slug));
-const added = ours.filter((m) => !have.has(m.slug));
-const collisions = ours.filter((m) => have.has(m.slug));
+const added = oursOrdered.filter((m) => !have.has(m.slug));
+const collisions = oursOrdered.filter((m) => have.has(m.slug));
 
 // Only built-ins the registry can route: the picker must never offer a model
 // that /u would answer 404 for. (codex-auto-review, gpt-daybreak-* were listed

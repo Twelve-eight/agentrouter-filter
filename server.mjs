@@ -73,36 +73,74 @@ import { stripForeignItemIds, stripAllItemIds, isItemIdRejection } from "./respo
 // need to inject a key per-process.
 //
 // Format: KEY=value per line, `#` comments, surrounding quotes stripped.
-function loadLocalEnv() {
-  const file = new URL("./.env.local", import.meta.url);
-  let text;
+// Parsed key/value pairs from .env.local, cached against the file's mtime+size
+// exactly like the registry below.
+//
+// WHY A CACHE AND NOT A ONE-TIME LOAD: loadLocalEnv() used to run once at module
+// load and write into process.env, and providerFor() reads its key from
+// process.env. That combination meant a key added AFTER the process started was
+// invisible forever - the gateway kept answering
+// `!! <provider> has no <ENV> in the environment; forwarding the client key`
+// and forwarded the CLIENT's credential upstream, which surfaced as
+// `401 Invalid API key` from a provider whose key was in fact correct on disk.
+//
+// Measured 2026-10-06: northstar-kiro was added to .env.local while the gateway
+// (PID 12004, started 05:19) was running; every ki:* call answered 401 and the
+// log carried that message 72 times, while the same key used directly returned
+// 200. Restarting was the only cure - which is exactly the trap this avoids.
+//
+// Re-reading on change is cheap (one stat() per request, re-parse only when the
+// file actually moves) and it makes editing .env.local sufficient on its own,
+// matching the "FILE is authoritative" contract the block above describes.
+const ENV_FILE = new URL("./.env.local", import.meta.url);
+let envFileCache = { key: null, values: null };
+function localEnvFile() {
+  let st;
   try {
-    text = fs.readFileSync(file, "utf8");
+    st = fs.statSync(ENV_FILE);
   } catch {
-    return; // no local overrides - environment alone is fine
+    // No file: fall back to whatever the process environment already holds.
+    return null;
   }
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (!t || t.startsWith("#")) continue;
-    const eq = t.indexOf("=");
-    if (eq < 1) continue;
-    const key = t.slice(0, eq).trim();
-    let value = t.slice(eq + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
+  const key = `${st.mtimeMs}:${st.size}`;
+  if (envFileCache.key === key) return envFileCache.values;
+
+  const values = new Map();
+  try {
+    for (const line of fs.readFileSync(ENV_FILE, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      const eq = t.indexOf("=");
+      if (eq < 1) continue;
+      const name = t.slice(0, eq).trim();
+      let value = t.slice(eq + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      values.set(name, value);
     }
-    // The file wins - see the precedence note above loadLocalEnv. A stale
-    // ambient variable once shadowed a rotated key here and surfaced only as an
-    // upstream 401. AR_ALLOW_ENV_OVERRIDE=1 restores the old direction for the
-    // rare case an operator must inject a key per-process.
-    if (process.env.AR_ALLOW_ENV_OVERRIDE === "1") {
-      if (process.env[key] === undefined) process.env[key] = value;
-    } else {
-      process.env[key] = value;
-    }
+  } catch {
+    return envFileCache.values; // unreadable now: keep the last good parse
   }
+  envFileCache = { key, values };
+  return values;
 }
-loadLocalEnv();
+
+/**
+ * Resolve a provider credential: the file wins, the ambient environment is the
+ * fallback - the same precedence loadLocalEnv() established, applied per request
+ * instead of once per process.
+ */
+function resolveEnvValue(name) {
+  if (!name) return undefined;
+  const fileValues = localEnvFile();
+  const fromFile = fileValues && fileValues.has(name) ? fileValues.get(name) : undefined;
+  const fromEnv = process.env[name];
+  // Same two-way precedence the old one-time loader implemented, so
+  // AR_ALLOW_ENV_OVERRIDE=1 keeps meaning "the ambient variable wins".
+  if (process.env.AR_ALLOW_ENV_OVERRIDE === "1") return fromEnv ?? fromFile;
+  return fromFile ?? fromEnv;
+}
 
 const PORT = Number(process.env.AR_GATEWAY_PORT ?? 7878);
 const HOST = "127.0.0.1";
@@ -295,7 +333,7 @@ function providerFor(model) {
     // upstream actually needs; without this the unified route only works for the
     // provider whose key the client happened to send.
     keyEnv: p.keyEnv,
-    key: p.keyEnv ? process.env[p.keyEnv] : undefined,
+    key: resolveEnvValue(p.keyEnv),
     // Effort levels the upstream accepts, when it is pickier than chat/completions
     // (opencode-zen's mimo-v2.6-flash-free: low/medium/high only; max/xhigh are
     // 400). A MODEL may override the provider window with its own `efforts` array
@@ -343,7 +381,7 @@ function modelList() {
 // forward.
 //
 // CREDENTIAL PRECEDENCE: client key first, then the registry's own key for this
-// provider (`providerKey` = route.key, i.e. process.env[route.keyEnv]). The
+// provider (`providerKey` = route.key, resolved from .env.local per request). The
 // unified route already substitutes route.key into `authorization` before this
 // runs, but a caller that sends no credential at all used to reach /v1/messages
 // with no x-api-key and no fallback - the request then failed 401 upstream even

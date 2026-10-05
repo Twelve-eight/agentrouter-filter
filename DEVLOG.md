@@ -2658,3 +2658,65 @@ codex exec --skip-git-repo-check -c model=ki:sonnet5.5 -c model_provider=gateway
 - 上游 `/v1/models` 还列出 `auto`、`claude-opus-5`、`claude-sonnet-5`、
   `claude-opus-4.8/4.7/4.6/4.5`、`claude-sonnet-4.6/4.5`、`gpt-5.6-sol/terra/luna`，
   本轮只注册用户点名要的两个；要加其余 id 应先逐个探测再登记。
+
+## 2026-10-06: ki:* 401 —— .env.local 的 key 在进程启动后才写入，运行中的网关永远看不到
+
+用户报：调用 `ki:opus5.5` 返回
+`unexpected status 401 Unauthorized: Invalid API key, url: http://127.0.0.1:7878/u/v1/responses`。
+
+### 根因（我的实现缺陷，不是用户操作问题）
+
+`providers.json` 的 provider `keyEnv` 由 `providerFor()` 在**请求时**从 `process.env`
+读取，而 `loadLocalEnv()` 只在**模块加载时**跑一次、把 `.env.local` 灌进 `process.env`。
+
+我在 2026-10-06 把 `NSCN_KIRO_API_KEY` 追加进 `.env.local`，但网关进程
+（PID 12004，启动于 10-05 05:19）早已越过那次加载。于是：
+
+```text
+!! northstar-kiro has no NSCN_KIRO_API_KEY in the environment; forwarding the client key
+proxy u/v1/responses -> https://kiro.northstar.cool/v1/responses (northstar-kiro)
+```
+
+网关把**客户端那把** `AGENTROUTER_API_KEY` 原样转给 kiro 上游 → 401。该行在日志里
+出现 **72 次**，而同一把 kiro key 直连上游是 200。
+
+### 为什么我先前的验证全绿却没抓到
+
+我每次验收都手动把 kiro key 塞进 `Authorization`，于是 `route.key` 为空时"转发客户端
+key"这条分支恰好收到了一把**正确**的 key，200 是那个巧合的产物。用**用户实际的请求
+路径**（客户端只发 agentrouter key）复现才暴露：`ki:opus5.5` → 401。教训：验收必须
+走真实调用方路径，不能自带凭据。
+
+### 修复：key 解析改为每请求读文件（mtime+size 缓存）
+
+`server.mjs`：
+- 新增 `localEnvFile()`：解析 `.env.local` 为 Map，按 `mtimeMs:size` 缓存，文件变了才
+  重新解析；文件不可读时保留上一次的好值。
+- 新增 `resolveEnvValue(name)`：**文件优先、环境兜底**，与旧 `loadLocalEnv()` 的
+  `AR_ALLOW_ENV_OVERRIDE` 双向语义保持一致。
+- `providerFor()` 的 `key:` 从 `process.env[p.keyEnv]` 改为 `resolveEnvValue(p.keyEnv)`。
+- 删除 `loadLocalEnv()`（它的语义已被逐请求版本完整覆盖）。
+
+代价：每请求一次 `stat()`；只在文件真正变化时重新解析。
+
+### 验证
+
+隔离实例（7879，不碰生产）:
+1. 客户端只发 agentrouter key → `ki:opus5.5` **200**，日志里那句警告消失。
+2. **热重载实测**：把文件里的 key 改坏 → 立刻 401；改回 → 立刻 200，**全程不重启**。
+   `.env.local` 逐字节还原确认。
+3. 停止隔离实例后正式重启网关（`restart-gateway.ps1`，语法门禁+快照）：
+   PID 12004 → 15512，82 models。
+4. 生产网关上同样路径 **200**。
+5. **端到端**：`codex exec -c model=ki:opus5.5 -c model_provider=gateway` →
+   `exit=0`，输出 PONG，tokens 3,272。
+
+### 顺带查出的两个独立问题（与本次 401 无关）
+
+| 现象 | 证据 | 结论 |
+| --- | --- | --- |
+| `gpt-6-astra-ar` 401 | `AGENTROUTER_API_KEY` 直连上游：`Budget pool quota has been exhausted` | **额度耗尽**，不是吊销。该 key 只服务 agentrouter 自己的模型；网关不校验客户端 key（假 key 也 200），所以其他 provider 不受影响 |
+| `ovoapi:6.1sol` 403 | ovoapi 侧分组/额度问题 | 与本网关无关，另案 |
+
+`AGENTROUTER_API_KEY` 不在 `.env.local`（只有 JUSTWOKER/OPENCODE/MOTOMOTO/OVOAPI/
+OVOAPI_AMZ/ANTIGRAVITY/NSCN_KIRO 七个），它来自 Machine 作用域环境变量。
