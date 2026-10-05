@@ -135,6 +135,7 @@ const PROVIDER_ABBR = {
   wb2api: 'wb',
   anyrouter: 'an',
   justwoker: 'jw',
+  'northstar-kiro': 'ki',
   'opencode-zen': 'zen',
   motomoto: 'moto',
   ovoapi: 'ovo',

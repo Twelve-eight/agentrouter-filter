@@ -172,6 +172,23 @@ const ROUTES = {
   // "Attention Required!"; GET /v1/models passes), and /v1/responses is
   // "not implemented" - so the anthropic bridge is the only working path.
   jw: { name: "justwoker", base: process.env.AR_UPSTREAM_JW ?? "https://api.justwoker.icu", anthropic: true },
+  // kiro.northstar.cool (order 5784). Native /v1/responses: probed 2026-10-06,
+  // claude-opus-5.5 and claude-sonnet-5.5 both answered 200 on /v1/responses,
+  // /v1/chat/completions and /v1/messages; tool calls return real function_calls
+  // and stream=true returns a complete SSE run. No proxy, no filter, no bridge.
+  // kiro.northstar.cool (order 5784). Native /v1/responses: probed 2026-10-06,
+  // claude-opus-5.5 and claude-sonnet-5.5 both answered 200 on /v1/responses,
+  // /v1/chat/completions and /v1/messages; tool calls return real function_calls
+  // and stream=true returns a complete SSE run.
+  //
+  // PROXY IS REQUIRED, same shape as anyrouter: a DIRECT TLS handshake to this
+  // host fails before any HTTP is exchanged (curl tls=0.000000, http_code 000;
+  // Node reports "Hostname/IP does not match certificate's altnames: Cert does
+  // not contain a DNS name"). TCP connects fine - it is the TLS layer that dies.
+  // Through http://127.0.0.1:7897 the SAME requests answered 200: 6/6 for
+  // claude-opus-5.5 and 4/4 for claude-sonnet-5.5, measured 2026-10-06.
+  // Do not drop `proxy` to "simplify" this route - it will break every call.
+  ki: { name: "northstar-kiro", base: process.env.AR_UPSTREAM_KI ?? "https://kiro.northstar.cool", chat: false, proxy: process.env.AR_PROXY_KI ?? "http://127.0.0.1:7897" },
 };
 
 // ---------------------------------------------------------------------------
@@ -182,7 +199,7 @@ const ROUTES = {
 // tools/build-model-catalog.cjs reads, so the picker and the gateway cannot
 // disagree about which models exist or where they go.
 // ---------------------------------------------------------------------------
-const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", wb2api: "WB", anyrouter: "AN", justwoker: "JW" };
+const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", wb2api: "WB", anyrouter: "AN", justwoker: "JW", "northstar-kiro": "KI" };
 
 // omp's own dashboard client (MIT), vendored from its embedded-client blob. Served
 // as static files so the browser loads index.js/styles.css relative to /stats/.
@@ -982,7 +999,7 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify(payload));
     return;
   }
-  const m = req.url.match(/^\/(ar|rc|wb|an|jw|u)(\/.*)$/);
+  const m = req.url.match(/^\/(ar|rc|wb|an|jw|ki|u)(\/.*)$/);
   if (!m) {
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");

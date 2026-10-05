@@ -2575,3 +2575,86 @@ Retry-After: 5
 ```
 
 本轮没有自动重启网关。
+
+## 2026-10-06: 接入 kiro.northstar.cool（订单 5784）—— claude-opus-5.5 / claude-sonnet-5.5
+
+用户给的是 Claude Code + Codex/OpenAI 两个 base URL 与 `NSCN_KIRO_API_KEY`，
+要求把 `claude-opus-5.5` / `claude-sonnet-5.5` 配进 Codex。
+
+### 能力探测（2026-10-06，直连时）
+
+| 面 | opus-5.5 | sonnet-5.5 |
+| --- | --- | --- |
+| `/v1/models` | 200（列出 15 个 id） | 同 |
+| `/v1/chat/completions` | 200 | 200 |
+| `/v1/responses` | 200 | 200 |
+| tool call（`tool_choice: required`） | 200，返回真 `function_call` | — |
+| `stream: true` | 200，完整 SSE 到 `response.completed` | — |
+
+id 形状：`fc_fcc9cd78d62048fe87118ff504cdbf02` + `call_id: toolu_bdrk_...`，
+所以 `strictItemIds` 保持关闭。
+
+### 接入方式（沿用既有规范）
+
+- `providers.json` 新增 provider `northstar-kiro`（`wire: responses`，无 filter、无 bridge）。
+- 模型以 `ki:` 前缀注册：`ki:opus5.5` / `ki:sonnet5.5`。前缀是必须的——
+  `claude-opus-5.5` 与 `ovoapi:claude-opus-5.5`、anyrouter/justwoker 的 claude 家族重名，
+  直接占用裸 slug 会静默改道已有调用方。
+- `server.mjs`：`ROUTES` 加 `ki`、`ROUTE_PREFIX` 加 `northstar-kiro: "KI"`、
+  路径正则加 `ki`（`/ki/v1/...` 前缀路由，重启后生效）。
+- `tools/build-model-catalog.cjs`：`PROVIDER_ABBR` 加 `'northstar-kiro': 'ki'`。
+- `.env.local` 追加 `NSCN_KIRO_API_KEY`（原值只存在于 User 作用域环境变量，
+  文件化后路由不再依赖该变量存活）。
+
+### 关键坑：这个域名必须走本地代理
+
+第一轮端到端验证时 Codex CLI 卡在指数退避重试里出不来，网关日志反复打印：
+
+```text
+!! northstar-kiro has no NSCN_KIRO_API_KEY in the environment; forwarding the client key
+proxy u/v1/responses -> https://kiro.northstar.cool/v1/responses (northstar-kiro)
+```
+
+（第一行是**旧进程未加载新 .env.local** 的假象，不是根因；统一路由按请求读
+`providers.json`，但 key 由 `providerFor()` 在请求时从 `process.env` 取，
+而 `loadLocalEnv()` 只在进程启动时跑一次。）
+
+真正的根因是 **TLS 层**：
+
+```text
+direct:   http_code 000, tls=0.000000, total=0.145   (TCP 连得上，TLS 握手直接死)
+          Node: "Hostname/IP does not match certificate's altnames: Cert does not contain a DNS name"
+proxied:  http_code 200, tls=1.944278, total=6.917   (http://127.0.0.1:7897)
+```
+
+与 anyrouter 同型：不是证书配置问题，是直连被中间设备劫持/干扰。给 provider
+加 `"proxy": "http://127.0.0.1:7897"` 后：
+
+- 直连代理实测：opus-5.5 **6/6** 200，sonnet-5.5 **4/4** 200。
+- 经网关 `/u/v1/responses`：opus-5.5 **4/4** 200。
+
+**`providers.json` 是每请求读取的**（按 mtime+size 缓存），所以统一路由
+`/u` 的这条修复**不需要重启网关**即可生效——上面 4/4 就是改完文件直接打的。
+
+### 验证
+
+- 目录重建：`tools/build-model-catalog.cjs` 输出 `added: 75 -> ... ki:opus5.5, ki:sonnet5.5`，
+  `total: 82`，写入 `C:\Users\o_Obl\.codex\omp-model-catalog.json`。
+- 目录条目：`ki:opus5.5 | opus-5.5 (ki) | ctx=200000 | efforts=low/medium/high/max`，
+  sonnet 同形。
+- 端到端（真实 Codex CLI，非裸 HTTP）：
+
+```text
+codex exec --skip-git-repo-check -c model=ki:opus5.5   -c model_provider=gateway "Reply with exactly: PONG"
+  -> exit=0, tokens used 3,272, 输出 PONG
+codex exec --skip-git-repo-check -c model=ki:sonnet5.5 -c model_provider=gateway "Reply with exactly: PONG"
+  -> exit=0, tokens used 3,272, 输出 PONG
+```
+
+### 待用户处理
+
+- **重启网关**才会让 `/ki/v1/...` 前缀路由生效（`ROUTES` 是模块加载时构建的）。
+  统一路由 `/u` 已经可用，Codex 的 `gateway` provider 走的正是它，所以**不改也能用**。
+- 上游 `/v1/models` 还列出 `auto`、`claude-opus-5`、`claude-sonnet-5`、
+  `claude-opus-4.8/4.7/4.6/4.5`、`claude-sonnet-4.6/4.5`、`gpt-5.6-sol/terra/luna`，
+  本轮只注册用户点名要的两个；要加其余 id 应先逐个探测再登记。

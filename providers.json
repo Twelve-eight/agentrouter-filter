@@ -79,6 +79,13 @@
       "keyEnv": "JUSTWOKER_API_KEY",
       "egressGuard": true
     },
+  "northstar-kiro": {
+    "base": "https://kiro.northstar.cool",
+    "wire": "responses",
+    "keyEnv": "NSCN_KIRO_API_KEY",
+    "proxy": "http://127.0.0.1:7897",
+    "_comment": "kiro.northstar.cool - order 5784 (Claude Code face + Codex/OpenAI face).\n\nWIRE: responses, native passthrough. Probed 2026-10-06: claude-opus-5.5 and\nclaude-sonnet-5.5 each answered 200 on /v1/responses, /v1/chat/completions and\n/v1/messages. Tool calls return real function_calls (exec_command with\n{\"cmd\":\"echo hi\"}) and stream=true returns a complete SSE run ending in\nresponse.completed. No proxy, no filter, no bridge needed.\n\nID HYGIENE: this upstream mints `fc_`/`msg_` ids (function_call came back as\nid=fc_fcc9cd78d62048fe87118ff504cdbf02 with call_id toolu_bdrk_...), so\nstrictItemIds stays OFF.\n\nKEY: NSCN_KIRO_API_KEY is supplied by the User-scope environment variable. It is\nnot in .env.local, so this route only works while that variable exists - add it\nto .env.local if the route must survive the variable being lost.\n\nMODEL COVERAGE: /v1/models also lists auto, claude-opus-5, claude-sonnet-5,\nclaude-opus-4.8/4.7/4.6/4.5, claude-sonnet-4.6/4.5 and gpt-5.6-sol/terra/luna.\nOnly the two ids the user asked for are registered; re-probe before adding the\nrest rather than assuming the whole list serves."
+  },
     "antigravity": {
       "base": "http://127.0.0.1:8045",
       "wire": "responses",
@@ -462,6 +469,15 @@
     "rc:6sol": {
       "p": "relaycat",
       "m": "gpt-6-sol"
+    },
+    "_northstar_kiro_comment": "kiro.northstar.cool, order 5784. PREFIXED with ki: because the bare\nids (claude-opus-5.5 / claude-sonnet-5.5) collide with ovoapi:claude-opus-5.5\nand the anyrouter/justwoker claude family - overwriting a bare slug would\nsilently reroute existing callers. Both ids probed 2026-10-06 on all three\nfaces plus tool calls and streaming (see the provider comment).",
+    "ki:opus5.5": {
+      "p": "northstar-kiro",
+      "m": "claude-opus-5.5"
+    },
+    "ki:sonnet5.5": {
+      "p": "northstar-kiro",
+      "m": "claude-sonnet-5.5"
     }
   },
   "_claude_comment": "claude-opus-4-8 is served by justwoker over the anthropic-messages wire (see the anthropic bridge in bridge.mjs). It was briefly removed when only agentrouter offered it: agentrouter registers the claude ids on its anthropic-messages face only (messages=402 quota, responses=503, while a nonexistent model is 503 on both) and codex speaks only responses, so selecting them always failed. That is why the responses->messages bridge exists. claude-opus-5 WAS unavailable on every provider we route until 2026-09-30, when\nthe ovoapi-amz key appeared; it is now served as `ovoapi:claude-opus-5` (probed\nthree rounds, 200 every time, with working tool calls). The same key also brings\nclaude-fable-5, claude-opus-4-7, claude-opus-4.8, claude-opus-5.5 and\nclaude-sonnet-5 - see the ovoapi-amz provider comment."
