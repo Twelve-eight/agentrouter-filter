@@ -67,6 +67,29 @@ item),用于规避 agentrouter 多 Azure 资源池无会话粘性导致的 400.�
 且实测带 `encrypted_content` 回放上游返回 200,故**不留该机制,也不为没有实证问题的
 东西做改写**.
 
+**namespace 工具的扁平化与历史改写 (2026-10-07, 仅 `flattenNamespaceTools` 路由)**: Codex 把
+多智能体工具声明成一个 namespace 条目(`{type:"namespace", name:"multi_agent_v1", tools:[...]}`),
+而 kiro 会**静默丢弃**这个形状 —— 模型完全看不到 `spawn_agent`。网关因此把 namespace 展开成
+扁平函数 `multi_agent_v1__spawn_agent` 再发(开关在 `providers.json` 的 `flattenNamespaceTools`)。
+
+**这需要两半,缺一不可**(2026-10-06/07 实测):
+
+| 方向 | 做什么 | 缺了会怎样 |
+|---|---|---|
+| 出站 | 展开工具表 **并且**把历史里回放的 `function_call` 改写成扁平线名 | 模型读自己的历史看到裸名 `spawn_agent`,就照抄调用裸名;上游如实回裸名;回程映射查不到 → Codex 报 `unsupported call: spawn_agent` |
+| 入站 | 用 `flattenTools()` 的 `byWire` 映射还原成 `{name, namespace}` | 模型看到扁平名却调不动(旧的半吊子状态) |
+
+真实症状是**同一会话里部分成功、部分失败**:失败样本全部缺 `namespace` 字段,成功样本都带 ——
+不是模型随机失误,而是历史里裸名与扁名混着,模型跟着学。
+
+**回程还原必须查映射,不能在 `"__"` 上切分**:namespace id 自身就含这个分隔符
+(`mcp__codex_app`),切分会把 `mcp__codex_app__list_threads` 解析成 namespace `"mcp"`。
+另有一个 `byBare` 安全网:只有当裸名**唯一归属**(一个命名空间拥有、且没有同名扁平工具)时才还原,
+否则宁可不猜 —— 防止把真实扁平工具错认成命名空间子工具。
+
+回归测试:`tools/test-namespace-passthrough.mjs`(14 项,含流式 SSE、歧义、扁平遮蔽、mcp 切名)。
+`server.mjs` 改动需要**重启网关**。
+
 `an` 单独走代理是因为 anyrouter.top 直连被 TLS 层拦截;其余路由保持直连
 (agentrouter 经该代理会挂起).上游可用 `AR_UPSTREAM_<ROUTE>` / `AR_PROXY_AN` 覆盖.
 
