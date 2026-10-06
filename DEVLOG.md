@@ -3000,3 +3000,49 @@ antigravity / motomoto / ovoapi 全系。
 （参见 1857 行那条同类教训）。
 
 用户明确表示"只生效 woker 也行"，所以本次**不动**，仅留档。
+
+## 2026-10-06 (6): 把机制知识从 DEVLOG 提升到 README
+
+用户指出："catalog 是知识性的，不仅记录到 log 里"。
+
+DEVLOG 是**时间线**（按日期分段，细节最全但检索成本高），而机制事实属于**可复用知识**，
+按 AGENTS.md §1 应落在项目入口。本轮把以下内容从 DEVLOG 提升进 `README.md`：
+
+新增两节：
+
+1. **`## 模型目录(~/.codex/omp-model-catalog.json)`** —— 取代此前只存在于 DEVLOG 的散落记录：
+   - `model_catalog_json` 是**替换**而非追加（指向 5 条目的文件会让内置模型全消失）；
+   - **生效时机表**：`providers.json` 每请求读取 vs catalog 启动时读一次（**改完必须重启 Codex**），
+     附源码依据（`config/mod.rs` 的 `load_model_catalog()` + 无 file watcher）与可执行验证
+     （`tools/probe-catalog-reload.mjs`）；
+   - `priority` 的两个互不相干作用（正值=内置排序，负值=进提示文本）；
+   - `visibility` 的**关键性质：隐藏 ≠ 不可用**（`find_spawn_agent_model_name()` 从不读
+     `show_in_picker`），以及为什么**不能改成删除条目**（标题生成器用 `gpt-5.6-luna`、
+     auto-review 用 `codex-auto-review`，删掉会重演 2026-09-22 的 503 风暴）；
+   - 子代理 5 个提示位的真实语义（取选择器前 5，**不是白名单**）；
+   - 4 个相关工具的一句话说明。
+
+2. **`## 过滤与脱敏的作用范围`** —— 把上一节的结论提升为常驻知识：
+   - 两个机制都按 provider 开关，当前各只对一个生效（过滤→agentrouter，脱敏→justwoker）；
+   - 过滤范围的实测数据（四个 provider `filter rewrote` 增量全 0，agentrouter 为 1）；
+   - **已知空白**：脱敏只在两条桥接分支有调用点（`server.mjs:1285` / `:1450`），
+     原生 responses 直通路径（54 个模型）没有；给这些 provider 写 `egressGuard: true` **不会生效**。
+
+同时修正 **`## 路由`** 表：原来只列 4 个 route（ar/rc/wb/an），实际已有 **14 个 provider**。
+新表给出 provider / 前缀 / 上游 / wire / filter / egressGuard，并说明 `wire` 决定走哪条链路
+（responses 透传 54 个、chat 桥接 26 个、anthropic 桥接 3 个）—— 这个分布正是上面那条
+脱敏空白的成因，两处互相引用。
+
+### 顺带更新的工作区索引
+
+`G:\omp works\docs\WORKSPACE-PROJECTS.md` 的 agentrouter-filter 条目已过时
+（写着 "catalog 51 项"、指向 `05920f6`）。改为当前事实：14 个 provider / 83 项 catalog /
+11 项可见，并把入口指向 README，标注 `providers.json` 与 catalog 的生效差异。
+该文件在 `G:\omp works` 根下，**不在任何 git 仓库内**（根目录非仓库），
+按 AGENTS.md §7 的路径类约定只做文件更新，不提交。
+
+### 验证
+
+- `README.md` 134 行改动（+124/-10），章节结构见 `grep '^#{1,3} '` 输出
+- 所有引用路径与实际文件核对过；三处可执行断言命令实跑通过
+- 本轮不重启任何服务

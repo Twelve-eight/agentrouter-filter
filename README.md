@@ -22,16 +22,31 @@ Codex CLI 侧的 agentrouter 过滤/桥接网关。
 
 Codex 的 `model_provider.base_url` 指向 `http://127.0.0.1:7878/<route>/v1`:
 
-| route | 上游 | 方式 | filter |
-|---|---|---|---|
-| `ar` | `https://ps.air-outer.com` | responses 透传 | 是 |
-| `rc` | `https://api.relaycat.top` | responses 透传 | 否 |
-| `wb` | `http://127.0.0.1:7863` | responses -> chat/completions 桥接 | 否 |
-| `an` | `https://anyrouter.top` | responses 透传,经 `http://127.0.0.1:7897` CONNECT 隧道 | 否 |
+除统一路由 `/u`(按请求体 `model` 字段派发)外,每个 provider 还有一个前缀路由:
 
-**为什么只给 `ar` 开 filter**:字符剥离与词表改写只对 agentrouter 有意义
-(它的词表会对不透明内容 400/500);对 relaycat/wb2api 跑这些规则只有保真度损失
-(emoji 与非批准文字被删,`relic-bag`/`net id` 这类标识符被改写),包括模型正在读写的代码.
+| provider | 前缀 | 上游 | wire | filter | egressGuard |
+|---|---|---|---|---|---|
+| `agentrouter` | `ar` | `https://ps.air-outer.com` | responses | **是** | 否 |
+| `relaycat` | `rc` | `https://api.relaycat.top` | responses | 否 | 否 |
+| `relaycat65` | — | `https://api.relaycat.top` | responses | 否 | 否 |
+| `relaycat-cn` | — | `https://api.relaycat.top` | responses | 否 | 否 |
+| `wb2api` | `wb` | `http://127.0.0.1:7863` | **chat** | 否 | 否 |
+| `anyrouter` | `an` | `https://anyrouter.top` | responses | 否 | 否 |
+| `justwoker` | `jw` | `https://api.justwoker.icu` | **anthropic** | 否 | **是** |
+| `northstar-kiro` | `ki` | `https://kiro.northstar.cool` | responses | 否 | 否 |
+| `antigravity` | — | `http://127.0.0.1:8045` | responses | 否 | 否 |
+| `opencode-zen` | — | `http://127.0.0.1:7901/zen` | **chat** | 否 | 否 |
+| `motomoto` | — | `https://motomoto.lol` | **chat** | 否 | 否 |
+| `ovoapi` / `ovoapi-amz` / `ovoapi-005` | — | `https://ovoapi.site` / `https://api-console.182yc.xyz` | responses | 否 | 否 |
+
+`wire` 决定走哪条处理链路:**responses** 原生透传(54 个模型),
+**chat** 桥接(26 个),`anthropic` 桥接(3 个)。桥接链路与透传链路的差异不只是协议转换 ——
+脱敏只挂在两条桥接链路上,详见下文"过滤与脱敏的作用范围"。
+
+路由前缀是历史遗留:统一路由 `/u` 出现后,大多数 provider 不再需要单独前缀,
+保留 `ar` / `rc` / `wb` / `an` / `jw` / `ki` 是为了兼容既有 `config.toml` 条目与调试脚本。
+
+**为什么只给 `ar` 开 filter**:见下文"过滤与脱敏的作用范围"(含实测数据).
 
 **严格 item id 修复 (2026-09-24, 仅 agentrouter)**:agentrouter 会校验**每条回放 item 的 id 前缀**
 是否与类型相符 (reasoning -> `rs`, message -> `msg`, function_call / function_call_output -> `fc`,
@@ -54,6 +69,105 @@ item),用于规避 agentrouter 多 Azure 资源池无会话粘性导致的 400.�
 
 `an` 单独走代理是因为 anyrouter.top 直连被 TLS 层拦截;其余路由保持直连
 (agentrouter 经该代理会挂起).上游可用 `AR_UPSTREAM_<ROUTE>` / `AR_PROXY_AN` 覆盖.
+
+## 模型目录(`~/.codex/omp-model-catalog.json`)
+
+Codex 的模型选择器读 `config.toml` 的 `model_catalog_json`,指向本仓库
+`tools/build-model-catalog.cjs` 生成的文件。**这个键是"替换"而不是"追加"**:
+指向一份 5 条目的文件会让 gpt-6-astra / gpt-5.5 / gpt-5.4 全部消失,
+所以生成器先经一个无 `model_catalog_json` 的临时 CODEX_HOME 读回内置目录
+(`codex debug models`),再把本仓库的模型并上去。
+
+### 生效时机:启动时读取一次,**改完必须重启 Codex**
+
+| 文件 | 读取时机 | 改完要做什么 |
+|---|---|---|
+| `providers.json`(本仓库) | **每请求**(mtime+size 缓存) | 什么都不用做 |
+| `~/.codex/omp-model-catalog.json` | **进程启动时一次** | **必须重启 Codex** |
+
+两者形状相同、都由本仓库生成,生效方式却相反 —— 这是最容易踩的一处。
+源码依据:`codex-rs/core/src/config/mod.rs` 的 `load_model_catalog()` 在配置加载时
+调用一次,结果存进 `Config.model_catalog`,没有 file watcher。
+可重复验证:`node tools/probe-catalog-reload.mjs`(合成目录 + 真实 codex.exe,
+同一进程改文件后仍返回旧列表,新进程才读到新列表 → `STARTUP ONLY`)。
+
+### `priority`:两个互不相干的作用
+
+| 取值 | 作用 |
+|---|---|
+| **正值** | 内置条目之间的排序(内置占用 1..43) |
+| **负值** | 该条目进入 `spawn_agent` 的 "Available model overrides" 提示文本 |
+
+选择器按 `priority` **升序**渲染,同值按 **catalog 数组顺序**。实测(合成目录
+`zz-a(0), zz-b(-2), zz-c(1), zz-d(-1)` → 返回 `zz-b, zz-d, zz-a, zz-c`)。
+所以"把某个模型往上挪"= 把它往数组前面挪。小数 priority 会让整份 catalog 被拒。
+
+### `visibility`:收窄选择器但不切断路由
+
+合法值只有 `list` / `hide` / `none`。
+
+**关键性质:隐藏 ≠ 不可用。** `find_spawn_agent_model_name()` 只匹配模型存在且
+`multi_agent_version != Disabled`,**从不读 `show_in_picker`**;被隐藏的模型照样能
+路由、照样能 spawn,只是不出现在选择器和提示块里。实测:隔离实例把已隐藏的
+`zen:space-bunny` 设为主模型,请求正常送达上游。
+
+这条性质是本仓库做"选择器收窄"的基础:2026-10-06 用户指定保留 11 个模型
+(见 `tools/build-model-catalog.cjs` 的 `KEEP_SLUGS`),其余全部标 `hide`。
+**不能改成删除条目** —— 桌面版每建一个线程就调标题生成器(用内置 slug
+`gpt-5.6-luna`),auto-review 调 `codex-auto-review`,删掉它们会重演 DEVLOG
+2026-09-22 记录的 503 风暴。
+
+### 子代理的 5 个提示位
+
+`spawn_agent` 的工具说明里列 5 个建议模型名,取自**选择器顺序的前 5 个**
+(`MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5`,硬编码在 Codex 二进制里,改不了)。
+**这不是白名单**:整份 catalog 都能 spawn。生成器用 `HINT_SLUGS = KEEP_SLUGS.slice(0, 5)`
+让提示位等于列表前五。
+
+验证:`node tools/probe-subagent-models.mjs --order`。
+
+### 相关工具
+
+| 工具 | 作用 |
+|---|---|
+| `tools/build-model-catalog.cjs` | 生成目录(内置目录 + 本仓库模型 + 上下文/effort/压缩阈值) |
+| `tools/model-inventory.mjs` | 按用量账本出全量清单;`--canvas` 直接重生成画布 |
+| `tools/probe-subagent-models.mjs` | 断言 priority 排序;证明提示位不是白名单 |
+| `tools/probe-catalog-reload.mjs` | 断言 catalog 是启动时读取(改完要重启) |
+
+## 过滤与脱敏的作用范围
+
+两个机制都按 **provider** 开关,当前各只对一个 provider 生效:
+
+| 机制 | 开关 | 作用范围 | 性质 |
+|---|---|---|---|
+| **屏蔽词过滤**(`filter.mjs`:字符白名单 + GLM 词表 + 身份改写) | `filter: true` | **只有 agentrouter** | 失败**放行**(不阻断) |
+| **脱敏**(`egress-guard.mjs`:密钥 / 主机身份 / 路径 / 内网 IP) | `egressGuard: true` | **只有 justwoker** | 失败**阻断** |
+
+**为什么过滤只留 agentrouter**:那些规则是为 agentrouter 的词表写的;对
+relaycat / wb2api / kiro 跑同一套规则只有保真度损失(emoji 与非批准文字被删,
+`relic-bag` / `net id` 这类标识符被改写,包括模型正在读写的代码)。
+实测(同一份触发载荷打四个 provider,按日志 `filter rewrote` 增量判断):
+zen / kiro / wb2api / ovoapi **全为 0**,agentrouter 为 1。
+
+**为什么脱敏只留 justwoker**:它存在的原因是 justwoker 被实测会收集主机信息
+(见 `egress-guard.mjs` 头部注释与 DEVLOG 2026-09-24)。
+
+### 已知空白:脱敏在原生 responses 直通路径上没有调用点
+
+`server.mjs` 里 `guardBody(...)` 只有两处调用,都在**桥接**分支内:
+
+| 行 | 分支 | 覆盖 |
+|---|---|---|
+| :1285 | `responses -> chat` 桥接 | 26 个 chat-wire 模型 |
+| :1450 | `responses -> anthropic` 桥接 | 3 个 anthropic-wire 模型 |
+
+**原生 responses 直通路径没有任何脱敏调用点**,而走这条路的有 **54 个模型**
+(relaycat 全系 / wb2api / anyrouter / northstar-kiro / antigravity / motomoto /
+ovoapi 全系)。即:给这些 provider 在 `providers.json` 里写 `egressGuard: true`
+**不会生效**,因为直通分支根本不读 `route.egressGuard` —— 必须先在直通路径上加调用点。
+这是"配置看起来对、实际不参与"的同型坑,与 DEVLOG 1857 行那条教训一致。
+当前用户明确接受"只生效 woker",故仅留档。
 
 ## 过滤内容(`filter.mjs`)
 
