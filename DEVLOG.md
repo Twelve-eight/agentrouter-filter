@@ -2736,7 +2736,7 @@ OVOAPI_AMZ/ANTIGRAVITY/NSCN_KIRO 七个），它来自 Machine 作用域环境�
 1. **优先级排序**：合成 catalog `zz-a(0), zz-b(-2), zz-c(1), zz-d(-1)` 灌进隔离 `CODEX_HOME`，
    用真实 `codex.exe app-server` 调 `model/list`，返回顺序是
    `zz-b(-2), zz-d(-1), zz-a(0), zz-c(1)` —— **priority 升序，同值按数组顺序**。
-   脚本：`G:\tmp\prio-probe.cjs`。
+   脚本已收编：`tools/probe-subagent-models.mjs --order`（合成 catalog + 真实 codex.exe app-server，断言排序）。
 2. **提示块不等于白名单**：真实 spawn `ki:opus5.5`（priority 0，**不在**那 5 个名字里）→
    子线程 `01a10ea6-6503-75d0-a0de-a3e2089035e9`（nickname `Helmholtz`）正常完成，
    `last_agent_message = "PROBE-OK"`，`duration_ms = 4320`。
@@ -2759,7 +2759,7 @@ OVOAPI_AMZ/ANTIGRAVITY/NSCN_KIRO 七个），它来自 Machine 作用域环境�
 
 `data/usage/*.jsonl` 全量重算，只读日期命名文件（`.phantom-merged.jsonl` 已验证是当天文件的
 100% 子集，glob 会双计）。加权 = `0.5 ^ (age_days / 7)`，即 7 天半衰期，让选择器反映"现在在用
-什么"而不是两周前被一次性探针刷过的模型。导出脚本：`G:\tmp\export.cjs`。
+什么"而不是两周前被一次性探针刷过的模型。导出脚本已收编：`tools/model-inventory.mjs`（`--canvas` 直接重生成画布，`--top N` 控制打印条数）。
 
 总计 82 个模型 / 56866 次请求；66 个有调用记录，16 个从未调用。
 0 成功率的 4 个：`claude-opus-5-5`(an, 38/0)、`glm-5.3`(ar, 4/0)、
@@ -2804,3 +2804,22 @@ Canvas（82 行完整清单 + 用量）：
 
 附：本次实验的失败不是并发导致 —— 同一时段 usage 账本里 `ovoapi gpt-5.6-sol` 连续 403、
 `justwoker claude-opus-4-8` 连续 503，两者都是**单请求失败**（dur 260-1500ms），没有排队特征。
+
+### 落盘（2026-10-06 09:0x）
+
+本轮结论原先只存在于 `G:\tmp`（临时目录，会被清理）。已收编为仓库内的正式工具并接入门禁：
+
+| 新增 | 作用 |
+|---|---|
+| `tools/model-inventory.mjs` | 全量扫描用量账本，输出 JSON + 可选 `--canvas <path>` 直接重生成画布。7 天半衰期加权；只读日期命名文件（`*.phantom-merged.jsonl` 已验证是当天文件的 100% 子集，glob 会双计） |
+| `tools/probe-subagent-models.mjs` | `--order` 用合成 catalog 驱动真实 `codex.exe app-server`，断言 `model/list` 的排序 = priority 升序 + 数组序；把"5 个名字只是提示文本、不是白名单"这条结论变成可重复执行的断言 |
+
+`tools/check-syntax.mjs` 的解析门禁与 collapsed-spread 扫描都加上了这两个文件
+（此前只覆盖请求路径上的 mjs 与 `build-model-catalog.cjs`）。
+
+验证：`node tools/model-inventory.mjs --canvas ...` 端到端跑通（82 行，canvas 过 `tsc` 0 error）；
+`node tools/probe-subagent-models.mjs --order` → `ORDERING OK`；
+`check-syntax` 全过；12 个测试文件全过（bridge-request 43 / stream-terminal 48 /
+responses-ids 16 / egress-guard 16 / egress-scan 28 / bridge-rude-close 8，其余 "all checks passed"），0 失败。
+
+DEVLOG 里原来指向 `G:\tmp\prio-probe.cjs` 与 `G:\tmp\export.cjs` 的两处引用已改写为上述仓库路径。

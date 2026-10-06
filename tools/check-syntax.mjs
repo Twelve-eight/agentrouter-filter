@@ -50,10 +50,17 @@ if (fs.existsSync(cjs)) check("tools/build-model-catalog.cjs", cjs, fs.readFileS
 // output, so there is nothing here to parse - stats-api.mjs, which the client
 // actually talks to, is in PLAIN above.
 
+// Analysis/verification tools. They are not on the request path, but they are
+// hand-edited often enough to deserve the same parse gate.
+const TOOLS = ["tools/model-inventory.mjs", "tools/probe-subagent-models.mjs"];
+for (const f of TOOLS) {
+  const p = path.join(ROOT, f);
+  if (fs.existsSync(p)) check(f, p, fs.readFileSync(p, "utf8"));
+}
 // Collapsed-spread sweep: a `..x`/`..x` run outside a string is almost certainly
 // a mangled `...`. Cheap to detect, and it is the exact failure this guards.
 console.log("collapsed-spread sweep:");
-for (const f of [...PLAIN, "tools/build-model-catalog.cjs", "providers.json"]) {
+for (const f of [...PLAIN, ...TOOLS, "tools/build-model-catalog.cjs", "providers.json"]) {
   const p = path.join(ROOT, f);
   if (!fs.existsSync(p)) continue;
   const hits = [];
