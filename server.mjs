@@ -41,7 +41,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { filterBody } from "./filter.mjs";
 import { guardBody, selectRules, summarize } from "./egress-guard.mjs";
-import { bridgeAnthropicStream, bridgeChatStream, toAnthropicBody, toChatBody, flattenTools, splitWireName } from "./bridge.mjs";
+import { bridgeAnthropicStream, bridgeChatStream, toAnthropicBody, toChatBody, flattenTools, splitWireName, joinWireName } from "./bridge.mjs";
 import { record as recordUsage } from "./usage.mjs";
 import { statsApi } from "./stats-api.mjs";
 import { stripForeignItemIds, stripAllItemIds, isItemIdRejection } from "./responses-ids.mjs";
@@ -265,6 +265,13 @@ function restoreNamespacedCalls(node, toolMap) {
     if (split.namespace) {
       node.name = split.name;
       node.namespace = split.namespace;
+    } else if (toolMap && toolMap.byBare && toolMap.byBare.has(node.name)) {
+      // Safety net: the model emitted the bare sub-tool name instead of the flat
+      // wire name. Only unambiguous owners are in byBare (one namespace, and no
+      // flat tool shadows it), so a real flat tool can never be captured here.
+      const owner = toolMap.byBare.get(node.name);
+      node.name = owner.name;
+      node.namespace = owner.namespace;
     }
   }
   for (const k of Object.keys(node)) {
@@ -1626,25 +1633,59 @@ const server = http.createServer(async (req, res) => {
   // here because this is the native-responses passthrough. `passthroughToolMap`
   // carries the return direction: without it the upstream's flat call name comes back
   // as `multi_agent_v1__spawn_agent` and Codex does not recognise it as spawn_agent.
+  //
+  // Both halves are required, measured 2026-10-06/07 on kiro:
+  //  1. OUT: flatten the tool list AND rename replayed function_calls to the flat
+  //     wire names. Without the rename the model reads its own history (bare
+  //     `spawn_agent`) and calls the bare name; the upstream returns that bare
+  //     name, which cannot be mapped back, and Codex answers
+  //     "unsupported call: spawn_agent". Same request with the history renamed:
+  //     the call comes back as `multi_agent_v1__spawn_agent` and spawns normally.
+  //  2. BACK: restore {name, namespace} using the maps flattenTools built - never
+  //     split on "__", because namespace ids themselves contain it
+  //     (mcp__codex_app); parsing made mcp__codex_app__list_threads resolve to
+  //     namespace "mcp". `byBare` is the safety net for a model that still emits
+  //     the bare sub-tool name: unambiguous owners only.
   let passthroughToolMap = null;
   if (route.flattenNamespaceTools && isResponses && req.method === "POST" && sentBody !== undefined) {
     try {
       const parsed = JSON.parse(sentBody);
       if (Array.isArray(parsed.tools) && parsed.tools.some((t) => t && t.type === "namespace")) {
-        const map = { byWire: new Map(), byPair: new Map() };
-        const { flat } = flattenTools(parsed.tools);
+        const { flat, byWire, byPair } = flattenTools(parsed.tools);
         parsed.tools = flat;
-        // Rebuild the maps from the flat list so the return direction resolves.
-        for (const t of flat) {
-          const i = t.name.indexOf("__");
-          if (i > 0) {
-            map.byWire.set(t.name, { namespace: t.name.slice(0, i), name: t.name.slice(i + 2) });
-            map.byPair.set(t.name.slice(0, i) + "\u0000" + t.name.slice(i + 2), t.name);
+        const flatNames = new Set(flat.map((t) => t && t.name).filter(Boolean));
+        const bareOwners = new Map();
+        for (const pair of byWire.values()) {
+          bareOwners.set(pair.name, (bareOwners.get(pair.name) ?? 0) + 1);
+        }
+        const byBare = new Map();
+        for (const pair of byWire.values()) {
+          if (flatNames.has(pair.name)) continue; // a real flat tool shadows it
+          if (bareOwners.get(pair.name) !== 1) continue; // two namespaces own it
+          byBare.set(pair.name, { namespace: pair.namespace, name: pair.name });
+        }
+        const map = { byWire, byPair, byBare };
+        let renamed = 0;
+        if (Array.isArray(parsed.input)) {
+          for (const it of parsed.input) {
+            if (!it || it.type !== "function_call" || typeof it.name !== "string") continue;
+            if (byWire.has(it.name)) continue; // already the flat wire name
+            let wire = null;
+            if (it.namespace) {
+              wire = joinWireName(it.name, it.namespace, map);
+            } else if (byBare.has(it.name)) {
+              const owner = byBare.get(it.name);
+              wire = joinWireName(owner.name, owner.namespace, map);
+            }
+            if (wire && wire !== it.name) {
+              it.name = wire;
+              renamed++;
+            }
           }
         }
         passthroughToolMap = map;
         sentBody = JSON.stringify(parsed);
-        log(`namespace-tools ${prefix}${rest} -> ${route.name}: expanded ${parsed.tools.length} flat tool(s)`);
+        log(`namespace-tools ${prefix}${rest} -> ${route.name}: expanded ${parsed.tools.length} flat tool(s); renamed ${renamed} replayed call(s)`);
       }
     } catch (e) {
       log(`!! namespace-tools expansion failed on ${prefix}${rest}; forwarding as-is: ${e?.message ?? e}`);

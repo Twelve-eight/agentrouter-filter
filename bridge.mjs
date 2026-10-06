@@ -948,6 +948,7 @@ function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = nu
 export {
   flattenTools,
   splitWireName,
+  joinWireName,
   bridgeAnthropicStream,
   bridgeChatStream,
   createResponsesEmitter,

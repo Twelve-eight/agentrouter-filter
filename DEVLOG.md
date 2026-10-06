@@ -3215,3 +3215,79 @@ catalog 是启动时读取一次（本文件 2026-10-06 (4)/(7)），进程启�
 **唯一未覆盖的边界**：本轮探针都是脚本发的裸请求，没有在**当前 Codex 会话界面里**
 手动贴图验证（那需要用户自己操作）。若界面仍不显示图片能力，先查该会话是否在
 catalog 写入之前启动 —— 是则重启 Codex。
+
+## 2026-10-07 (2): kiro 子代理"部分成功、部分失败"的真根因 —— 历史重放没改写
+
+用户报："那个会话仍然告诉我它不能调 dsv4.1f 子代理"。
+
+### 现象（两个会话都能复现，同一会话内自相矛盾）
+
+会话 `01a0e7ad-00be`（主模型 `ki:opus5.5`）在 2026-10-06 03:32–04:12 的记录里，
+`spawn_agent` 调用**有时成功、有时 `unsupported call: spawn_agent`**：
+
+| 行 | 调用名 | namespace | 结果 |
+|---|---|---|---|
+| 68 | spawn_agent | `multi_agent_v1` | **成功**（返回 agent_id） |
+| 110 | spawn_agent | **无** | `unsupported call: spawn_agent` |
+| 111 | spawn_agent | **无** | `unsupported call: spawn_agent` |
+| 118 | spawn_agent | `multi_agent_v1` | **成功** |
+| 150/325/331/337/343/367/373 | spawn_agent | **无** | 全部 `unsupported call` |
+
+**失败样本全部缺少 `namespace` 字段** —— 这是根因的方向标，不是模型随机失误。
+
+### 复现（mock 上游捕获真实出站字节，决定性）
+
+隔离实例（7880，指向 127.0.0.1:7891 的 mock 上游），发一个和真实会话同形的第二轮请求
+（历史里有 `{name:"spawn_agent", namespace:"multi_agent_v1"}` 的旧调用 + 声明 namespace 工具）：
+
+```
+--- tools sent upstream:            name=[multi_agent_v1__spawn_agent]     <- 已扁平化
+--- history function_calls sent:    name=[spawn_agent] namespace=[multi_agent_v1]  <- 没改写！
+```
+
+**出站只做了半边**：工具表扁平了，历史调用没有。模型读到自己的历史（裸名 `spawn_agent`），
+下一次就用裸名调用；上游如实回裸名；回程映射（byWire 只认扁平名）查不到 → 原样透传 →
+Codex 的 `registry.rs:554` 查不到 `spawn_agent` 这个默认命名空间的工具 → `unsupported call`。
+
+对比 `bridge.mjs`：chat 与 anthropic 两条桥接都有 `joinWireName()` 做这半边
+（`bridge.mjs:146`、`:326`），**唯独 responses 直通漏了**。
+
+### 第二个缺陷（同段代码）：用 `"__"` 切名会切错 mcp 命名空间
+
+旧代码从扁平名重建映射时按**第一个** `"__"` 切分：
+
+```
+mcp__codex_app__list_threads  ->  namespace "mcp", name "codex_app__list_threads"   (错)
+```
+
+`flattenTools()` 本身返回权威的 `byWire`/`byPair` 映射，重建纯属多余且有害。
+真实数据佐证：`mcp__codex_app::list_threads` 确实以带 namespace 的形态存在于会话记录中。
+
+### 修复（`server.mjs` 直通路径 + `bridge.mjs` 导出一行）
+
+1. `bridge.mjs`：导出 `joinWireName`（原为模块内私有）。
+2. `server.mjs` 直通分支：
+   - 直接用 `flattenTools()` 返回的 `byWire`/`byPair`，**删掉 `"__"` 切分重建**；
+   - **出站新增历史改写**：`parsed.input` 里每个 `function_call`，若 `byWire` 没有它，
+     就按 `joinWireName(name, namespace)` 改写为扁平线名；无 namespace 但有唯一裸名归属的也改写；
+   - 新增 `byBare` 安全网：只有**唯一归属**（一个命名空间拥有、且没有同名扁平工具）的裸名
+     才允许还原，防止把真实扁平工具错认成命名空间子工具；
+   - 日志加 `renamed N replayed call(s)`。
+3. 回程（SSE 与非流式两处）用同一 `toolMap`，`byBare` 兜底。
+
+### 验证（全部实跑）
+
+| 层面 | 证据 |
+|---|---|
+| 隔离 + mock 上游 | 历史改写生效；回程 namespace 正确 |
+| 隔离 + **真实 kiro** | 同形请求返回 `name=spawn_agent namespace=multi_agent_v1`（HTTP 200） |
+| 新增回归测试 | `tools/test-namespace-passthrough.mjs` **14 项全过**（含流式 SSE、歧义、扁平遮蔽、mcp 切名） |
+| 全量回归 | 13 个测试文件全过，0 失败；`check-syntax` 全过（新测试已入门禁） |
+
+新增测试覆盖的边界：历史改写、回程还原、裸名安全网、双命名空间歧义（不猜）、
+扁平工具遮蔽（不抢）、`mcp__codex_app` 切名、非 adopt 路由不受影响、流式 SSE 逐行改写。
+
+### 生效条件
+
+`server.mjs` 改动**需要重启网关**（`providers.json` 每请求读，但这次逻辑在 server.mjs）。
+隔离实例（7880/7881/7882/7883/7891）已全部停止。

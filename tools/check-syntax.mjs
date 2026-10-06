@@ -56,6 +56,7 @@ const TOOLS = [
   "tools/model-inventory.mjs",
   "tools/probe-subagent-models.mjs",
   "tools/probe-catalog-reload.mjs",
+  "tools/test-namespace-passthrough.mjs",
 ];
 for (const f of TOOLS) {
   const p = path.join(ROOT, f);
