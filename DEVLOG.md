@@ -2949,3 +2949,54 @@ VERDICT: STARTUP ONLY - the running process keeps the catalog it loaded; RESTART
 - `probe-subagent-models.mjs --order` → `ORDERING OK`
 - `check-syntax` 全过（含 3 个 tools/*.mjs）
 - 12 个测试文件全过，0 失败
+
+## 2026-10-06 (5): 过滤/脱敏的作用范围 —— 用户定案 + 一个待填的空白
+
+用户定案（原文两段，前一段后来撤回）：
+1. "解除所有屏蔽词限制，只对明确 agentrouter 的模型开过滤，我们正在远离 agentrouter"
+2. "脱敏保留，对所有模型生效" → 随后撤回 → "不用了，脱敏只生效 woker 也行"
+
+**结论：一行都不用改。** 现状恰好就是定案后的目标状态：
+
+| 功能 | 实现 | 作用范围 | 证据 |
+|---|---|---|---|
+| 屏蔽词过滤（字符白名单 + GLM 词表 + 身份改写） | `providers.json` 的 `filter: true` | **只有 agentrouter** | 见下实测 |
+| 脱敏（密钥 / 主机身份 / 路径 / 内网 IP） | `providers.json` 的 `egressGuard: true` | **只有 justwoker** | 本文件 1095 行的原始决定 |
+
+### 屏蔽词范围实测（不是读代码推断）
+
+同一份触发载荷 `CTRLPROBE 😀 RelicChoice NetId timewarp ---` 打四个 provider，
+按网关日志里 `filter rewrote` 行数的增量判断：
+
+| provider | 模型 | HTTP | rewrites 增量 |
+|---|---|---|---|
+| opencode-zen | `space-bunny-free` | 200 | **0** |
+| northstar-kiro | `ki:sonnet5.5` | 200 | **0** |
+| wb2api | `global:gpt-6-astra` | 503（上游故障） | **0** |
+| ovoapi | `ovoapi:6.1sol` | 403（上游故障） | **0** |
+| **agentrouter** | `deepseek-v4-flash` | 400 content-blocked | **1** |
+
+本地函数验证改写确实发生（排除"探针没触发"）：
+`"CTRLPROBE-A 😀 RelicChoice NetId timewarp ---"` → `"CTRLPROBE-A  relic choice net id time warp ---"`。
+
+注：agentrouter 那格 400 是**预期**的 —— 载荷里有 emoji 和触发词，正是上游会拦的东西；
+它 400 而不是被改写后 200，是因为 agentrouter 的字符/词表规则只覆盖已知组合，
+新造的探针串仍可能撞上未枚举的规则。这不影响"其它 provider 完全没被改写"这个结论。
+
+### 待填的空白（本次只记录，未实施）
+
+**脱敏目前只挂在两条桥接链路里**，`server.mjs` 中 `guardBody(...)` 只有两处调用：
+
+- :1285 —— `responses -> chat` 桥接（`sendChat`，26 个 chat-wire 模型）
+- :1450 —— `responses -> anthropic` 桥接（3 个 anthropic-wire 模型）
+
+**原生 responses 直通路径没有任何脱敏调用点**，而走这条路的有 **54 个模型** ——
+含 relaycat / relaycat65 / relaycat-cn / wb2api / anyrouter / northstar-kiro /
+antigravity / motomoto / ovoapi 全系。
+
+即：如果将来要给这些 provider 开脱敏，**只在 `providers.json` 里写 `egressGuard: true`
+不会生效** —— 因为 `route.egressGuard` 在两个桥接分支里被读取，直通分支根本不看它。
+必须先在直通路径上加调用点。这与本仓库历史上反复踩的"配置看起来对、实际不参与"是同一类坑
+（参见 1857 行那条同类教训）。
+
+用户明确表示"只生效 woker 也行"，所以本次**不动**，仅留档。
