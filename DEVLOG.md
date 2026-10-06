@@ -2777,3 +2777,30 @@ OVOAPI_AMZ/ANTIGRAVITY/NSCN_KIRO 七个），它来自 Machine 作用域环境�
 Canvas（82 行完整清单 + 用量）：
 `C:\Users\o_Obl\.cursor\projects\1784557707559\canvases\model-usage-inventory.canvas.tsx`
 （用 `tsc` + 真实 canvas SDK 类型定义校验，0 error；此前的版本有语法损坏已重写）。
+
+### 并发实测（2026-10-06 08:50）
+
+用户问"子代理模型真的有上限吗"。为区分"模型上限"与"并发上限"，一次性 spawn 10 个：
+
+| 子代理 | 请求模型 | turn_context 实际模型 | 结果 |
+|---|---|---|---|
+| Jason | mimo-v2.6-flash-free | mimo-v2.6-flash-free | CONC-A |
+| Avicenna | space-bunny-free | space-bunny-free | CONC-B |
+| Banach | zen:space-bunny | zen:space-bunny | CONC-C |
+| Huygens | ki:sonnet5.5 | ki:sonnet5.5 | CONC-D |
+| Socrates | cn:deepseek-v4.1-flash | cn:deepseek-v4.1-flash | CONC-E |
+| Hegel | ovoapi:gpt-5.6-sol | ovoapi:gpt-5.6-sol | 上游 403 卡住，手动关闭 |
+| Meitner | deepseek-v4.1-flash | deepseek-v4.1-flash | 完成（内容为空） |
+| Mencius | gpt-6-astra | gpt-6-astra | CONC-H |
+| Mill | global:deepseek-v4.1-flash | global:deepseek-v4.1-flash | CONC-I |
+| Chandrasekhar | claude-opus-4-8 | claude-opus-4-8 | 上游 503 卡住，手动关闭 |
+
+**10 个全部被受理，0 次 `agent thread limit reached`。** 6 个返回预期 token，2 个因上游故障
+（ovoapi 403、justwoker 503）滞留，2 个正常结束。`turn_context` 逐个核对，**每个子代理实际
+路由到的模型都等于请求的模型**（含 `zen:` / `cn:` / `ovoapi:` / `ki:` 前缀别名）。
+
+即：模型选择**没有白名单**，并发上限（`max_concurrent_threads_per_session = 1000000`）
+在 10 路下也没触发。滞留的两个是上游额度/故障，与 Codex 侧无关。
+
+附：本次实验的失败不是并发导致 —— 同一时段 usage 账本里 `ovoapi gpt-5.6-sol` 连续 403、
+`justwoker claude-opus-4-8` 连续 503，两者都是**单请求失败**（dur 260-1500ms），没有排队特征。
