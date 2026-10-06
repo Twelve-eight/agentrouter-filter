@@ -74,52 +74,47 @@ const BASE = 'You are Codex, a coding agent. You and the user share the same wor
 // verified accepted by both the agentrouter and wb2api paths.
 const DEFAULT_EFFORT = 'max';
 
-// A 5-slot HINT list shown to the model as "Available model overrides".
+// PICKER SCOPE (2026-10-06, user decision).
 //
-// CORRECTED 2026-10-02 after reading codex 0.159.0 source: this is NOT a whitelist.
-// spawn_agent validates a requested model with find_spawn_agent_model_name()
-// (codex-rs/core/src/agent/child_config.rs), which accepts ANY catalog entry whose
-// multi_agent_version is not Disabled - priority is never consulted. Measured: a
-// live spawn_agent with model="space-bunny-free" (priority 0, absent from this
-// list) was accepted and its session metadata recorded that exact model.
+// The user reviewed the full usage-ranked inventory and named the models they
+// want offered, in this order. Everything else is marked visibility "hide":
+// it disappears from the picker and from the spawn_agent hint, but stays in the
+// catalog and therefore stays ROUTABLE and SPAWNABLE by name.
 //
-// So every registered model is already spawnable; this list only controls which 5
-// names are SUGGESTED in the tool description, because Codex hard-codes
-// MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5 (child_config.rs:20) for that text.
-// Prioritize the models the user actually reaches for.
+// Why hide instead of deleting the entries:
+//   - the desktop title generator calls the built-in slug gpt-5.6-luna on every
+//     new thread; dropping it from the registry reproduced the 503 storm
+//     documented in DEVLOG 2026-09-22;
+//   - the auto-review feature calls codex-auto-review;
+//   - the user's standing rule is that EVERY registered model must remain
+//     usable as a sub-agent (find_spawn_agent_model_name never consults
+//     visibility - child_config.rs:323-329).
+// Hiding satisfies all three: model/list filters on show_in_picker, so the
+// picker shows exactly the models below, while the routes stay alive.
 //
-// Usage across data/usage/*.jsonl, re-counted 2026-09-28 (15009 rows):
-//   global:deepseek-v4.1-flash  5662   kept  - the workhorse dev model
-//   claude-opus-4-8             2833   kept  - user-requested; qualifies only
-//                                              because the anthropic RETURN path
-//                                              now forwards toolMap (see the note
-//                                              at the bridgeAnthropicStream call
-//                                              in server.mjs)
-//   cn:deepseek-v4.1-flash      2235   kept  - the fallback realm
-//   mimo-v2.6-flash-free          17   kept  - the zen free model actually in use
-//   zen:mimo-v2.6-flash            0   EVICTED 2026-09-28 for motomoto:gpt-6-astra
+// The trailing comment numbers are the ranks from the inventory published to
+// the user on 2026-10-06 (7-day half-life weighted, data/usage/*.jsonl).
 //
-// zen:mimo-v2.6-flash held its slot as "the documented example of a prefixed
-// alias", but it was never called once in 15009 rows while motomoto:gpt-6-astra
-// was explicitly requested as a sub-agent route. A zero-use alias is not worth a
-// slot that a requested model can occupy. The prefixed-alias case is still
-// covered by the registry (zen:space-bunny, motomoto:*, global:*) - it just no
-// longer occupies one of these five.
-//
-// WARNING about motomoto:gpt-6-astra as a sub-agent - it is measured SLOW.
-// 2026-09-28 probes through the live gateway: plain call 128s, call WITH tools
-// 230s, tool-calling call 124s (it DID return a correct function_call for
-// exec_command). Compare global:deepseek-v4.1-flash 1.4s and claude-opus-4-8
-// 5.7s. A sub-agent on this route is 20-150x slower than the others and can cross
-// AGENTS.md Sec 11's 10-minute split threshold in a few turns. It is offered
-// because the user asked for it; prefer the other four for real work.
-const OVERRIDE_SLUGS = new Set([
-  'global:deepseek-v4.1-flash',
-  'cn:deepseek-v4.1-flash',
-  'mimo-v2.6-flash-free',
-  'motomoto:gpt-6-astra',
-  'claude-opus-4-8',
-]);
+// HINT: spawn_agent's "Available model overrides" block is capped at 5
+// (MAX_SPAWN_AGENT_MODEL_OVERRIDES, child_config.rs:20) and is filled from the
+// head of the picker order, so the first five entries below are the five names
+// that block advertises.
+const KEEP_SLUGS = [
+  'ovoapi:6.1sol',              // #2  - second-heaviest route in the pool
+  'global:deepseek-v4.1-flash', // #1  - the workhorse dev model
+  'cn:deepseek-v4.1-flash',     // #3  - the fallback realm
+  'claude-opus-4-8',            // #5  - user-requested; anthropic RETURN path
+  'ki:opus5.5',                 // #15 - northstar kiro
+  'space-bunny-free',           // #12 - zen free tier
+  'deepseek-v4-flash',          // #14 - agentrouter
+  'global:gpt-6-astra',         // #25 - wb2api
+  'ki:sonnet5.5',               // #29 - northstar kiro
+  'rc65:6.1sol',                // #30 - relaycat 0.065 group
+  'ag:gemini3.8h',              // new - antigravity gemini-3.8-flash-high
+];
+const KEEP_SET = new Set(KEEP_SLUGS);
+// The five names spawn_agent advertises: the head of the picker order.
+const HINT_SLUGS = new Set(KEEP_SLUGS.slice(0, 5));
 // Display names. Two rules, both requested by the user:
 //   1. the route marker is the GROUP MULTIPLIER, not the word "via" - "(0.065)"
 //      reads as "served through the 0.065x group" and is shorter;
@@ -199,8 +194,8 @@ function entry(slug, display, description, efforts, contextWindow, modalities = 
     //                   NOT gate spawning: the validator accepts any catalog entry.
     //                   So 0 (default) keeps an entry routable and pickable while
     //                   leaving the hint list alone.
-    // OVERRIDE_SLUGS below only chooses which 5 models get advertised in the hint.
-    priority: OVERRIDE_SLUGS.has(slug) ? -1 : 0,
+    // HINT_SLUGS below chooses which 5 models get advertised in the hint.
+    priority: HINT_SLUGS.has(slug) ? -1 : 0,
     supports_reasoning_summaries: true,
     default_reasoning_summary: 'none',
     support_verbosity: false,
@@ -422,18 +417,25 @@ function usageScoreOf(slug) {
   return USAGE_SCORES.get(`${spec.p}|${spec.m ?? slug}`) ?? 0;
 }
 const oursOrdered = (() => {
-  // The pinned entries keep their registry order: they already lead the picker
-  // through priority -1, and that same order is what spawn_agent's hint lists.
-  const pinned = ours.filter((m) => OVERRIDE_SLUGS.has(m.slug));
-  const ranked = ours
-    .filter((m) => !OVERRIDE_SLUGS.has(m.slug))
+  // The kept models lead, in the exact order the user listed them. The rest
+  // follow in usage order - they are hidden from the picker, but their position
+  // still decides where they would reappear if one is ever un-hidden.
+  const rank = new Map(KEEP_SLUGS.map((slug, i) => [slug, i]));
+  const missing = KEEP_SLUGS.filter((slug) => !ours.some((m) => m.slug === slug));
+  if (missing.length) {
+    throw new Error(`refusing to build: KEEP_SLUGS names models the registry does not serve: ${missing.join(', ')}`);
+  }
+  const kept = ours
+    .filter((m) => rank.has(m.slug))
+    .sort((a, b) => rank.get(a.slug) - rank.get(b.slug));
+  const rest = ours
+    .filter((m) => !rank.has(m.slug))
     .map((m, i) => ({ m, i, score: usageScoreOf(m.slug) }))
     // Stable: equal scores - including the whole no-traffic tail - keep registry order.
     .sort((a, b) => (b.score - a.score) || (a.i - b.i))
     .map((x) => x.m);
-  const top = ranked.slice(0, 8).map((m) => `${m.slug}(${Math.round(usageScoreOf(m.slug))})`);
-  console.log(`order: gateway usage, ${USAGE_HALF_LIFE_DAYS}d half-life; top: ${top.join(', ')}`);
-  return [...pinned, ...ranked];
+  console.log(`picker: ${kept.length} listed, ${rest.length} hidden`);
+  return [...kept, ...rest];
 })();
 
 // 3) merge, built-ins first.
@@ -457,7 +459,7 @@ const collisions = oursOrdered.filter((m) => have.has(m.slug));
 // by codex but served by nobody; codex-auto-review is now in the registry.)
 // Guard: the spawn_agent override list is capped at 5 entries and is filled in
 // catalog order, built-ins first. A built-in entry with a negative priority would
-// therefore silently evict one of OVERRIDE_SLUGS. Today every built-in uses a
+// therefore silently evict one of HINT_SLUGS. Today every built-in uses a
 // positive value (astra 1 .. codex-auto-review 43) - fail loudly if that changes,
 // rather than shipping a sub-agent list that quietly lost a model.
 const builtinNegative = builtin.models.filter((m) => typeof m.priority === "number" && m.priority < 0);
@@ -467,14 +469,21 @@ if (builtinNegative.length) {
       'they would occupy slots in the spawn_agent override list - re-check that list before proceeding',
   );
 }
-if (OVERRIDE_SLUGS.size > 5) {
-  throw new Error(`refusing to build: OVERRIDE_SLUGS has ${OVERRIDE_SLUGS.size} entries but the spawn_agent override list only shows 5`);
+if (HINT_SLUGS.size > 5) {
+  throw new Error(`refusing to build: HINT_SLUGS has ${HINT_SLUGS.size} entries but the spawn_agent override list only shows 5`);
 }
 const ROUTED = new Set(Object.keys(REGISTRY.models).filter((k) => REGISTRY.models[k] && typeof REGISTRY.models[k] === "object"));
 const droppedBuiltins = builtin.models.filter((m) => !ROUTED.has(m.slug)).map((m) => m.slug);
 const keptBuiltins = builtin.models.filter((m) => ROUTED.has(m.slug));
 
 const merged = { models: [...keptBuiltins, ...added] };
+
+// Picker scope, enforced over the WHOLE catalog (built-ins included). Built-in
+// entries are not in KEEP_SLUGS, so they are hidden too - they stay routable
+// through the gateway, which is all the title generator and auto-review need.
+for (const m of merged.models) {
+  m.visibility = KEEP_SET.has(m.slug) ? 'list' : 'hide';
+}
 
 // 4) Normalize the default reasoning level across the WHOLE catalog, built-ins
 //    included.

@@ -2823,3 +2823,72 @@ Canvas（82 行完整清单 + 用量）：
 responses-ids 16 / egress-guard 16 / egress-scan 28 / bridge-rude-close 8，其余 "all checks passed"），0 失败。
 
 DEVLOG 里原来指向 `G:\tmp\prio-probe.cjs` 与 `G:\tmp\export.cjs` 的两处引用已改写为上述仓库路径。
+
+## 2026-10-06 (3): 选择器收窄到 11 个模型 + 提示位 = 列表前五 + antigravity gemini
+
+用户决定（原文）："提示位换成模型列表的前五个。模型列表只保留 2，1，3，5，15，12，14，25，29，30，gemini3.8high(antigravity)"。
+编号取自 2026-10-06 我发布给用户的那份用量榜单（7 天半衰期加权）。
+
+### 编号 -> slug 映射（逐条核对过）
+
+| 编号 | slug | 加权 | 备注 |
+|---|---|---|---|
+| 2 | `ovoapi:6.1sol` | 9697 | 用量第二 |
+| 1 | `global:deepseek-v4.1-flash` | 18296 | 主力 |
+| 3 | `cn:deepseek-v4.1-flash` | 3534 | 国内版回退 |
+| 5 | `claude-opus-4-8` | 940 | |
+| 15 | `ki:opus5.5` | 34 | northstar kiro |
+| 12 | `space-bunny-free` | 52 | zen 免费 |
+| 14 | `deepseek-v4-flash` | 37 | agentrouter |
+| 25 | `global:gpt-6-astra` | 7 | wb2api |
+| 29 | `ki:sonnet5.5` | 4 | northstar kiro |
+| 30 | `rc65:6.1sol` | 3 | relaycat 0.065 |
+| - | `ag:gemini3.8h` | 0 | 新增，见下 |
+
+### 实现：`visibility: "hide"`，不是删除
+
+`tools/build-model-catalog.cjs` 新增 `KEEP_SLUGS`（上述 11 个，按用户给序）替换原
+`OVERRIDE_SLUGS`；`HINT_SLUGS = KEEP_SLUGS.slice(0, 5)` 决定提示位。合并后对**整份**
+catalog（含内置条目）统一执行 `visibility = KEEP_SET.has(slug) ? 'list' : 'hide'`。
+
+**为什么隐藏而不是删除条目**（三条都有实证，不是推理）：
+
+1. 桌面版每建一个线程就调标题生成，用的是内置 slug `gpt-5.6-luna`；把它从注册表删掉
+   会重演 DEVLOG 2026-09-22 记录的 503 风暴。
+2. auto-review 走 `codex-auto-review`。
+3. 用户长期规则：所有已注册模型都必须仍能作为子代理使用。
+
+**源码依据**（`G:\tmp\codex-src\codex-rs`，codex 0.160.0）：
+
+- `core/src/agent/child_config.rs:323-329` —— `find_spawn_agent_model_name()` 只匹配
+  `model.model == requested && multi_agent_version != Disabled`，**不看 `show_in_picker`**。
+  即隐藏只影响"提示文案"，不影响能不能 spawn。
+- `core/src/context/world_state/model_catalog.rs:31-36` 与
+  `core/src/tools/handlers/multi_agents_spec.rs:827-832` —— 提示块取前 5 个
+  `show_in_picker` 的条目（`MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5`，child_config.rs:20）。
+- `visibility` 合法值只有 `list` / `hide` / `none`（合成目录实测报错信息），
+  内置目录里 `gpt-5.4` 与 `codex-auto-review` 本来就是 `hide`。
+
+### antigravity gemini
+
+`providers.json` 新增 `ag:gemini3.8h -> gemini-3.8-flash-high`。
+
+**当前仍然不通**（同日复测）：`/v1/chat/completions` 与 `/v1/responses` 都是
+400 `User location is not supported for the API use.`；同 provider 的
+`claude-sonnet-4-6` 200 作为对照。原因见 providers.json 里那段既有注释 ——
+antigravity-tools 的业务流量不走它配置的上游代理（实测它对 7897 的连接数为 0），
+地区判定发生在 Google 侧，不是我们网关能改的。**已按用户要求注册并路由，但需按
+"已注册、暂不可用"对待**，直到某次探测返回 200。
+
+### 验证
+
+| 项 | 方法 | 结果 |
+|---|---|---|
+| 选择器顺序 | 真实 `codex.exe app-server` + `model/list`，隔离 CODEX_HOME 指向新 catalog | **11 个**，顺序 = 用户给序 |
+| 提示块内容 | 抓包代理 8123 截获真实请求体 | 前五 = `ovoapi:6.1sol` / `global:deepseek-v4.1-flash` / `cn:deepseek-v4.1-flash` / `claude-opus-4-8` / `ki:opus5.5` |
+| 隐藏模型仍可用 | 隔离实例把 `zen:space-bunny`（已隐藏）设为主模型，指向本地捕获服务 | **请求送达**，`body.model == "zen:space-bunny"`，exit 0 |
+| 网关路由新条目 | 7878 `/u/v1/responses` 调 `ag:gemini3.8h` | 400 上游地区封锁（网关路由正确，故障在上游） |
+| 语法门禁 | `check-syntax.mjs` | all checks passed |
+| catalog 完整性 | 83 条（11 list + 72 hide） | `gpt-5.6-luna` / `codex-auto-review` 仍在，均为 hide |
+
+`providers.json` 每请求读取，**不需要重启网关**；catalog 需要重启 Codex 才生效。
