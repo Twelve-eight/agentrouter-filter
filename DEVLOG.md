@@ -3099,3 +3099,69 @@ catalog 是**启动时读取一次**（见本文件 2026-10-06 (4) 与 README"�
 - `check-syntax` 全过
 - `probe-catalog-reload.mjs` → `STARTUP ONLY`（再次确认重启要求）
 - `model-inventory.mjs --canvas` 重生成画布，`tsc` 0 error
+
+## 2026-10-06 (8): kiro 丢 namespace 工具 —— opus5.5 当主模型时调不出子代理
+
+用户报："你没有让 opus5.5 能调用子代理。"
+
+### 根因
+
+Codex 0.155+ 把多智能体工具声明成**一个 namespace 条目**：
+
+```json
+{ "type": "namespace", "name": "multi_agent_v1",
+  "tools": [ {"name":"spawn_agent"}, {"name":"wait_agent"}, ... ] }
+```
+
+`bridge.mjs` 的 `flattenTools()` 会把它展开成扁平函数 `multi_agent_v1__spawn_agent` ——
+但**只对 chat 和 anthropic 两条桥接链路生效**。原生 responses 直通路径原样转发，
+而 **kiro 会静默丢弃这个形状**，模型因此完全看不到 `spawn_agent`。
+
+### 实测证据（决定性）
+
+同一模型 `ki:opus5.5`、同一提示、同一种 namespace 工具形状，只换上游：
+
+| 上游 | namespace 形状 | 扁平形状 |
+|---|---|---|
+| **kiro** | **无调用**（"I don't have a sub-agent tool available"） | 调用成功 |
+| relaycat (`rc65:6.1sol`) | 调用成功 | 调用成功 |
+| agentrouter (`gpt-6-astra`) | 调用成功 | 调用成功 |
+| wb2api (`cn:glm-5.3`) | 无调用 | 无调用（模型自身不调，非工具丢失） |
+
+**kiro 是唯一"扁平能调、namespace 不能调"的上游**，这个对照排除了"模型不愿意调"的解释。
+
+真实会话佐证：`~/.codex/sessions/2026/10/06/rollout-2026-10-06T11-10-11-*`（主模型 `ki:opus5.5`）
+的 reasoning 里反复出现 "I don't have a subagent spawning tool available"，14 次调用全是
+`exec_command`/`write_stdin`/`view_image`，没有一次 `spawn_agent`。
+
+### 修复
+
+按 provider 开关（**不全局改**，因为 relaycat/agentrouter 原生就懂 namespace 形状）：
+
+1. `providers.json`：`northstar-kiro` 加 `"flattenNamespaceTools": true`。
+2. `bridge.mjs`：导出 `flattenTools` 与 `splitWireName`（原本是模块内私有）。
+3. `server.mjs` 直通路径：
+   - **出站**：`route.flattenNamespaceTools` 为真且有 namespace 条目时，展开成扁平函数，
+     并把 `byWire`/`byPair` 映射表留给返回方向；
+   - **入站**：上游回的扁平名 `multi_agent_v1__spawn_agent` 还原成
+     `{name:"spawn_agent", namespace:"multi_agent_v1"}` —— 否则 Codex 认不出，
+     这正是 2026-09-24 那条"回复路径半边"的教训（`bridge.mjs:1532` 注释）；
+   - 流式响应因此不能盲 `pipe`：改为按行缓冲、还原、再写出（无该标志时保持原零拷贝 pipe）。
+
+### 验证（隔离实例 7879，未碰生产 7878）
+
+| 网关 | 结果 |
+|---|---|
+| 7878（旧代码） | namespace 工具 → **无 function_call**，模型说没有子代理工具 |
+| 7879（修复后） | namespace 工具 → **`multi_agent_v1::spawn_agent`** |
+
+返回的是带 namespace 的正确形状，不是扁平名 —— 说明出站展开与入站还原两半都对。
+
+- 12 个测试文件全过（0 失败）
+- `check-syntax` 全过
+- 隔离实例已停止
+
+### 生效条件
+
+`server.mjs` 改动**需要重启网关**（`providers.json` 每请求读取，但这次的逻辑在 server.mjs 里）。
+重启后 `ki:opus5.5` / `ki:sonnet5.5` 才能以主模型身份派发子代理。

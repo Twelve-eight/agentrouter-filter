@@ -946,6 +946,8 @@ function bridgeAnthropicStream(upstream, res, model, stream = true, onUsage = nu
 }
 
 export {
+  flattenTools,
+  splitWireName,
   bridgeAnthropicStream,
   bridgeChatStream,
   createResponsesEmitter,

@@ -41,7 +41,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { filterBody } from "./filter.mjs";
 import { guardBody, selectRules, summarize } from "./egress-guard.mjs";
-import { bridgeAnthropicStream, bridgeChatStream, toAnthropicBody, toChatBody } from "./bridge.mjs";
+import { bridgeAnthropicStream, bridgeChatStream, toAnthropicBody, toChatBody, flattenTools, splitWireName } from "./bridge.mjs";
 import { record as recordUsage } from "./usage.mjs";
 import { statsApi } from "./stats-api.mjs";
 import { stripForeignItemIds, stripAllItemIds, isItemIdRejection } from "./responses-ids.mjs";
@@ -250,6 +250,46 @@ const STATS_CLIENT_TYPES = {
   ".css": "text/css; charset=utf-8",
 };
 
+// Restore the namespace on a function_call that an upstream emitted under its
+// flat wire name. Codex only recognises {name, namespace} - a bare
+// `multi_agent_v1__spawn_agent` is visible to the user but useless, exactly the
+// reply-path half of the 2026-09-24 lesson recorded in bridge.mjs.
+function restoreNamespacedCalls(node, toolMap) {
+  if (!node || typeof node !== "object") return node;
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) node[i] = restoreNamespacedCalls(node[i], toolMap);
+    return node;
+  }
+  if (node.type === "function_call" && typeof node.name === "string") {
+    const split = splitWireName(node.name, toolMap);
+    if (split.namespace) {
+      node.name = split.name;
+      node.namespace = split.namespace;
+    }
+  }
+  for (const k of Object.keys(node)) {
+    const v = node[k];
+    if (v && typeof v === "object") node[k] = restoreNamespacedCalls(v, toolMap);
+  }
+  return node;
+}
+
+// Rewrite one SSE line if its data payload carries a flattened call name.
+// Non-data lines (event:, id:, blank) pass through byte-identical.
+function restoreNamespacedSseLine(line, toolMap) {
+  const m = /^(data:\s*)(\S.*?)(\r?\n)?$/.exec(line);
+  if (!m) return line;
+  const payload = m[2];
+  if (payload === "[DONE]") return line;
+  let rewritten = payload;
+  try {
+    rewritten = JSON.stringify(restoreNamespacedCalls(JSON.parse(payload), toolMap));
+  } catch {
+    return line; // not JSON we understand - never corrupt the stream
+  }
+  return rewritten === payload ? line : m[1] + rewritten + (m[3] ?? "");
+}
+
 const REGISTRY_PATH = new URL("./providers.json", import.meta.url);
 
 // Read per request, not at module load - same reasoning as the stats client above. A
@@ -318,6 +358,14 @@ function providerFor(model) {
     chat: (typeof spec.wire === "string" ? spec.wire : p.wire) === "chat",
     anthropic: (typeof spec.wire === "string" ? spec.wire : p.wire) === "anthropic",
     filter: p.filter === true,
+    // Some native-responses upstreams silently DROP Codex's namespace tool shape
+    // (`{type:"namespace", name:"multi_agent_v1", tools:[...]}`), so the model never
+    // sees spawn_agent at all. Measured 2026-10-06 on kiro, same model + same prompt:
+    //   namespace shape -> "I don't have a sub-agent tool available in this session"
+    //   flattened       -> the model CALLED multi_agent_v1__spawn_agent immediately
+    // relaycat and agentrouter understand the namespace shape natively (both called
+    // the tool under either shape), so this is per-provider, not global.
+    flattenNamespaceTools: p.flattenNamespaceTools === true,
     // Strict-Responses upstream: a replayed item id must follow its per-type
     // prefix contract, and an id minted by a DIFFERENT upstream has to be
     // dropped before the body leaves. Declared per provider in providers.json so
@@ -1572,6 +1620,38 @@ const server = http.createServer(async (req, res) => {
   // rejection, covering the residue level 1 cannot judge: an id with an
   // acceptable prefix that this upstream has no record of.
   let sentBody = body;
+
+  // Namespace-tool flattening for upstreams that ignore Codex's namespace shape.
+  // Same expansion bridge.mjs already performs for the chat/anthropic wires, applied
+  // here because this is the native-responses passthrough. `passthroughToolMap`
+  // carries the return direction: without it the upstream's flat call name comes back
+  // as `multi_agent_v1__spawn_agent` and Codex does not recognise it as spawn_agent.
+  let passthroughToolMap = null;
+  if (route.flattenNamespaceTools && isResponses && req.method === "POST" && sentBody !== undefined) {
+    try {
+      const parsed = JSON.parse(sentBody);
+      if (Array.isArray(parsed.tools) && parsed.tools.some((t) => t && t.type === "namespace")) {
+        const map = { byWire: new Map(), byPair: new Map() };
+        const { flat } = flattenTools(parsed.tools);
+        parsed.tools = flat;
+        // Rebuild the maps from the flat list so the return direction resolves.
+        for (const t of flat) {
+          const i = t.name.indexOf("__");
+          if (i > 0) {
+            map.byWire.set(t.name, { namespace: t.name.slice(0, i), name: t.name.slice(i + 2) });
+            map.byPair.set(t.name.slice(0, i) + "\u0000" + t.name.slice(i + 2), t.name);
+          }
+        }
+        passthroughToolMap = map;
+        sentBody = JSON.stringify(parsed);
+        log(`namespace-tools ${prefix}${rest} -> ${route.name}: expanded ${parsed.tools.length} flat tool(s)`);
+      }
+    } catch (e) {
+      log(`!! namespace-tools expansion failed on ${prefix}${rest}; forwarding as-is: ${e?.message ?? e}`);
+      passthroughToolMap = null;
+    }
+  }
+
   const canRepairIds = route.strictItemIds && isResponses && req.method === "POST" && body !== undefined;
   if (canRepairIds) {
     const fixed = stripForeignItemIds(body);
@@ -1699,7 +1779,14 @@ const server = http.createServer(async (req, res) => {
       disarmIdle();
       if (settled) return;
       settled = true;
-      const text = Buffer.concat(parts).toString("utf8");
+      let text = Buffer.concat(parts).toString("utf8");
+      if (passthroughToolMap) {
+        try {
+          text = JSON.stringify(restoreNamespacedCalls(JSON.parse(text), passthroughToolMap));
+        } catch {
+          /* not JSON we understand - hand the upstream's bytes through unchanged */
+        }
+      }
       res.end(text);
       let u = null;
       try {
@@ -1773,18 +1860,41 @@ const server = http.createServer(async (req, res) => {
     try { res.destroy(); } catch {}
     bookStream(false, 504);
   });
-  upstream.on("data", (c) => {
-    lineBuf += c.toString("utf8");
-    const lines = lineBuf.split("\n");
-    lineBuf = lines.pop() ?? "";
-    for (const line of lines) scanLine(line);
-  });
-  upstream.on("end", () => {
-    disarmStreamIdle();
-    if (lineBuf) scanLine(lineBuf);
-    bookStream(upstream.statusCode < 400, upstream.statusCode);
-  });
-  upstream.pipe(res);
+  // With namespace flattening active the bytes must be rewritten on the way back,
+  // so the stream cannot be a blind pipe: buffer to line boundaries, restore, flush.
+  // Without the flag this stays the original zero-copy pipe.
+  if (passthroughToolMap) {
+    let outBuf = "";
+    upstream.on("data", (c) => {
+      outBuf += c.toString("utf8");
+      const lines = outBuf.split("\n");
+      outBuf = lines.pop() ?? "";
+      for (const line of lines) scanLine(line);
+      if (lines.length) res.write(lines.map((l) => restoreNamespacedSseLine(l, passthroughToolMap)).join("\n") + "\n");
+    });
+    upstream.on("end", () => {
+      disarmStreamIdle();
+      if (outBuf) {
+        scanLine(outBuf);
+        res.write(restoreNamespacedSseLine(outBuf, passthroughToolMap));
+      }
+      bookStream(upstream.statusCode < 400, upstream.statusCode);
+      res.end();
+    });
+  } else {
+    upstream.on("data", (c) => {
+      lineBuf += c.toString("utf8");
+      const lines = lineBuf.split("\n");
+      lineBuf = lines.pop() ?? "";
+      for (const line of lines) scanLine(line);
+    });
+    upstream.on("end", () => {
+      disarmStreamIdle();
+      if (lineBuf) scanLine(lineBuf);
+      bookStream(upstream.statusCode < 400, upstream.statusCode);
+    });
+    upstream.pipe(res);
+  }
   } catch (e) {
     // Last-resort guard: keep the process alive and tell the client what broke.
     log(`!! unhandled error in handler: ${e?.stack ?? e}`);

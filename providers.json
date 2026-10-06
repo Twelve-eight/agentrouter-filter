@@ -80,6 +80,7 @@
       "egressGuard": true
     },
   "northstar-kiro": {
+    "flattenNamespaceTools": true,
     "base": "https://kiro.northstar.cool",
     "wire": "responses",
     "keyEnv": "NSCN_KIRO_API_KEY",
