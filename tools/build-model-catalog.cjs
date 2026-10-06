@@ -571,10 +571,35 @@ const CTX_PIN = {
   'gpt-6-sol': 240000,
   'gpt-6.1-sol': 240000,
 };
+
+// Kiro (northstar-kiro) context.
+//
+// The upstream publishes no context_length - its /v1/models carries only
+// max_tokens, which is the OUTPUT cap - so both kiro entries fell through to
+// CTX_DEFAULT=200000. Direct probes on /v1/messages (2026-10-06):
+//   ~133k input -> 200 OK
+//   ~400k input -> 200 OK (usage.in=400426)
+//   ~500k input -> 400 "prompt is too long: 500530 tokens > 200000 maximum"
+// The pool is heterogeneous, so 500k is not reliably servable. The user set
+// window=400000 / compact=350000 on 2026-10-06 and asked to stop probing there.
+//
+// Keyed by SLUG, not by upstream id: ovoapi and ovoapi-005 also serve
+// claude-opus-5.5, and this measurement is about the kiro channel only.
+const CTX_PIN_BY_SLUG = {
+  'ki:opus5.5': 400000,
+  'ki:sonnet5.5': 400000,
+};
 for (const m of merged.models) {
   const spec = REGISTRY.models[m.slug];
   const upstream = spec?.m ?? m.slug;
   const pin = CTX_PIN[upstream];
+  if (pin) {
+    m.context_window = pin;
+    m.max_context_window = pin;
+  }
+}
+for (const m of merged.models) {
+  const pin = CTX_PIN_BY_SLUG[m.slug];
   if (pin) {
     m.context_window = pin;
     m.max_context_window = pin;
@@ -611,11 +636,18 @@ for (const m of merged.models) {
 //    keeps the per-turn burn down. It is a cost/quota decision.
 const COMPACT_ASTRA = 260000;
 const COMPACT_DEFAULT = 500000;
+// Slug-keyed compaction overrides. kiro's window is 400000, but the user wants
+// compaction at 350000 so a long thread never reaches the range the upstream
+// rejected (500k failed with "prompt is too long").
+const COMPACT_PIN_BY_SLUG = {
+  'ki:opus5.5': 350000,
+  'ki:sonnet5.5': 350000,
+};
 // Reply headroom. The limit counts input only, so the threshold has to sit far
 // enough below the window that the model still has room to answer.
 const REPLY_MARGIN = 8192;
 for (const m of merged.models) {
-  const limit = /astra/.test(m.slug) ? COMPACT_ASTRA : COMPACT_DEFAULT;
+  const limit = COMPACT_PIN_BY_SLUG[m.slug] ?? (/astra/.test(m.slug) ? COMPACT_ASTRA : COMPACT_DEFAULT);
   // Never let the threshold exceed the window codex will ACTUALLY use. Codex
   // applies effective_context_window_percent (95 on every entry here) before
   // comparing against this limit, so clamping to the raw context_window still

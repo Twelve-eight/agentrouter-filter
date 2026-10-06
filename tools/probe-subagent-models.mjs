@@ -51,7 +51,17 @@ const realCatalog = JSON.parse(
   fs.readFileSync(path.join(os.homedir(), ".codex", "omp-model-catalog.json"), "utf8"),
 );
 const base = realCatalog.models.find((m) => m.slug === "gpt-6-astra") ?? realCatalog.models[0];
-const mk = (slug, prio) => ({ ...JSON.parse(JSON.stringify(base)), slug, display_name: slug, priority: prio });
+// Force visibility to "list": the cloned base entry comes from the live catalog,
+// where most models are now deliberately hidden (picker scope, 2026-10-06). A
+// hidden entry never reaches model/list, so without this the probe silently
+// tests nothing and reports an empty picker.
+const mk = (slug, prio) => ({
+  ...JSON.parse(JSON.stringify(base)),
+  slug,
+  display_name: slug,
+  priority: prio,
+  visibility: "list",
+});
 
 // Deliberately out of priority order so the result cannot be a lucky identity map.
 const entries = [mk("zz-a", 0), mk("zz-b", -2), mk("zz-c", 1), mk("zz-d", -1)];

@@ -52,7 +52,11 @@ if (fs.existsSync(cjs)) check("tools/build-model-catalog.cjs", cjs, fs.readFileS
 
 // Analysis/verification tools. They are not on the request path, but they are
 // hand-edited often enough to deserve the same parse gate.
-const TOOLS = ["tools/model-inventory.mjs", "tools/probe-subagent-models.mjs"];
+const TOOLS = [
+  "tools/model-inventory.mjs",
+  "tools/probe-subagent-models.mjs",
+  "tools/probe-catalog-reload.mjs",
+];
 for (const f of TOOLS) {
   const p = path.join(ROOT, f);
   if (fs.existsSync(p)) check(f, p, fs.readFileSync(p, "utf8"));

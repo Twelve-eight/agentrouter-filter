@@ -2892,3 +2892,60 @@ antigravity-tools 的业务流量不走它配置的上游代理（实测它对 7
 | catalog 完整性 | 83 条（11 list + 72 hide） | `gpt-5.6-luna` / `codex-auto-review` 仍在，均为 hide |
 
 `providers.json` 每请求读取，**不需要重启网关**；catalog 需要重启 Codex 才生效。
+
+## 2026-10-06 (4): catalog 是否需要重启才生效 —— 答案落盘
+
+用户明确要求："catalog 是否需要重启才生效这个问题的答案应当被落盘。"
+
+### 答案：需要重启。`model_catalog_json` 是**启动时读取一次**，运行中的进程不会重读。
+
+`providers.json`（网关侧）与 `omp-model-catalog.json`（Codex 侧）形状相同、都由本仓库生成，
+但生效方式相反 —— 这正是这个问题反复被问的原因：
+
+| 文件 | 读取时机 | 改完要做什么 |
+|---|---|---|
+| `Tools/agentrouter-filter/providers.json` | **每请求**（mtime+size 缓存） | 什么都不用做 |
+| `~/.codex/omp-model-catalog.json` | **进程启动时一次** | **必须重启 Codex** |
+
+### 实测方法（可重复执行）
+
+`tools/probe-catalog-reload.mjs`：合成 CODEX_HOME，目录 A 让 `zz-alpha` 可见，
+`model/list` 一次；进程**保持运行**时把文件改写成目录 B（`zz-beta` 可见），同一个进程再问一次；
+最后另起一个**全新进程**问第三次。
+
+```text
+catalog A (alpha=list, beta=hide) -> picker: ["zz-alpha"]
+rewrote the file to B (alpha=hide, beta=list); process still running
+same process, after the edit   -> picker: ["zz-alpha"]     <- 没变
+fresh process on B             -> picker: ["zz-beta"]      <- 重读
+VERDICT: STARTUP ONLY - the running process keeps the catalog it loaded; RESTART CODEX
+```
+
+第二次调用是**决定性证据**：同一个 PID 在文件已变之后仍返回旧列表，
+所以既不是"缓存过期"，也不是"需要等一会儿"。
+
+### 源码佐证
+
+`codex-rs/core/src/config/mod.rs:2174-2180` 的 `load_model_catalog()` 在
+`Config::load_from_base_config_with_overrides` 里被调用一次（:4084），
+结果存进 `Config.model_catalog: Option<ModelsResponse>`（:1021），
+再由 `build_models_manager()`（`thread_manager.rs:440-453`）交给 models manager。
+没有 file watcher —— 全文件搜 `notify|watch|inotify` 在 config/thread_manager 里没有命中。
+
+### 顺带修掉的一个真实脆弱点
+
+`tools/probe-subagent-models.mjs` 克隆 `gpt-6-astra` 作为合成目录的模板条目。
+2026-10-06 的选择器收窄把这个 slug 标成了 `visibility: "hide"`，于是合成目录**全部隐藏**，
+`model/list` 返回空，探针报 "model/list returned nothing"。
+这不是探针写错了逻辑，而是它**依赖了实时目录的一个属性**。
+已修：克隆时显式 `visibility: "list"`，并注释说明原因。
+修复后 `node tools/probe-subagent-models.mjs --order` → `ORDERING OK`。
+
+`tools/check-syntax.mjs` 的解析门禁加入了 `tools/probe-catalog-reload.mjs`。
+
+### 验证
+
+- `probe-catalog-reload.mjs` → `VERDICT: STARTUP ONLY`（可重复执行，退出码 0）
+- `probe-subagent-models.mjs --order` → `ORDERING OK`
+- `check-syntax` 全过（含 3 个 tools/*.mjs）
+- 12 个测试文件全过，0 失败
