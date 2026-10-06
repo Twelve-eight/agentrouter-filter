@@ -231,6 +231,18 @@ const VISION_SLUGS = new Set([
   'cn:deepseek-v4.1-flash',
   'deepseek-v4-flash',
   'cn:deepseek-v4-flash',
+  // northstar-kiro. Measured 2026-10-06 through the live gateway on
+  // /u/v1/responses with a generated 64x64 solid PNG, plus a no-image control:
+  //   RED  -> "Red"      BLUE -> "Blue"     no image -> "I don't see an image attached"
+  // The control is what makes this conclusive: naming two different colours from
+  // two different images cannot be a lucky guess, and the model explicitly says
+  // it sees nothing when the picture is absent.
+  //
+  // NOT added, because the same probe failed on availability (not on vision):
+  //   ovoapi:claude-opus-5.5 -> 503 no available channel under that group
+  //   ovo05:opus5.5          -> 403 no access to the claude welfare group
+  // Re-probe those two if their upstream quota recovers; do not copy this entry.
+  'ki:opus5.5',
 ]);
 
 // The model list comes from providers.json - the same file the gateway routes on.

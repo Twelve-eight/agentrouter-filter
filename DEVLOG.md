@@ -3046,3 +3046,56 @@ DEVLOG 是**时间线**（按日期分段，细节最全但检索成本高），
 - `README.md` 134 行改动（+124/-10），章节结构见 `grep '^#{1,3} '` 输出
 - 所有引用路径与实际文件核对过；三处可执行断言命令实跑通过
 - 本轮不重启任何服务
+
+## 2026-10-06 (7): ki:opus5.5 读图 —— 实测后加入 VISION_SLUGS
+
+用户报："opus5.5能读图。"
+
+### 实测（不是采纳用户断言，也不是推断）
+
+`VISION_SLUGS` 的注释写明"只在本探针通过后才加 id"，所以按该约定实测。
+探针 `G:\tmp\vision-control.mjs` 用 zlib 现场生成 64x64 纯色 PNG（不经第三方库），
+走**线上网关** `/u/v1/responses`，并带一个**无图对照组**：
+
+| 输入 | ki:opus5.5 回答 | HTTP |
+|---|---|---|
+| 纯红图 | `Red` | 200 |
+| 纯蓝图 | `Blue` | 200 |
+| **无图（对照）** | `I don't see an image attached. Could you try uploading it ag` | 200 |
+
+**对照组是结论的关键**：两张不同图给出两个正确且不同的颜色，不可能是猜的；
+而没有图时模型明确说"看不到图"。这排除了"随便蒙一个颜色"和"客户端把图丢了"两种解释。
+
+### 另外两个 opus5.5 路由：未加入（失败原因是可用性，不是读图）
+
+| slug | 结果 |
+|---|---|
+| `ovoapi:claude-opus-5.5` | **503** `No available channel for model claude-opus-5.5 under group aws claude` |
+| `ovo05:opus5.5` | **403** `无权访问 claude 福利组 分组` |
+
+这两个连请求都进不去，所以**无法判定**它们是否支持读图 —— 不是"不支持"。
+上游额度恢复后应重新探测；**不要照抄 ki 的条目**。注释里已写明这一点。
+
+### 改动
+
+`tools/build-model-catalog.cjs` 的 `VISION_SLUGS` 加入 `ki:opus5.5`，并附上实测三行数据、
+对照组的说明、以及两个失败路由的处理指引。重建后：
+
+```
+ki:opus5.5               modalities=["text","image"]   <- 生效
+ovo05:opus5.5            modalities=["text"]
+ovoapi:claude-opus-5.5   modalities=["text"]
+```
+
+### 生效条件
+
+catalog 是**启动时读取一次**（见本文件 2026-10-06 (4) 与 README"模型目录"节），
+所以 **`ki:opus5.5` 的图片能力要重启 Codex 才在界面上可用**。
+网关侧无需重启。
+
+### 验证
+
+- 对照实验：红/蓝/无图 三组，结论明确（上表）
+- `check-syntax` 全过
+- `probe-catalog-reload.mjs` → `STARTUP ONLY`（再次确认重启要求）
+- `model-inventory.mjs --canvas` 重生成画布，`tsc` 0 error
