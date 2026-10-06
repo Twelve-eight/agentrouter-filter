@@ -2720,3 +2720,60 @@ key"这条分支恰好收到了一把**正确**的 key，200 是那个巧合的�
 
 `AGENTROUTER_API_KEY` 不在 `.env.local`（只有 JUSTWOKER/OPENCODE/MOTOMOTO/OVOAPI/
 OVOAPI_AMZ/ANTIGRAVITY/NSCN_KIRO 七个），它来自 Machine 作用域环境变量。
+
+## 2026-10-06 (2): 子代理模型"上限"复核 —— 无上限，只有 5 个提示位
+
+用户问："子代理模型真的有上限吗？如果有，我亲自指定每一个。把目前所有模型列表输出出来，附用量。"
+
+### 结论
+
+**没有上限。** 整份 catalog 都能 spawn。唯一的 5 是 `spawn_agent` 工具描述里**列几个建议名字**，
+硬编码在 Codex 二进制（`MAX_SPAWN_AGENT_MODEL_OVERRIDES = 5`，child_config.rs:20），
+只影响提示文本，不影响能不能 spawn。
+
+### 本轮新增的两条实测（此前只有源码结论）
+
+1. **优先级排序**：合成 catalog `zz-a(0), zz-b(-2), zz-c(1), zz-d(-1)` 灌进隔离 `CODEX_HOME`，
+   用真实 `codex.exe app-server` 调 `model/list`，返回顺序是
+   `zz-b(-2), zz-d(-1), zz-a(0), zz-c(1)` —— **priority 升序，同值按数组顺序**。
+   脚本：`G:\tmp\prio-probe.cjs`。
+2. **提示块不等于白名单**：真实 spawn `ki:opus5.5`（priority 0，**不在**那 5 个名字里）→
+   子线程 `01a10ea6-6503-75d0-a0de-a3e2089035e9`（nickname `Helmholtz`）正常完成，
+   `last_agent_message = "PROBE-OK"`，`duration_ms = 4320`。
+   `turn_context` 里 `"model":"ki:opus5.5"`，用量账本同日有 `northstar-kiro` 记录。
+   会话文件：`~/.codex/sessions/2026/10/06/rollout-2026-10-06T08-39-08-01a10ea6-*.jsonl`。
+
+### 当前 5 个提示位（priority = -1，按 catalog 数组顺序）
+
+| 序 | slug | 加权用量 | 7 天请求 | 说明 |
+|---|---|---|---|---|
+| 1 | `global:deepseek-v4.1-flash` | 18232 | 27653 | 主力开发模型 |
+| 2 | `claude-opus-4-8` | 930 | 2403 | 用户指定 |
+| 3 | `cn:deepseek-v4.1-flash` | 3540 | 6325 | 国内版回退 |
+| 4 | `mimo-v2.6-flash-free` | 12 | 27 | zen 免费额度 |
+| 5 | `motomoto:gpt-6-astra` | 31 | 71 | 实测极慢（单次 128s） |
+
+其余 77 个模型 priority = 0（或内置模型的正值），不占提示位但**一样能 spawn**。
+
+### 用量口径
+
+`data/usage/*.jsonl` 全量重算，只读日期命名文件（`.phantom-merged.jsonl` 已验证是当天文件的
+100% 子集，glob 会双计）。加权 = `0.5 ^ (age_days / 7)`，即 7 天半衰期，让选择器反映"现在在用
+什么"而不是两周前被一次性探针刷过的模型。导出脚本：`G:\tmp\export.cjs`。
+
+总计 82 个模型 / 56866 次请求；66 个有调用记录，16 个从未调用。
+0 成功率的 4 个：`claude-opus-5-5`(an, 38/0)、`glm-5.3`(ar, 4/0)、
+`claude-fable-5-1`(an, 2/0)、`gpt-5.2`(rc, 1/0)。
+
+### 本轮改动的代码
+
+`tools/build-model-catalog.cjs`：新增 `usageScores()` / `usageScoreOf()` / `oursOrdered`，
+让 `added` 数组按用量降序（`OVERRIDE_SLUGS` 那 5 条仍保持注册表原序，因为它们靠 priority -1
+已经排在前面）。重建后 `added` 顺序从注册表序变成用量序，选择器列表随之变化。
+**提示位成员没动** —— 换哪 5 个占提示位等用户决定。
+
+### 交付物
+
+Canvas（82 行完整清单 + 用量）：
+`C:\Users\o_Obl\.cursor\projects\1784557707559\canvases\model-usage-inventory.canvas.tsx`
+（用 `tsc` + 真实 canvas SDK 类型定义校验，0 error；此前的版本有语法损坏已重写）。
