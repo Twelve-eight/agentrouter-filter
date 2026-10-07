@@ -77,16 +77,17 @@
       "base": "https://api.justwoker.icu",
       "wire": "anthropic",
       "keyEnv": "JUSTWOKER_API_KEY",
-      "egressGuard": true
+      "egressGuard": true,
+      "shellCarrier": true
     },
-  "northstar-kiro": {
-    "flattenNamespaceTools": true,
-    "base": "https://kiro.northstar.cool",
-    "wire": "responses",
-    "keyEnv": "NSCN_KIRO_API_KEY",
-    "proxy": "http://127.0.0.1:7897",
-    "_comment": "kiro.northstar.cool - order 5784 (Claude Code face + Codex/OpenAI face).\n\nWIRE: responses, native passthrough. Probed 2026-10-06: claude-opus-5.5 and\nclaude-sonnet-5.5 each answered 200 on /v1/responses, /v1/chat/completions and\n/v1/messages. Tool calls return real function_calls (exec_command with\n{\"cmd\":\"echo hi\"}) and stream=true returns a complete SSE run ending in\nresponse.completed. No proxy, no filter, no bridge needed.\n\nID HYGIENE: this upstream mints `fc_`/`msg_` ids (function_call came back as\nid=fc_fcc9cd78d62048fe87118ff504cdbf02 with call_id toolu_bdrk_...), so\nstrictItemIds stays OFF.\n\nKEY: NSCN_KIRO_API_KEY is supplied by the User-scope environment variable. It is\nnot in .env.local, so this route only works while that variable exists - add it\nto .env.local if the route must survive the variable being lost.\n\nMODEL COVERAGE: /v1/models also lists auto, claude-opus-5, claude-sonnet-5,\nclaude-opus-4.8/4.7/4.6/4.5, claude-sonnet-4.6/4.5 and gpt-5.6-sol/terra/luna.\nOnly the two ids the user asked for are registered; re-probe before adding the\nrest rather than assuming the whole list serves."
-  },
+    "northstar-kiro": {
+      "flattenNamespaceTools": true,
+      "base": "https://kiro.northstar.cool",
+      "wire": "responses",
+      "keyEnv": "NSCN_KIRO_API_KEY",
+      "proxy": "http://127.0.0.1:7897",
+      "_comment": "kiro.northstar.cool - order 5784 (Claude Code face + Codex/OpenAI face).\n\nWIRE: responses, native passthrough. Probed 2026-10-06: claude-opus-5.5 and\nclaude-sonnet-5.5 each answered 200 on /v1/responses, /v1/chat/completions and\n/v1/messages. Tool calls return real function_calls (exec_command with\n{\"cmd\":\"echo hi\"}) and stream=true returns a complete SSE run ending in\nresponse.completed. No proxy, no filter, no bridge needed.\n\nID HYGIENE: this upstream mints `fc_`/`msg_` ids (function_call came back as\nid=fc_fcc9cd78d62048fe87118ff504cdbf02 with call_id toolu_bdrk_...), so\nstrictItemIds stays OFF.\n\nKEY: NSCN_KIRO_API_KEY is supplied by the User-scope environment variable. It is\nnot in .env.local, so this route only works while that variable exists - add it\nto .env.local if the route must survive the variable being lost.\n\nMODEL COVERAGE: /v1/models also lists auto, claude-opus-5, claude-sonnet-5,\nclaude-opus-4.8/4.7/4.6/4.5, claude-sonnet-4.6/4.5 and gpt-5.6-sol/terra/luna.\nOnly the two ids the user asked for are registered; re-probe before adding the\nrest rather than assuming the whole list serves."
+    },
     "antigravity": {
       "base": "http://127.0.0.1:8045",
       "wire": "responses",

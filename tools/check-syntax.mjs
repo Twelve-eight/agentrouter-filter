@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 // This file lives in tools/, so the project root is one level up.
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-const PLAIN = ["server.mjs", "bridge.mjs", "filter.mjs", "egress-guard.mjs", "usage.mjs", "pricing.mjs", "stats-api.mjs"];
+const PLAIN = ["server.mjs", "bridge.mjs", "filter.mjs", "egress-guard.mjs", "usage.mjs", "pricing.mjs", "stats-api.mjs", "shell-carrier.mjs"];
 
 let failed = 0;
 
@@ -58,6 +58,7 @@ const TOOLS = [
   "tools/probe-catalog-reload.mjs",
   "tools/test-namespace-passthrough.mjs",
   "tools/test-stats-usage-shape.mjs",
+  "tools/test-shell-carrier.mjs",
 ];
 for (const f of TOOLS) {
   const p = path.join(ROOT, f);

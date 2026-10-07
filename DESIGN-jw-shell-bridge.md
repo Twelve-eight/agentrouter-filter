@@ -114,3 +114,22 @@ Codex 的 `function_call_output` 要包回 anthropic 的 `tool_result`，
 | 测试 | mock 上游 + 解包单测 + 端到端（~150 行） |
 
 **总计约 250-300 行 + 测试。** 不需要重启 Codex，只需重启网关。
+
+
+---
+
+## 状态更新 2026-10-07: **已实现并实测通过**
+
+本文的设计已落地，见 shell-carrier.mjs 与 DEVLOG 2026-10-07 (5)。
+
+与设计稿的差异（实现时确定的）：
+
+1. **Q1 定案：还原成 function_call 交 Codex 执行**（推荐项）。网关不自执行任何工具，
+   所以沙箱/审批/超时全部沿用 Codex 原有边界，网关保持无状态。
+2. **Q2 已解决**：carrier 路由强制 stream:false（上游流式不产内容块），
+   由新的 ridgeAnthropicBody() 在网关侧重新发出 responses SSE。
+3. **Q3 未采用**：不保留 apply_patch 第二通道。上游 schema 与 Codex 的 custom tool
+   形状不同，多一条通道就多一套形状转换；统一走 carrier 更少的失败面。
+4. **Q4 已实测**：description 尾部保真（TAILMARK 探针），协议行稳定被遵守（5 轮）。
+5. **guard 分化**：carrier 分支**不传** isGuardToolName —— ash 在黑名单里，
+   传了会删掉每个真调用。这是实现时发现的坑，已在测试里钉住。

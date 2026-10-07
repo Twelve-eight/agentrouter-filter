@@ -3632,3 +3632,72 @@ cacheWrite 不再写死 0
 - 网关进程仍是 07:00:57 启动的那个；`stats-api.mjs` 是每请求 import 的模块，
   但 **ESM import 有模块缓存**，所以**需要重启网关**才会加载新代码。
   重启前旧数字会继续显示。
+
+## 2026-10-07 (5)：jw(opus-4-8) 借壳透传落地 —— 子代理可用了
+
+用户要求："处理一下 opus4.8 能不能拿来当子代理用"。
+
+### 先复现（上游现状探测，直连 /v1/messages）
+
+| 探针 | 结果 |
+|---|---|
+| T2 零工具 | "我的工具是 read_tabular、system_todo_write" —— **仍无视调用方工具表** |
+| T3 发 exec_command | 同样只报那两个 —— exec_command 被丢弃 |
+| P1 stream:true | `message_start → message_delta → message_stop`，**0 个 content block**，output_tokens=89 |
+| P2 description 合并 | 我们塞的 MARKER 在它 bash 描述里**保留**（尾部拼接） |
+| P3 尾部保真 | TAILMARK 在最后一行原样可见 |
+| P4 历史里放未声明的工具名 | **200 接受**，不报错 |
+| P5 并行调用 | 一次回两个 tool_use，**顺序可能颠倒**（B 在 A 前） |
+| P6 system 存活 | SYSMARK 原样出现在它的系统提示里 |
+| P7 bash schema | `command/description/run_in_background/secret_env/timeout_ms/dangerously_disable_sandbox`，仅 command 必填 |
+
+**端到端症状复现**（经真实网关）：`response.completed output=[]` —— 空响应，
+就是子代理"跑完 completed: null、无报告"的成因。
+根因两条：① 工具表被上游替换 → 模型看不到我们的工具；② 流式路径不产内容块。
+
+### 实现（三个新件 + 三处接线）
+
+新增 `shell-carrier.mjs`（纯函数，无 socket 无全局态）：
+
+- `buildCarrierTool(tools)` —— 唯一发出的工具 `bash`，描述里写死协议
+  `@tool:<name> <json>` + 真实工具清单（名字/schema 摘要/首句说明，已截断到 80 条 × 180 字符）
+- `encodeCarrierCall` / `decodeCarrierCall` —— 编解码；JSON 坏了**不猜**，
+  返回 `args: null` 让上层报错
+- `unwrapCarrierCall` —— 回程还原；无 `@tool:` 前缀 = 裸 shell，映射到调用方自己的
+  shell 工具名（`exec_command` 优先）
+- `applyShellCarrier(msg)` —— 出站改写：工具表换成 carrier、历史里的每次 tool_use
+  重编码成 `@tool:` 调用、**强制 `stream:false`**，返回 receipt
+
+`bridge.mjs`：
+- `toAnthropicBody(body, model, toolMap, shellCarrier)` 新增第 4 参
+- 新增 `bridgeAnthropicBody()` —— 非流式响应 → responses SSE。**三段式分组**
+  （reasoning → text → calls）发事件，因为 emitter 的 output_index 由"谁先开盘"
+  决定，而 Codex 要求 reasoning 是整轮第一项（乱序会让下次回放在严格上游上非法）
+- emitter 里加 `unwrapCall`：carrier 名（`bash`）在**两个 finish 分支**都还原成
+  真名，裸 shell 也一样
+
+`server.mjs`：
+- `providerFor` 增加 `shellCarrier` 开关（per-provider 声明）
+- `ROUTES.jw` 与 `providers.json.justwoker` 置 `shellCarrier: true`
+- 独立分支：carrier 路由**缓冲**上游响应，JSON 就解析、若是 SSE（中转站忽略了
+  stream:false）就退回流式桥；**这条分支不传 toolGuard** —— `bash` 恰好在
+  opencode-zen 的幻影工具黑名单里，传了会把每个真调用都删掉，正是要修的症状
+
+### 验证
+
+- `tools/test-shell-carrier.mjs` **14 项全过**（真实 handler + stub 上游）：
+  出站工具表/协议/stream=false、历史重编码、tool_result 保 id；回程 carrier→真名、
+  call_id 保真、裸 shell、坏 JSON 上报、thinking→reasoning、输出顺序、用量入账、
+  两条 SAFETY（带/不带开关的行为差异）
+- **真上游端到端**（独立 7999 端口实例，未动生产网关）：
+  - L1 → `CALL name=exec_command call_id=toolu_bdrk_01Ssry... args={"cmd":"dir \"G:\\omp works\\...\""}`
+  - L2 → 模型读了工具结果，正确回答"11 个 .mjs 文件"
+- 全部 13 个测试文件 + check-syntax 全绿
+
+### 诚实边界
+
+- 借壳只对**名字**负责：模型若编造清单外的名字，网关原样透传，由 Codex 判定
+- 上游故障会直接反映（实测期间它整体 503 "No available channel"，零工具探针同样
+  503，与本改动无关；恢复后立即 200）
+- 该上游仍是**不可信端点**：`egressGuard` 保持开启，且已知会注入自己的工具
+- 子代理的**实际可用性**取决于它能否正确遵守协议；协议遵守已在真上游验证过 5 轮

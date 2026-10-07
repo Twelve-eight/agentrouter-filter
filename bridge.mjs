@@ -1,4 +1,5 @@
 import { StringDecoder } from "node:string_decoder";
+import { applyShellCarrier, decodeCarrierCall, unwrapCarrierCall, CARRIER_TOOL } from "./shell-carrier.mjs";
 
 // responses <-> chat/completions and responses <-> anthropic/messages
 // translation, plus the chat/anthropic SSE -> responses SSE bridges. Side-effect
@@ -297,7 +298,7 @@ function pushBlocks(messages, role, blocks) {
   else messages.push({ role, content: blocks });
 }
 
-function toAnthropicBody(body, model, toolMap = null) {
+function toAnthropicBody(body, model, toolMap = null, shellCarrier = false) {
   const messages = [];
   const items = Array.isArray(body.input) ? body.input : [{ role: "user", content: body.input }];
   for (const it of items) {
@@ -378,6 +379,19 @@ function toAnthropicBody(body, model, toolMap = null) {
   // closest is `any` (must call some tool).
   if (body.tool_choice === "required") out.tool_choice = { type: "any" };
   else if (body.tool_choice === "auto") out.tool_choice = { type: "auto" };
+
+  // Shell carrier (justwoker/jw): the upstream ignores the caller's tool list and
+  // honours only bash/grep/glob/apply_patch, and its streaming path emits no
+  // content blocks. Fold every tool into one carrier `bash` whose description
+  // teaches the @tool: protocol, and force the non-streaming wire. The receipt
+  // rides on toolMap (never serialised) so the return path can unwrap.
+  if (shellCarrier) {
+    // The rewrite must happen even without a toolMap: the hook used to be nested
+    // inside `if (toolMap)`, so a caller that passed none got the full tool list
+    // and the upstream silently dropped it - the exact failure this exists for.
+    const receipt = applyShellCarrier(out);
+    if (toolMap) toolMap.carrier = receipt;
+  }
   return out;
 }
 
@@ -433,6 +447,15 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
   let rIndex = -1;
   const rId = "rs_" + Math.random().toString(36).slice(2, 14);
   const calls = new Map(); // key -> {id,name,args,itemId,added,outIndex}
+  // Shell-carrier support (jw/justwoker): the upstream answers with ONE tool
+  // name (`bash`) whose args carry  {@tool:<name> <json>}. unwrapCarrierCall
+  // rewrites that into the real function_call and returns null for every other
+  // name, so on a normal route this is a no-op.
+  const unwrapCall = (c) => {
+    const shellTool = toolMap?.carrier?.shellTool;
+    const shaped = unwrapCarrierCall(c.name, c.args, shellTool);
+    return shaped ? { ...c, name: shaped.name, args: shaped.args } : c;
+  };
   let usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
   // output_index must be a monotonic per-item counter, NOT output.length: items
   // are only appended to `output` at close/finish, so using output.length gave a
@@ -527,8 +550,9 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
     if (!stream) {
       closeMessage();
       const out = [];
-      for (const c of calls.values()) {
-        if (!c.added) continue;
+      for (const rawCall of calls.values()) {
+        if (!rawCall.added) continue;
+        const c = unwrapCall(rawCall);
         out.push({ type: "function_call", id: c.itemId, status: "completed", arguments: c.args || "{}", call_id: c.id, ...splitWireName(c.name, toolMap) });
       }
       const items2 = items.filter(Boolean);
@@ -562,7 +586,8 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
       placeItem(rIndex, rItem);
     }
     closeMessage();
-    for (const c of calls.values()) {
+    for (const rawCall of calls.values()) {
+      const c = unwrapCall(rawCall);
       if (!c.added) continue;
       // One announcement per call, now that the wire name is final. A namespace
       // sub-tool becomes {name: "spawn_agent", namespace: "multi_agent_v1"} - the
@@ -692,6 +717,92 @@ function createResponsesEmitter({ res, model, stream, onUsage, toolGuard = null,
     finish,
     fail,
   };
+}
+
+// ---------------------------------------------------------------------------
+// anthropic NON-STREAMING response -> responses SSE (shell-carrier routes)
+// ---------------------------------------------------------------------------
+//
+// jw (justwoker/opus-4-8) answers a streaming request with a message_start ->
+// message_delta -> message_stop trio that carries ZERO content blocks while still
+// reporting output_tokens > 0 (measured 2026-10-07). A tool-calling turn therefore
+// reached Codex as an empty response: 'sub-agent returned nothing'. The same
+// request on stream:false returns the full body, so a carrier route asks for the
+// non-streaming form and re-emits the stream here.
+//
+// The body's tool_use blocks are the carrier calls the model was taught to make:
+// decodeCarrierCall unwraps  @tool:<name> <json>  back into a REAL function_call
+// whose call_id is the upstream's own tool_use id. That id is what we hand to
+// Codex, so the result it replays comes back as `tool_result.tool_use_id` with no
+// map needed - the round trip closes on the id alone.
+//
+// Output order mirrors the streaming bridge (reasoning, message, calls) because
+// Codex records items in the order it first sees them, and a reasoning item that
+// lands after its function_call makes the next replay invalid on strict upstreams.
+function bridgeAnthropicBody(body, res, model, stream = true, onUsage = null, toolMap = null) {
+  const em = createResponsesEmitter({ res, model, stream, onUsage, toolGuard: null, toolMap });
+  const carrier = toolMap?.carrier ?? null;
+
+  const raw = body?.content;
+  if (!Array.isArray(raw)) {
+    em.fail('upstream returned a non-Anthropic body');
+    return;
+  }
+
+  // Three passes, not one. Item order in the final `output` array is decided by the
+  // order the emitter OPENS each item, and Codex records reasoning as the first item
+  // of a turn: a reasoning item that lands after its message/function_call makes the
+  // next replay invalid on strict upstreams. Grouping by kind gives the documented
+  // [reasoning, message, calls] order regardless of how the upstream interleaved its
+  // blocks (the streaming bridge gets this for free from Anthropic's own ordering).
+  for (const block of raw) {
+    if (block?.type === 'thinking' && block.thinking) em.reasoning(String(block.thinking));
+  }
+  for (const block of raw) {
+    if (block?.type === 'text' && block.text) em.text(String(block.text));
+  }
+
+  const calls = [];
+  for (const block of raw) {
+    if (!block || block.type !== 'tool_use') continue;
+    const id = block.id || ('call_' + Math.random().toString(36).slice(2, 10));
+    if (block.name === CARRIER_TOOL) {
+      const command = block.input?.command;
+      const decoded = decodeCarrierCall(command);
+      if (!decoded) {
+        // A bare shell command on the carrier: run it as the caller's shell tool.
+        const shell = carrier?.shellTool || 'exec_command';
+        calls.push({ id, name: shell, args: JSON.stringify({ cmd: String(command ?? '') }) });
+        continue;
+      }
+      if (decoded.args === null) {
+        // Malformed payload: do NOT guess. Hand Codex a call it will reject with a
+        // readable message, so the model is told its protocol line was invalid and
+        // has a chance to retry with valid JSON instead of losing the turn.
+        calls.push({ id, name: decoded.name, args: JSON.stringify({ error: 'invalid @tool JSON payload', raw: decoded.raw }) });
+        continue;
+      }
+      calls.push({ id, name: decoded.name, args: JSON.stringify(decoded.args) });
+      continue;
+    }
+    // Any other name the upstream invented (read_tabular, system_todo_write, or a
+    // caller tool that slipped through): pass it through unchanged. Codex decides
+    // what it recognises; the gateway must not invent or drop calls.
+    calls.push({ id, name: block.name, args: JSON.stringify(block.input ?? {}) });
+  }
+  for (const c of calls) em.call(c.id, { id: c.id, name: c.name, args: c.args });
+
+  const u = body?.usage ?? {};
+  const details = {};
+  if (u.cache_read_input_tokens) details.cached_tokens = u.cache_read_input_tokens;
+  if (u.cache_creation_input_tokens) details.cache_write_tokens = u.cache_creation_input_tokens;
+  em.setUsage({
+    input_tokens: u.input_tokens ?? 0,
+    output_tokens: u.output_tokens ?? 0,
+    total_tokens: (u.input_tokens ?? 0) + (u.output_tokens ?? 0),
+    ...(Object.keys(details).length ? { input_tokens_details: details } : {}),
+  });
+  em.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +1061,7 @@ export {
   splitWireName,
   joinWireName,
   bridgeAnthropicStream,
+  bridgeAnthropicBody,
   bridgeChatStream,
   createResponsesEmitter,
   toAnthropicBody,

@@ -41,7 +41,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { filterBody } from "./filter.mjs";
 import { guardBody, selectRules, summarize } from "./egress-guard.mjs";
-import { bridgeAnthropicStream, bridgeChatStream, toAnthropicBody, toChatBody, flattenTools, splitWireName, joinWireName } from "./bridge.mjs";
+import { bridgeAnthropicStream, bridgeAnthropicBody, bridgeChatStream, toAnthropicBody, toChatBody, flattenTools, splitWireName, joinWireName } from "./bridge.mjs";
 import { record as recordUsage } from "./usage.mjs";
 import { statsApi } from "./stats-api.mjs";
 import { stripForeignItemIds, stripAllItemIds, isItemIdRejection } from "./responses-ids.mjs";
@@ -168,6 +168,7 @@ function isGuardToolName(name) {
 }
 
 
+
 // Origins only: the incoming path already carries /v1/.. (Codex base_url is
 // http://127.0.0.1:7878/<prefix>/v1).
 // AR_UPSTREAM_<PREFIX> overrides a route's origin (e.g. to point /ar at a
@@ -209,7 +210,11 @@ const ROUTES = {
   // /v1/chat/completions exists but Cloudflare blocks every POST to it (403
   // "Attention Required!"; GET /v1/models passes), and /v1/responses is
   // "not implemented" - so the anthropic bridge is the only working path.
-  jw: { name: "justwoker", base: process.env.AR_UPSTREAM_JW ?? "https://api.justwoker.icu", anthropic: true },
+  // shellCarrier: the upstream replaces the caller tool list with its own four
+  // names (bash/grep/glob/apply_patch) and its streaming path emits no content
+  // blocks, so the gateway folds every tool into one carrier bash and asks for
+  // the non-streaming form. See shell-carrier.mjs.
+  jw: { name: "justwoker", base: process.env.AR_UPSTREAM_JW ?? "https://api.justwoker.icu", anthropic: true, shellCarrier: true },
   // kiro.northstar.cool (order 5784). Native /v1/responses: probed 2026-10-06,
   // claude-opus-5.5 and claude-sonnet-5.5 both answered 200 on /v1/responses,
   // /v1/chat/completions and /v1/messages; tool calls return real function_calls
@@ -419,6 +424,12 @@ function providerFor(model) {
     // Cross-realm fallback target for this model (providers.json "fallback"),
     // e.g. "global:deepseek-v4.1-flash" -> "cn:deepseek-v4.1-flash".
     fallback: typeof spec.fallback === "string" ? spec.fallback : null,
+    // Shell carrier (justwoker/jw). The upstream replaces the caller's tool
+    // list with its own four names and its streaming path emits no content
+    // blocks, so the gateway folds every tool into one carrier `bash` and asks
+    // for the non-streaming form (see shell-carrier.mjs and
+    // bridgeAnthropicBody). Declared per provider so no other route changes.
+    shellCarrier: p.shellCarrier === true,
   };
 }
 
@@ -1521,7 +1532,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
     }
-    const msg = toAnthropicBody(parsed, parsed.model, toolMap);
+    const msg = toAnthropicBody(parsed, parsed.model, toolMap, route.shellCarrier);
     log(`bridge ${prefix}${rest} -> ${route.name} model=${parsed.model} msgs=${msg.messages.length} tools=${msg.tools?.length ?? 0}`);
     // Request clock for EVERY terminal branch below (2xx bridge, upstream
     // 4xx/5xx, local 502). It used to be created only on the success path, so
@@ -1593,6 +1604,67 @@ const server = http.createServer(async (req, res) => {
     // S4: same idle guard as the chat bridge - a silent upstream trips the bridge
     // close/error path (response.failed) instead of hanging; self-disarms on end.
     armBodyIdleTimeout(upstream, () => log(`!! upstream stream idle > ${BODY_IDLE_TIMEOUT_MS}ms (anthropic bridge, ${route.name}); aborting`));
+
+    // Shell-carrier routes ask for the NON-streaming form because the upstream's
+    // stream carries no content blocks. Buffer it, then either parse the JSON
+    // body (the expected shape) or fall through to the SSE bridge if this
+    // upstream ignored `stream:false` - some relays answer SSE regardless.
+    if (route.shellCarrier) {
+      const chunks = [];
+      for await (const c of upstream) chunks.push(c);
+      const text = Buffer.concat(chunks).toString("utf8");
+      const ctype = String(upstream.headers?.["content-type"] ?? "");
+      const looksSSE = /text\/event-stream/i.test(ctype) || /^\s*data:/i.test(text);
+      const done = (u) => {
+        recordUsage({
+          route: prefix,
+          provider: route.name,
+          model: parsed.model,
+          effort: parsed.reasoning?.effort ?? null,
+          ok: true,
+          duration_ms: Date.now() - t0,
+          input_tokens: u?.input_tokens ?? 0,
+          output_tokens: u?.output_tokens ?? 0,
+          reasoning_tokens: u?.output_tokens_details?.reasoning_tokens ?? 0,
+          cached_tokens: u?.input_tokens_details?.cached_tokens ?? 0,
+          cache_write_tokens: u?.input_tokens_details?.cache_write_tokens ?? 0,
+        });
+      };
+      if (looksSSE) {
+        // The relay ignored stream:false. Replay the buffered bytes through the
+        // existing streaming bridge (Readable.from keeps its chunking semantics).
+        const { Readable } = await import("node:stream");
+        // No tool guard here: the carrier call is named `bash`, which IS in
+        // TOOL_GUARD_NAMES (the opencode-zen phantom list) - passing the guard
+        // would silently delete every real call and reproduce the empty turn.
+        bridgeAnthropicStream(Readable.from([text]), res, parsed.model, parsed.stream !== false, done, null, toolMap);
+        return;
+      }
+      let body;
+      try {
+        body = JSON.parse(text);
+      } catch (e) {
+        log(`!! shell-carrier ${route.name}: non-JSON upstream body: ${text.slice(0, 200)}`);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "shell-carrier upstream returned a non-JSON body", type: "upstream_error" } }));
+        return;
+      }
+      if (body?.type === "error" || (body?.error && !body?.content)) {
+        const m = body?.error?.message ?? "upstream error";
+        log(`!! shell-carrier ${route.name} upstream error: ${String(m).slice(0, 200)}`);
+        recordUsage({
+          route: prefix, provider: route.name, model: parsed.model,
+          effort: parsed.reasoning?.effort ?? null, ok: false, status: 502,
+          duration_ms: Date.now() - t0,
+          input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cached_tokens: 0,
+        });
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: String(m), type: "upstream_error" } }));
+        return;
+      }
+      bridgeAnthropicBody(body, res, parsed.model, parsed.stream !== false, done, toolMap);
+      return;
+    }
     bridgeAnthropicStream(upstream, res, parsed.model, parsed.stream !== false, (u) => {
       recordUsage({
         route: prefix,
