@@ -3291,3 +3291,67 @@ mcp__codex_app__list_threads  ->  namespace "mcp", name "codex_app__list_threads
 
 `server.mjs` 改动**需要重启网关**（`providers.json` 每请求读，但这次逻辑在 server.mjs）。
 隔离实例（7880/7881/7882/7883/7891）已全部停止。
+
+## 2026-10-07 (3): jw opus-4-8 空返回 —— 上游已被换成非 Claude 后端
+
+用户报："Opus4.8 jw 子代理空返回、无报告"。
+
+### 症状
+
+子代理 `01a113aa-006f`（model=`claude-opus-4-8`, effort=high）执行 71 秒后
+`task_complete`，但 `completed: null` —— 没有任何 assistant message，没有报告文件。
+它自己的 rollout 里只有一条 reasoning，内容是：
+
+> "my available tools are limited to read_tabular and todo tools, not a general file
+> reader... I have no shell tool, no local file-read tool... so I genuinely cannot
+> read these local files"
+
+**它列出的工具（`read_tabular` / `system_todo_write`）根本不是 Codex 的工具。** 这是第一线索。
+
+### 决定性实验（直连上游，绕过网关）
+
+| 测试 | 发送 | 上游回答 |
+|---|---|---|
+| T1 | 一个自造工具 `zzz_custom_tool_9911` | "No... every tool I can see: 1. **read_tabular** 2. **system_todo_write**" |
+| T2 | **一个工具都不发** | "read_tabular / system_todo_write" |
+| T3 | 发 `exec_command` 工具 | "I don't have access to an `exec_command` tool... The only tool available is `read_tabular`" |
+
+**T2 是决定性的**：调用方一个工具都没提供，模型却报告有两个固定的 Snowflake 工具。
+说明这个端点**无视请求里的 `tools` 字段**，背后是另一个带固定系统提示的后端
+（`read_tabular` 只接受 `@` 开头的 Snowflake stage 路径，明确拒绝本地文件）。
+
+### 流式路径的第二个缺陷（同一上游）
+
+流式请求下该上游经常**只发 thinking 块、不发正文块**，甚至一个 content block 都不发：
+
+```
+event: message_start        content: []
+event: message_delta        output_tokens: 7      <- 报了 token 但没有任何内容
+event: message_stop
+```
+
+偶发情况下会发 thinking + signature，然后 `stop_reason: end_turn` 直接结束 —— 正文为空。
+`stream:false` 时同一问题会返回 tool_use（它自己幻觉出的 read_tabular 调用）。
+
+### 责任划分（已排除我们这侧）
+
+| 检查 | 结果 |
+|---|---|
+| 桥接能否正常转换内容 | 用 mock 上游发合规 anthropic SSE → 网关正确产出 `response.output_text.delta` ✅ |
+| 网关发出去的请求形状 | `tools: exec_command`、`stream: true`、messages 正常 ✅ |
+| 上游原始响应 | 无正文块 / 无视 tools（见上表）❌ |
+
+### 结论
+
+`claude-opus-4-8`（jw 路由）当前**不是一个可用的 Claude 端点**：
+它无视调用方工具表、固定暴露两个 Snowflake 工具、流式不产正文。
+这与它此前被记录为"会收集主机信息"的可疑供应商印象一致 —— 现在这个 key 指向的后端
+和当初注册时已不是同一个东西。
+
+### 建议（待用户决定）
+
+1. 把 `claude-opus-4-8` 从 `KEEP_SLUGS` 移出 / 标 `visibility: hide`，避免再被子代理选中；
+2. 或保留但只在 catalog 描述里标注"不可用：上游无视 tools"；
+3. 不要用它做子代理 —— 它会思考完就静默结束，表现为"空返回、无报告"。
+
+未改任何配置：这一步等用户定夺。
