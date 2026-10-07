@@ -3355,3 +3355,74 @@ event: message_stop
 3. 不要用它做子代理 —— 它会思考完就静默结束，表现为"空返回、无报告"。
 
 未改任何配置：这一步等用户定夺。
+
+### 追加复核（2026-10-07 08:40 前后，第二轮）
+
+用户要求"再看一眼"。重测结果：**症状全部稳定复现，且定位到了更精确的机制**。
+
+#### 1) 工具表被"替换"，不是合并
+
+用**允许名单探针**逐个发单个工具，问它"你现在能调哪些工具，只列名字"：
+
+| 我发的工具 | 上游报告它能看到 |
+|---|---|
+| `exec_command` | ~~exec_command~~ → read_tabular, system_todo_write |
+| `read_file` | ~~read_file~~ → read_tabular, system_todo_write |
+| `write_file` | ~~write_file~~ → read_tabular, system_todo_write |
+| `spawn_agent` | ~~spawn_agent~~ → read_tabular, system_todo_write |
+| `str_replace_editor` | ~~str_replace_editor~~ → read_tabular, system_todo_write |
+| `update_plan` | ~~update_plan~~ → read_tabular, system_todo_write |
+| `web_search` | ~~web_search~~ → read_tabular, system_todo_write |
+| `bash` | **bash** ✅, read_tabular, system_todo_write |
+| `grep` | **Grep** ✅, read_tabular, system_todo_write |
+| `glob` | **glob** ✅, read_tabular, system_todo_write |
+| `apply_patch` | **apply_patch** ✅, read_tabular, system_todo_write |
+
+**规律**：只有 `bash` / `grep` / `glob` / `apply_patch` 这几个**特定名字**能透传，
+其余全部被丢掉，且两个 Snowflake 工具**恒定存在**（不发 tools 时也在）。
+
+补充证据：发 `apply_patch` 且 description 里塞唯一标记 `ZZQMARKER8842` 时，
+模型把**我们写的 description 一字不差地引用了**（并附上了它自己的大段 patch 语法说明），
+说明 `apply_patch` 这个工具确实是**透传进去的**、模型能读到。
+
+而发我们自己的 `read_tabular`（只给 `file_path` 参数）时，模型**自作主张补上了
+`pandas_operations` 参数**（我们从未发过这个参数）—— 它用的是**上游预置的 schema**，
+不是我们的。
+
+#### 2) 两个 Snowflake 工具是上游自带、且在服务端真实执行
+
+追问"把工具返回的确切错误原文给我"，模型回：
+
+> `file_path must be a Snowflake stage path starting with @ for server-side execution`
+
+**我们这边从未返回过这条错误**（我们的 `read_tabular` 只是个 schema，没有实现）。
+说明这两个工具**在上游服务端真实存在并被执行**，是平台自带的能力注入。
+
+#### 3) 流式仍然不产正文
+
+```
+message_start   content: []
+message_delta   output_tokens: 7     <- 有 token 计数，零内容
+message_stop
+```
+非流式同样问题下会返回 `read_tabular` 的 tool_use（它幻觉/预置的工具）。
+
+#### 4) 身份声明仍是 Claude
+
+问"你是什么产品、谁做的"，答："I'm Claude, an AI assistant made by Anthropic"。
+**但这与工具面证据矛盾** —— 工具面明显是另一个带 Snowflake 数据平台的系统。
+
+#### 5) 用量侧佐证
+
+短消息（"hi"）的 `input_tokens` 恒为 **10,365**；发 40k 字符消息时为 **50,363**。
+差值正好是 40k 字符的 token 量（~40k），说明**固定开销约 10k tokens** ——
+这就是它那套预置系统提示的体量。历史上 10-03 有过 `in=437011` 的成功记录，
+说明当时确实是可用的 Claude 端点，**现在这个 key 背后的后端已经被换掉了**。
+
+#### 结论（不变，证据更硬）
+
+`claude-opus-4-8`（jw）当前是一个**平台代理**，不是 Claude：
+它注入自己的 Snowflake 工具、丢弃大部分调用方工具、流式不产正文。
+**不能用作子代理** —— 它会思考完静默结束，表现为"空返回、无报告"。
+
+它现在仍在 `KEEP_SLUGS` 里（选择器第 5 位）。要不要摘掉，等用户定。
