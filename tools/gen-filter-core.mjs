@@ -15,7 +15,7 @@
 // Verify: node tools/diff-test.mjs  (must print 0 mismatches)
 import fs from "node:fs";
 
-const SRC = "G:/omp works/.omp/hooks/pre/strip-illegal.ts";
+const SRC = "G:/omp works/Tools/agentrouter-filter/filter-rules-source.ts";
 const DST = "G:/omp works/Tools/agentrouter-filter/filter-core.ts";
 
 const src = fs.readFileSync(SRC, "utf8");

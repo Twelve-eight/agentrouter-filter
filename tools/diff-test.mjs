@@ -20,7 +20,7 @@
 import { sanitize as genSanitize, deepStrip as genDeepStrip } from "../filter-core.ts";
 import fs from "node:fs";
 
-const SRC = "G:/omp works/.omp/hooks/pre/strip-illegal.ts";
+const SRC = "G:/omp works/Tools/agentrouter-filter/filter-rules-source.ts";
 const src = fs.readFileSync(SRC, "utf8");
 const start = src.split("\n").findIndex((l) => l.startsWith("const KEEP = "));
 const end = src.split("\n").findIndex((l) => l.startsWith("export default function (pi"));

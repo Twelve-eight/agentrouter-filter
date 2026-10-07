@@ -3777,3 +3777,93 @@ prefill 快，TTFB 落在悬崖以内，所以立刻恢复正常。与"首字节
    （当前 400k 窗口 / 350k 压缩），prefill 时间随输入线性增长，压缩越早 TTFB 越短。
 3. **换一个 US 出口节点**：如果悬崖来自机场节点而非 kiro 自身，换节点即可。
    判定方法：同样 5 连发冷请求，在两条不同代理节点上各跑一遍，比较 TTFB 分布。
+
+## 2026-10-07 (7): omp 侧 —— kiro 256k + 移除 omp 过滤规则（只留网关）
+
+用户两条指令：
+1. `把 omp 内的 kiro 模型上下文压缩设为 256k`
+2. `移除 omp 已有的过滤规则，只留在网关里对 agentrouter 模型使用`
+
+### 1) kiro 进 omp，contextWindow 256000
+
+**先说清机制**：omp 的压缩阈值是**全局**的
+（`settings.compaction.thresholdTokens` / `thresholdPercent`，
+见 `settings-schema.ts:2512-2545`），**没有 per-model 键** ——
+查了 `models-config-schema-bundle.ts` 的模型条目 schema，
+可 patch 的字段只有 `contextWindow / maxTokens / compactionModel /
+contextPromotionTarget / remoteCompaction / compat / ...`。
+`resolveThresholdTokens(contextWindow, settings)`（`compaction.ts:362`）
+是 **contextWindow 的函数**。
+
+→ 所以"把 kiro 的压缩设为 256k"唯一可落地的实现就是
+**把 kiro 的 `contextWindow` 设为 256000**，让 reserve 制默认阈值落在 256k 内。
+已在 `~/.omp/agent/models.yml` 加 `northstar-kiro`（opus5.5 / sonnet5.5 两条，
+均 `contextWindow: 256000`、`maxTokens: 128000`）。
+`omp models find kiro` 显示 **256K** ✓。
+
+**踩到一个坑**：`baseUrl` 必须是 `https://kiro.northstar.cool/v1`
+（漏 `/v1` → omp 报 `404 status code (no body)`）。已修。
+
+**代理**：omp 没有 per-provider proxy 键，机制是环境变量
+`PI_PROXY_<PROVIDER大写、非字母数字换下划线>` 回退 `PI_PROXY`
+（二进制里 `nh6()`：`` `PI_PROXY_${A.toUpperCase().replace(/[^A-Z0-9]/g,"_")}` ``）。
+当前已设 `PI_PROXY` 与 `PI_PROXY_ANYROUTER`；
+**`PI_PROXY_NORTHSTAR_KIRO` 尚未设**（需要时再设，直连也能通）。
+
+### 2) 移除 omp 过滤规则
+
+**移除对象**（两份完全相同，sha256 `72ccb805ac304700...`，11576 字节）：
+
+| 路径 | 作用范围 |
+|---|---|
+| `G:\omp works\.omp\hooks\pre\strip-illegal.ts` | 整个工作区（omp 会话） |
+| `G:\omp works\Sts\sts2-spire1\.omp\hooks\pre\strip-illegal.ts` | 该项目 |
+
+两份都已删除，并归档到 `.tmp/removed-omp-filters-20261007/`（可回滚）。
+
+**保留未动**：`.omp/hooks/pre/backup.ts` —— 那是备份钩子，不是过滤规则。
+
+**关键耦合已处理**：网关的 `filter-core.ts` 原本是**从 omp 钩子生成的逐字节副本**，
+`tools/gen-filter-core.mjs` 与 `tools/diff-test.mjs` 都以该钩子为源。
+钩子删除后这条链会断（`diff-test` 直接 ENOENT）。
+
+→ 把规则源**搬进网关仓库**：`Tools/agentrouter-filter/filter-rules-source.ts`
+（原文件 + 说明性文件头；`export default` 钩子接线保留为历史参考，无人 import）。
+生成器/校验器已改指向它，并重新生成：
+
+```
+node tools/gen-filter-core.mjs   ->  core lines 31-208
+node tools/diff-test.mjs         ->  45 sanitize samples + 1 deepStrip tree, mismatches: 0
+```
+
+`filter.mjs` / `server.mjs` / `README.md` 里指向旧路径的注释已同步改写。
+（`DEVLOG.md:11` 的历史条目保留不动 —— 那是记录，不是指引。）
+
+### 验证
+
+- 网关过滤仍在工作（agentrouter 路由专用）：
+  - 身份句 `You are Claude Code, ...` → `You are Codex, an official CLI coding agent.`
+  - 假名/谚文 → 清空；emoji → `[x]`；中文/西里尔**保留**（符合白名单）
+  - `filterBody(..., {injectInstructions:true})` → changed=true、身份句消失、指令已注入
+- `node tools/check-syntax.mjs` → all checks passed
+- `omp models find kiro` → 256K ✓
+
+### 未决：kiro 端点当前故障（与本改动无关）
+
+验证 kiro 时它**持续返回**：
+
+```
+event: error
+data: {"code":"overloaded","message":"Upstream returned an empty response. Please retry.","type":"error"}
+```
+
+- **6/6 全失败**，且 **A~F 六种请求形状全部同样报错**（最小 body、max_tokens、
+  max_output_tokens、纯字符串 input、stream:false、带 instructions）
+- 直连与经 7897 **都是 200 + 同一条 error**，所以不是代理、不是 omp 配置、
+  不是我加的 `contextWindow`
+- 早先（同日 11:22）同样是这个请求形状曾经 **200 且返回 PONG**，
+  说明这是端点侧状态变化，不是形状问题
+- omp 侧表现：`Retry budget exhausted after 10 retries: Error Code overloaded`
+
+结论：**配置已就位，等 kiro 端点恢复即可用**。恢复后 `omp -p --model
+northstar-kiro/claude-opus-5.5` 应直接通。

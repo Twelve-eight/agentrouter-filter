@@ -11,7 +11,7 @@ Codex CLI 侧的 agentrouter 过滤/桥接网关。
    凡只有 chat/completions 面的上游(wb2api)都必须做协议桥接。
 2. **Codex 没有请求改写钩子**。它只暴露 `PreToolUse` / `UserPromptSubmit` /
    `SessionStart` / `Stop` 等事件,无法改写最终请求体。omp 侧为 agentrouter 写的
-   `G:/omp works/.omp/hooks/pre/strip-illegal.ts`(字符白名单 + 网关敏感词表 +
+   `filter-rules-source.ts (in this repo)`(字符白名单 + 网关敏感词表 +
    身份句屏蔽)只能改由传输层承接。
 3. **agentrouter 有客户端白名单**。它按 `originator` 头放行
    (实测:`originator: codex_exec` / `pi` / `opencode` / `cline` / `openclaw` -> 200;
@@ -195,7 +195,7 @@ ovoapi 全系)。即:给这些 provider 在 `providers.json` 里写 `egressGuard
 ## 过滤内容(`filter.mjs`)
 
 **核心规则不在本仓库手写**.`filter-core.ts` 由 `tools/gen-filter-core.mjs`
-从 omp 钩子 `G:/omp works/.omp/hooks/pre/strip-illegal.ts` 的纯核心段(第 19-196 行)
+从 omp 钩子 `filter-rules-source.ts (in this repo)` 的纯核心段(第 19-196 行)
 **字节级原样复制**而来:只丢弃 `import type` 行与 `export default function (pi)` 接线,
 再追加一行 export.Node 24 原生擦除类型,该核心只用可擦除语法,所以**不做任何正则改写**
 (正则改写可能悄悄破坏含 `": "` 的正则字面量或字符串).`tools/diff-test.mjs` 用

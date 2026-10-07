@@ -2,8 +2,8 @@
 //
 // The character map and the gateway word list are NOT written here: they are a
 // byte-for-byte copy of the pure core of the omp pre-hook
-// G:/omp works/.omp/hooks/pre/strip-illegal.ts, produced by
-// tools/gen-filter-core.mjs into filter-core.ts. Only the hook's `import type`
+// filter-rules-source.ts (in this repo), produced by
+// tools/gen-filter-core.mjs into filter-core.ts. Only the source's `import type`
 // line and its `export default function (pi)` wiring are dropped; no annotation
 // rewriting happens (Node 24 strips types natively, and the core uses only
 // erasable syntax). The guard is therefore "the copy is byte-identical to the

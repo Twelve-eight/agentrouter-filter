@@ -6,7 +6,7 @@
 //    -> "no longer supported"; the only accepted value is "responses").
 // 2. Codex has no request-rewriting hook (only PreToolUse / UserPromptSubmit /
 //    SessionStart / ...), so the outbound sanitisation that omp applied through
-//    G:/omp works/.omp/hooks/pre/strip-illegal.ts cannot be attached to Codex
+//    filter-rules-source.ts (in this repo) cannot be attached to Codex
 //    directly.
 // 3. agentrouter (ps.air-outer.com) content-blocks certain character/word
 //    combinations and its client allowlist rejects unknown clients.
