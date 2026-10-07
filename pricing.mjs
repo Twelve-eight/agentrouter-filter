@@ -67,6 +67,47 @@ const VENDORS = new Set([
 //   explicitly rather than derived, because priceFor() replaces the rate set
 //   wholesale.
 const MANUAL = {
+  // Claude 5.5 line. models.db currently ships no row for either id, so the
+  // numbers below come straight from Anthropic's own pricing page
+  // (docs.anthropic.com/en/docs/about-claude/pricing, read 2026-10-07):
+  //   Claude Opus 5.5   $4 / $20   cache 5m-write $5   hits $0.20
+  //   Claude Sonnet 5.5 $2 / $10   cache 5m-write $2.50 hits $0.20
+  // cacheWrite uses the 5-minute rate; the 1-hour rate ($8 / $4) is only used
+  // when a caller explicitly asks for 1h caching, which we never do.
+  // Free tiers. $0 is the ACTUAL price, not a missing value - these ids are
+  // only reachable through opencode-zen's free tier, which bills nothing.
+  // Recorded so the dashboard shows a real 0 instead of "n/a"; if zen ever
+  // starts charging for them, replace these with the invoice-derived numbers.
+  "space-bunny-free": {
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    provider: "opencode-zen free tier",
+    note: "free tier - $0 by design, not a missing price",
+  },
+  "zen:space-bunny": {
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    provider: "opencode-zen free tier",
+    note: "free tier - $0 by design, not a missing price",
+  },
+  "mimo-v2.6-flash-free": {
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    provider: "opencode-zen free tier",
+    note: "free tier - $0 by design, not a missing price",
+  },
+  "zen:mimo-v2.6-flash": {
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    provider: "opencode-zen free tier",
+    note: "free tier - $0 by design, not a missing price",
+  },
+  "claude-opus-5-5": {
+    cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+    provider: "anthropic (official pricing page 2026-10-07)",
+    note: "Opus 5.5 - $4/$20, cache write $5 (5m), hits $0.20",
+  },
+  "claude-sonnet-5-5": {
+    cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+    provider: "anthropic (official pricing page 2026-10-07)",
+    note: "Sonnet 5.5 - $2/$10, cache write $2.50 (5m), hits $0.20",
+  },
   "gpt-6.1-sol": {
     cost: {
       input: 2, output: 10, cacheRead: 0.185, cacheWrite: 2.5,
@@ -148,6 +189,54 @@ const ALIAS = {
   "rc65:6.1sol": "gpt-6.1-sol",
   "ovoapi:6.1sol": "gpt-6.1-sol",
   "6.1sol": "gpt-6.1-sol",
+  // northstar-kiro serves the CURRENT Claude line under dotted ids. models.db
+  // spells them with hyphens (claude-opus-5-5 / claude-sonnet-5-5), and the
+  // vendor's own page (docs.anthropic.com .../pricing, read 2026-10-07) lists
+  // Opus 5.5 at $4/$20 and Sonnet 5.5 at $2/$10. Without these the lookup
+  // missed entirely and both kiro models showed "n/a" in the dashboard.
+  "ki:opus5.5": "claude-opus-5-5",
+  "ki:sonnet5.5": "claude-sonnet-5-5",
+  // antigravity's Gemini id carries an effort suffix the vendor id does not.
+  // Google's own pricing page (ai.google.dev/gemini-api/docs/pricing, read
+  // 2026-10-07) lists gemini-3.8-flash at $0.75/$3.75 with $0.075 cache read
+  // (promotional through 2026-12-31; doubles on 2027-01-01).
+  "ag:gemini3.8h": "gemini-3.8-flash",
+  "gemini-3.8-flash-high": "gemini-3.8-flash",
+  // Hidden-but-spawnable slugs. visibility:"hide" only narrows the picker -
+  // the whole catalog can still be selected as a sub-agent model - so an
+  // unpriced entry here is still a real spend the dashboard cannot show.
+  // Each alias maps our routing slug onto the vendor id in models.db.
+  // Verified against the db on 2026-10-07 (see the existence probe in DEVLOG).
+  "gpt-6-astra-ar": "gpt-6-astra",
+  "gpt-6-astra-an": "gpt-6-astra",
+  "ovoapi:6astra": "gpt-6-astra",
+  "rc65:6astra": "gpt-6-astra",
+  "rc:5.6luna": "gpt-5.6-luna",
+  "rc65:5.6luna": "gpt-5.6-luna",
+  "ovoapi:5.6terra": "gpt-5.6-terra",
+  "rc65:5.6terra": "gpt-5.6-terra",
+  "rc65:5.6sol": "gpt-5.6-sol",
+  "gpt-5.6-sol-ar": "gpt-5.6-sol",
+  "rc:5.6solc": "gpt-5.6-sol",
+  "rc:5.6": "gpt-5.6",
+  "rc65:5.5": "gpt-5.5",
+  "rc:5.5c": "gpt-5.5",
+  "rc:5.6c": "gpt-5.6",
+  "ag:sonnet4-5": "claude-sonnet-4-5",
+  "ag:sonnet4-6": "claude-sonnet-4-6",
+  "ag:haiku4-5": "claude-haiku-4-5",
+  "ag:opus4-6": "claude-opus-4-6",
+  "ag:opus4-6t": "claude-opus-4-6",
+  "ovo05:opus5": "claude-opus-5",
+  "ovo05:sonnet5": "claude-sonnet-5",
+  "ovoapi:claude-opus-5.5": "claude-opus-5-5",
+  "ovo05:opus5.5": "claude-opus-5-5",
+  "mimo-v2.6-flash-free": "mimo-v2.6-flash",
+  "zen:mimo-v2.6-flash": "mimo-v2.6-flash",
+  "cn:minimax-m3": "MiniMax-M3",
+  "cn:kimi-k3-1": "kimi-k3",
+  "ovoapi:claude-opus-4.8": "claude-opus-4-8",
+  "rc:5.6solc": "gpt-5.6-sol",
 };
 
 /** Strip a routing namespace so `global:gpt-5.6-sol` can match `gpt-5.6-sol`. */

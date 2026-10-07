@@ -3511,3 +3511,70 @@ of the request or by setting the DEFAULT_NAMESPACE property for the current user
 
 **对使用的结论不变**：它丢弃 Codex 的工具名（只有 `bash`/`grep`/`glob`/`apply_patch`
 这类名字能过）、注入自己的 Snowflake 工具、流式不产正文 —— 不能用作子代理。
+
+
+## 2026-10-07 (4): 官方定价补全（用户要求"去网上搜这些模型的官方定价塞进网关"）
+
+### 现状
+
+网关定价来自两处：`models.db`（omp 的 models.dev 缓存，只用**厂商**条目）+
+`pricing.mjs` 的 `MANUAL` 手填表。查完发现 **39 个模型无价**，其中 1 个还是可见的。
+
+### 从官网取到的价（2026-10-07 实抓）
+
+| 来源 | 内容 |
+|---|---|
+| `docs.anthropic.com/en/docs/about-claude/pricing` | 完整 Claude 价格表（含缓存写入 5m/1h、命中） |
+| `api-docs.deepseek.com/quick_start/pricing` | deepseek-flash / v4-pro 的峰谷价 |
+| `ai.google.dev/gemini-api/docs/pricing` | gemini-3.8-flash $0.75/$3.75，缓存 $0.075（促销至 2026-12-31，2027-01-01 翻倍） |
+
+Anthropic 官方原文（节选）：
+
+```
+Claude Opus 5.5     $4 / MTok   $20 / MTok   5m write $5    1h write $8    hits $0.20
+Claude Sonnet 5.5   $2 / MTok   $10 / MTok   5m write $2.50 1h write $4    hits $0.20
+Claude Opus 4.8     $5 / MTok   $25 / MTok   5m write $6.25 1h write $10   hits $0.50
+```
+
+### 改动
+
+1. **ALIAS 扩充**（~35 条）：把路由 slug 映射到 models.db 里厂商自己的 id。
+   包括 hidden 模型 —— `visibility:"hide"` 只是收窄选择器，**整份 catalog 仍可作子代理**，
+   所以 hidden 模型无价也是真实花费看不见。
+2. **MANUAL 新增**：
+   - `claude-opus-5-5` $4/$20（cacheWrite $5，cacheRead $0.20）
+   - `claude-sonnet-5-5` $2/$10（cacheWrite $2.50，cacheRead $0.20）
+   - 四个 **免费档** 显式记 $0（space-bunny-free / zen:space-bunny /
+     mimo-v2.6-flash-free / zen:mimo-v2.6-flash）—— $0 是真实价格，
+     不是"缺价"，写进去让面板显示 0 而不是 n/a。
+
+### 结果
+
+无价模型 **39 → 8**。剩下 8 个全是未公开发布的 relaycat/ovo 内部 id
+（`gpt-6-sol`、`gpt-6`、`gpt-reserve`、`codex-auto-review` 及其别名），
+OpenAI 官网对这些 id 没有公开价（平台页 403/超时，抓不到）。
+
+### 11 个可见模型现在的价
+
+| 模型 | 输入 | 输出 | 缓存读 | 缓存写 | 来源 |
+|---|---|---|---|---|---|
+| ovoapi:6.1sol | $4 | $20 | $0.37 | $5 | ovo 发票（已存在） |
+| global/cn:deepseek-v4.1-flash | $0.30 | $1.20 | $0.006 | - | deepseek 官网 |
+| deepseek-v4-flash | $0.30 | $1.20 | $0.006 | - | deepseek 官网 |
+| claude-opus-4-8 | $5 | $25 | $0.50 | $6.25 | anthropic 官网 |
+| ki:opus5.5 | $4 | $20 | $0.20 | $5 | anthropic 官网 |
+| ki:sonnet5.5 | $2 | $10 | $0.20 | $2.50 | anthropic 官网 |
+| ag:gemini3.8h | $0.75 | $3.75 | $0.075 | - | google 官网 |
+| global:gpt-6-astra | $10 | $50 | $1 | $12.5 | openai（长上下文 272k+ 时翻倍为 $20/$75） |
+| space-bunny-free | $0 | $0 | $0 | $0 | zen 免费档 |
+
+### 诚实边界
+
+- OpenAI 官网（platform.openai.com/docs/pricing、openai.com/pricing）对本机
+  **403 / 超时**，gpt-6 系的价来自 models.db 的厂商条目，**未与官网二次核对**。
+- Gemini 3.8 Flash 的 $0.75/$3.75 是**促销价**（官方写明 2027-01-01 起翻倍到
+  $1.50/$7.50）。网关记的是当前价；届时需更新。
+- 全部改动只影响**统计展示**，不改变路由或计费行为。
+- 需要重启网关才加载新 pricing.mjs？—— **不需要**：`priceFor` 是每请求调用，
+  但 `load()` 有 `INDEX` 缓存，只在**首次**调用时读表。所以已运行的网关要重启
+  才会看到新价。
