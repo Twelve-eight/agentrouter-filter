@@ -3426,3 +3426,88 @@ message_stop
 **不能用作子代理** —— 它会思考完静默结束，表现为"空返回、无报告"。
 
 它现在仍在 `KEEP_SLUGS` 里（选择器第 5 位）。要不要摘掉，等用户定。
+
+### 追加复核 3（用户假设：是不是跑在 Claude Code CLI 里？）
+
+用户假设："中转站以前是直接把请求丢给 A\（Anthropic），现在只能套一层 CC CLI，
+然后把模型的输出原样丢下来。"
+
+#### 结论：**不是 Claude Code CLI**，是一个 Snowflake 侧的数据分析 agent
+
+用户先纠正了一个前提：雪花（Snowflake）是云数据仓库公司，与 Anthropic 无隶属关系；
+CC 可以通过 MCP 接雪花服务端，雪花平台自己也能调 Claude —— 所以"出现雪花工具"
+**不能**单独证明不是 CC。判别标准因此换成**字符串指纹 + 措辞比对**。
+
+#### 证据 A：泄漏出来的系统提示词原文（上游自己打的）
+
+```
+You are a helpful assistant.
+
+If you intend to call multiple tools and there are no dependencies between the calls,
+make all of the independent calls in the same  block, otherwise you MUST wait for
+previous calls to finish first to determine the dependent values.
+```
+
+#### 证据 B：与本机 CC 二进制（v2.1.291，241MB exe）逐串比对
+
+| 指纹 | CC 二进制里存在？ |
+|---|---|
+| `You are Claude Code` | ✅ |
+| `Anthropic's official CLI` | ✅ |
+| `claude.ai/code` | ✅ |
+| `You are an interactive CLI tool` | ✅ |
+| `TodoWrite` | ✅ |
+| **`read_tabular`** | **❌** |
+| **`system_todo_write`** | **❌** |
+| **`pandas_operations`** | **❌** |
+| **`SnowflakeFile`** | **❌** |
+| **`make all of the independent calls in the same block`** | **❌** |
+| **`otherwise you MUST wait for previous calls`** | **❌** |
+| **`You are a helpful assistant.`** | **❌** |
+
+**措辞比对（决定性）**：CC 二进制里的批处理指令原文是
+> "You can call multiple tools in a single response. If you intend to call multiple tools
+> and there are no dependencies between them, **make all independent tool calls in parallel**."
+
+而上游那句是 "**make all of the independent calls in the same block**"。**同义但不同文** ——
+不是同一份提示词，不是同一套 harness。
+
+#### 证据 C：工具是**服务端真实执行**的（不是普通反代）
+
+追问"把工具返回的确切错误原文给我"，模型在一**次 HTTP 请求内**完成
+"调用工具 → 拿到错误 → 汇报"，返回：
+
+```
+Failed with http status 422, error code 391920: Unable to run the command.
+You must specify the warehouse to use by either setting the warehouse field in the body
+of the request or by setting the DEFAULT_NAMESPACE property for the current user.
+```
+
+这是一条**真实的 Snowflake REST/SQL API 错误**（错误码 391920、warehouse/DEFAULT_NAMESPACE
+都是 Snowflake 概念）。**我们这边从未产生过这条错误**。
+
+**这一点很关键**：普通反代（把请求转给上游再原样丢回）**做不到**"调用工具→拿结果→
+再继续生成"这个循环，因为那需要服务端有工具执行器 + agent loop。
+所以用户假设的**方向是对的**（确实套了一层 harness），只是那层是 **Snowflake 的
+数据 agent**，不是 CC CLI。
+
+#### 证据 D：它自己泄漏的产品名
+
+工具描述里嵌着完整参考实现，出现：`from snowflake.snowpark.files import SnowflakeFile`、
+`SnowparkFile.open(stage_path, 'rb', require_scoped_url=False)`、
+`main(session, stage_path, ...)`、`apply_simple_truncation(result, max_response_bytes=50000)`、
+`exec(pandas_operations, exec_globals)`（globals 为 `{'df','pd','np','result'}`）、
+`openpyxl`/`xlrd` 引擎选择、magic-byte 校验（`.xlsx` 以 `PK` 开头）。
+**这是 Snowflake Cortex / 数据分析 agent 的典型形态。**
+
+#### 修正后的判断
+
+| 假设 | 判定 | 依据 |
+|---|---|---|
+| 直接反代给 Anthropic | **否** | 工具在服务端被执行，有 agent loop |
+| **套了一层 harness**（用户方向） | **是** | 请求内完成"调工具→拿结果→续答" |
+| 那层是 **CC CLI** | **否** | 提示词措辞不同；CC 二进制无这些指纹串 |
+| 那层是 **Snowflake 数据 agent** | **是** | Snowpark / SnowflakeFile / 错误码 391920 / warehouse 概念 |
+
+**对使用的结论不变**：它丢弃 Codex 的工具名（只有 `bash`/`grep`/`glob`/`apply_patch`
+这类名字能过）、注入自己的 Snowflake 工具、流式不产正文 —— 不能用作子代理。
