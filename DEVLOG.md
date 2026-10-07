@@ -3701,3 +3701,79 @@ cacheWrite 不再写死 0
   503，与本改动无关；恢复后立即 200）
 - 该上游仍是**不可信端点**：`egressGuard` 保持开启，且已知会注入自己的工具
 - 子代理的**实际可用性**取决于它能否正确遵守协议；协议遵守已在真上游验证过 5 轮
+
+## 2026-10-07 (6): Kiro opus-5.5 间歇性 ECONNRESET —— 定位到 TTFB 悬崖
+
+用户报告：`stream disconnected before completion: Transport error: network error:
+error decoding response body`（Codex 侧），且"中断会话、发一句新消息就消失"。
+
+### 日志证据（网关侧）
+
+`.tmp/argw-autostart.log` 中 `northstar-kiro` 共 **24 次** `!! upstream error after 200 ... ECONNRESET`。
+逐条对齐"请求发出时刻 → reset 时刻"：
+
+| 序号 | reset 时刻 | 距请求发出 | 请求体大小 |
+|---|---|---|---|
+| 1 | 09:47:37 | **+60.7s** | 257 KB |
+| … | … | … | … |
+| 18 | 11:07:51 | **+60.7s** | 975 KB |
+
+**+60.7s 出现 15 次以上，方差在 ±0.2s** —— 这是定时器，不是随机网络抖动。
+对照：同文件里 ovoapi 的 ECONNRESET 无此规律（散落在 1~30s），所以这不是我们代码里的 timer。
+
+### 排除项（都实测过，两条路径 = 直连 / 经 7897）
+
+| 假设 | 测试 | 结果 |
+|---|---|---|
+| 总时长上限 | 单条流持续 246s | ✅ 完整走完，`response.completed` |
+| 大请求体 | 900KB / 1.9MB body | ✅ 200 |
+| 首字节慢 | TTFB 5.7s / 20.9s / 33s | ✅ 200 |
+| 长答案 | 758KB / 947KB 输出流 | ✅ 完整 |
+| 代理链路问题 | 同样请求 direct vs 7897 | 两者行为一致，**不是代理** |
+| 我们的代码 | 网关无 60s 定时器（只有可配 idle，默认 120s） | ✅ 已排除 |
+
+### 复现（关键）
+
+连发 **5 个各 ~900KB 的全新（冷缓存）请求**：
+
+```
+turn1  headerMs=29597  ok
+turn2  headerMs=25148  ok
+turn3  headerMs=22146  ok
+turn4  headerMs=21538  ok
+turn5  ECONNRESET      totalMs=42538   <- 失败
+```
+
+另一次 6+6 连发全部成功（TTFB 最高 37.6s），说明**触发条件不是"第 N 个请求"**，
+而是叠加了其它负载后 **TTFB 被推到某个临界值**。
+
+### 结论（置信度分级）
+
+- **已确认**：reset 由上游/中间层发出，时间锚定在"请求开始 +60s"前后，
+  与请求体大小、总时长、输出长度**都无关**，只与"多久没收到第一个字节"相关。
+- **高度可能**：链路上某跳是 **nginx 反代，`proxy_read_timeout` 默认 60s**
+  （它计的是"两次读事件之间的间隔"；首字节没到之前，这个间隔从请求发出算起）。
+  kiro 的 `Via: 1.1 Caddy` 只说明最外层是 Caddy，里面还有一跳。
+- **未验证**：具体是哪一跳（kiro 自身？其上游？机场节点？）。无法从我们这边取证。
+
+### 用户侧观察吻合
+
+"中断会话、发一句新消息就消失" —— 新消息 = 新请求，且此时 prompt 缓存已热，
+prefill 快，TTFB 落在悬崖以内，所以立刻恢复正常。与"首字节超时才被掐"一致。
+
+### 用户指令
+
+**"对 kiro 使用 7897 的代理，因为服务器在 US"** —— 核查结果：**已经这么配了**。
+`providers.json` → `northstar-kiro.proxy = "http://127.0.0.1:7897"`，
+与 anyrouter / motomoto 同一机制（CONNECT 隧道）。本轮未改动此处。
+
+### 可做的缓解（未实施，等用户定）
+
+1. **网关侧对 kiro 的首字节设一个 <60s 的软超时**：TTFB 超过 ~55s 就主动断开并
+   返回**可重试**的信号（而不是让上游 ECONNRESET 变成 Codex 的
+   "error decoding response body"）。Codex 的 server-overloaded 重试路径需要
+   `Retry-After`，所以正确形状是 503 + Retry-After，而不是裸断连。
+2. **减小重放体积**：把 kiro 的 `auto_compact_token_limit` 从 350k 再压低
+   （当前 400k 窗口 / 350k 压缩），prefill 时间随输入线性增长，压缩越早 TTFB 越短。
+3. **换一个 US 出口节点**：如果悬崖来自机场节点而非 kiro 自身，换节点即可。
+   判定方法：同样 5 连发冷请求，在两条不同代理节点上各跑一遍，比较 TTFB 分布。
