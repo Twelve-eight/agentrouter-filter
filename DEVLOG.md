@@ -3578,3 +3578,57 @@ OpenAI 官网对这些 id 没有公开价（平台页 403/超时，抓不到）�
 - 需要重启网关才加载新 pricing.mjs？—— **不需要**：`priceFor` 是每请求调用，
   但 `load()` 有 `INDEX` 缓存，只在**首次**调用时读表。所以已运行的网关要重启
   才会看到新价。
+
+## 2026-10-07 17:4x: /stats 的 "950k" —— 口径重复计算（已修）
+
+### 现象与结论
+用户在 `http://127.0.0.1:7878/stats/index.html#/requests?range=24h` 看到一次请求
+显示 ~950k token，问"哪里写错了"。**不是配置错误，也没有任何东西写错到窗口上**：
+
+- `950000` = `context_window 1000000 × effective_context_window_percent 95%`，是
+  Codex 的**有效窗口**，不是用量。同一 session 的 `token_count` 事件里
+  `model_context_window: 950000` 是常量。
+- 会话真实用量 `last_token_usage` 走 483k → 494k，到 500k 触发压缩
+  （`auto_compact_token_limit = min(500000, 950000-8192)` = 500000），
+  压缩后掉回 31k。**压缩按设计工作**：09:18:41 有 `compacted` 事件，之后
+  31k → 85k。
+
+### 真正的 bug：/stats 把 cache 算了两次
+`stats-api.mjs toOmpRow()` 把网关账本里的 `input_tokens` 直接填进 omp 客户端的
+`usage.input`。但两者口径相反：
+
+- 我们的账本（wb2api / OpenAI 风格）：`input_tokens` **已包含** cache 桶
+  （全部 60562 条历史行验证：`cacheRead + cacheWrite <= input_tokens`，
+  0 例外）。
+- omp 客户端：`usage.input` 是**未命中 cache 的输入**，`cacheRead` /
+  `cacheWrite` 单独成桶。
+
+于是同一条 cache 被算两次：真实 475,059 的 prompt（474,496 命中 cache）
+发出去变成 `input 475059 + cacheRead 474496 + output 567 = 950122`。
+09:18:03 那行正是 494,658 + 494,336 + 6,988 = 995,982。
+
+### 修法
+`toOmpRow()` 改为：
+
+```
+input = max(0, input_tokens - cacheRead - cacheWrite)
+totalTokens = input + output + cacheRead + cacheWrite
+cacheWrite 不再写死 0
+```
+
+修完 `/api/stats/recent` 里同一个会话最大行 995,982 → **501,646**，
+`in` 21 → 322。聚合口径同步正确：`Uncached Input` 卡片不再报整段 prompt，
+`cacheRate` 能到 ~1（原来是 input 含 cache、分母也被抬高，永远偏低）。
+
+### 回归门禁
+新增 `tools/test-stats-usage-shape.mjs`（7 项，含真实行 494658/494336，
+双计数回归、cacheWrite 透传、负值 clamp、无 cache 不变、cacheRate 上限），
+并加入 `tools/check-syntax.mjs` 的 TOOLS 解析列表。
+
+### 诚实边界
+- 只影响**统计展示**，账户扣费与路由完全没变（成本仍按 `pricing.mjs` 从原始
+  `input_tokens_details` 计算，那里本来就是分桶的）。
+- 历史行不做回填：`toOmpRow` 是读时换算，所以 24h/7d 等所有区间一起修正。
+- 网关进程仍是 07:00:57 启动的那个；`stats-api.mjs` 是每请求 import 的模块，
+  但 **ESM import 有模块缓存**，所以**需要重启网关**才会加载新代码。
+  重启前旧数字会继续显示。

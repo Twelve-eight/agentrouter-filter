@@ -64,9 +64,20 @@ const n = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
  */
 function toOmpRow(r) {
   const cost = costOf(r);
-  const input = n(r.input_tokens);
+  // 口径换算: OUR rows report input_tokens INCLUSIVE of the cache buckets (every
+  // upstream we bridge does - measured across 60562 rows, cacheRead+cacheWrite
+  // never exceeds input_tokens). omp's client means the OPPOSITE: its usage.input
+  // is UNCACHED input, with cacheRead/cacheWrite in separate buckets. Publishing
+  // our raw number under omp's field names double-counted the cache: a 475k
+  // prompt that was 474k cached showed up as ~950k tokens in the requests table
+  // and drawer, and the 'Uncached Input' card reported the full prompt. Subtract
+  // the buckets here so every downstream formula (totalTokens, cacheRate) is
+  // consistent with what the client expects.
+  const inputTotal = n(r.input_tokens);
   const output = n(r.output_tokens);
   const cacheRead = n(r.cached_tokens);
+  const cacheWrite = n(r.cache_write_tokens);
+  const input = Math.max(0, inputTotal - cacheRead - cacheWrite);
   return {
     id: 0,
     // omp keys drill-downs by session file; a proxy has no transcript, so the
@@ -87,8 +98,9 @@ function toOmpRow(r) {
       input,
       output,
       cacheRead,
-      cacheWrite: 0,
-      totalTokens: input + output + cacheRead,
+      cacheWrite,
+      // input already excludes the cache buckets, so this is the real turn size.
+      totalTokens: input + output + cacheRead + cacheWrite,
       premiumRequests: 0,
       cost: {
         input: n(cost?.input),
@@ -446,4 +458,4 @@ export function statsApi(pathname, searchParams) {
   }
 }
 
-export { RANGES, DEFAULT_RANGE };
+export { RANGES, DEFAULT_RANGE, toOmpRow };
