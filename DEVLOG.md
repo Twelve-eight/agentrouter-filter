@@ -4055,3 +4055,48 @@ wb2api `/v1/models` 的可见集在两次构建之间变了(第一次构建时�
 - `/v1/responses` 的密文回放只测了**一轮**;更深的链路(多轮 reasoning 累积)未测。
 - 未测该 key 的并发上限与计费口径;该站不在 `pricing.mjs` 的价格表里,`/stats` 会显示 n/a
   (模型 id `swe-2-high` 在 `models.db` 中**查无此条**,已实测确认)。
+
+### 7. omp 侧接入(用户要求"我要用 omp")
+
+omp **不走网关**,直连 `https://devin.northstar.cool/v1`(用户 2026-10-07 定的规则:
+omp 用各 provider 的原生端点,网关留给 Codex)。
+
+| 文件 | 改动 |
+|---|---|
+| `~/.omp/agent/models.yml` | 新增 provider `devin-northstar`(`api: openai-responses`,
+  `baseUrl: https://devin.northstar.cool/v1`,key `DEVIN_NORTHSTAR_API_KEY`),唯一模型
+  `swe-2-high`,`contextWindow: 262000`、`maxTokens: 128000`、六档 effort、`input:[text,image]` |
+| `~/.omp/agent/.env` | 追加 `DEVIN_NORTHSTAR_API_KEY`(与网关同一把 key 的副本,不是第二把凭据) |
+| `~/.omp/agent/config.yml` | `enabledModels` 加 `devin-northstar/swe-2-high`(排在 kiro 两条之后) |
+
+备份:`.tmp/omp-models.yml.bak-20261008-210521`、`.tmp/omp-env.bak-20261008-210521`、
+`.tmp/omp-config.yml.bak-20261008-210521`。
+
+**踏过的坑**:`baseUrl` 必须带 `/v1`。漏了会得到 `404 status code (no body)` —— 与
+2026-10-07 kiro 那次同一个坑,已写进 `models.yml` 注释里。
+
+### omp 端到端验证(全是真跑,不是看配置)
+
+```
+omp models find swe           -> devin-northstar (1);swe-2-high 262K / 128K / 六档 / images=yes
+omp config get enabledModels  -> 含 devin-northstar/swe-2-high
+
+omp -p --model devin-northstar/swe-2-high 'Reply with exactly: OMP-SWE2-OK'
+  -> Working... / OMP-SWE2-OK                                  (1/1)
+
+omp -p --model ... '用 bash 工具运行 echo TOOL-OK,然后只回答输出'
+  -> Working... / TOOL-OK                                      (工具链路通)
+
+omp -p --model ... @swe2-green.png '主色是什么?一个英文词'
+  -> Working... / Green                                        (图片链路通)
+```
+
+图片用的仍是**现场用 zlib 生成**的真 PNG(纯绿 64x64),并已 `view_image` 目视确认颜色正确 ——
+沿用上面第 2 节定下的规矩:视觉探测必须用真图片 + 无图对照,不能手贴 base64。
+
+### omp 侧的已知边界
+
+- **够不够 262K 未实测**:262000 是上游自报值,omp 按全局 60% 在约 157200 tokens 压缩。
+- **档位是装饰性的**(与本文件第 2 节同一结论):omp 里选 max 不会真的让上游更用力。
+- 该 provider 目前只有 1 个模型;该站其余 264 个 id 仍刻意未登记。
+- 现有 omp 会话可能需要重启才能刷新模型列表(本次改动由 CLI 实跑验证,验证进程是新起的)。
