@@ -3867,3 +3867,191 @@ data: {"code":"overloaded","message":"Upstream returned an empty response. Pleas
 
 结论：**配置已就位，等 kiro 端点恢复即可用**。恢复后 `omp -p --model
 northstar-kiro/claude-opus-5.5` 应直接通。
+
+## 2026-10-07 (later): omp 侧 Claude 模型能力补齐 (用户指出"你没有为 omp 中的 claude 模型配置能力")
+
+### 发现的问题
+
+`omp models <provider>` 暴露的能力表里，四个已启用的 Claude 路由**元数据不完整**：
+
+| 模型 | 修复前 | 问题 |
+|---|---|---|
+| `northstar-kiro/claude-sonnet-5.5` | `input: [text]` | 实测能读图，但配置说不能 → 图片**被静默丢弃**（最糟的失败方式：不报错） |
+| `northstar-kiro/claude-opus-5.5` | `efforts: [low,medium,high,max]` | 实测 `minimal`/`xhigh` 都 200，档位被砍窄 |
+| `northstar-kiro/claude-sonnet-5.5` | 同上 | 同上 |
+| `opencode-zen/claude-fable-5-1` | ctx `-` / max `-` / thinking `-` / images `no` | 运行时发现（models.dev 缓存）完全没有能力元数据 |
+
+### 实测证据（不是照抄厂商页）
+
+**kiro（直连 `https://kiro.northstar.cool/v1/responses`，经 7897）**
+- 读图：64x64 纯蓝色 PNG → `claude-sonnet-5.5` 答 `"Blue."`、`claude-opus-5.5` 答 `"Blue"`（HTTP 200）
+- 档位矩阵：两个模型 × `minimal/low/medium/high/xhigh/max` = **12/12 HTTP 200**
+  → 配置里的 `[low,medium,high,max]` 既缺 `minimal` 也缺 `xhigh`
+
+**justwoker（直连 `api.justwoker.icu/v1/messages`）**
+- 读图：同一张蓝图 → `"Blue"`（HTTP 200）；重新验证既有配置正确（`input: [text, image]`）
+- 档位：`minimal/low/medium/high/xhigh/max` 全 200（`high` 首次 403，重试 200，判定为偶发）
+- **结论：jw 无需改动，原配置正确**
+
+**opencode-zen**
+- 权威来源：`https://models.dev/api.json` → `opencode/claude-fable-5-1`
+  （canonical `anthropic/claude-fable-5-1`）：`reasoning=true`、
+  `reasoning_options=[low,medium,high,xhigh,max]`、`modalities.input=[text,image,pdf]`、
+  `limit={context:1000000, output:128000}`
+- **live 探测未能执行（诚实边界）**：经 7901 zen 反代打 `claude-fable-5-1`
+  → **HTTP 402 `Insufficient account funds`**；换 `space-bunny-free` 对照组
+  → **HTTP 429 `FreeUsageLimitError`**（免费档限流）。
+  所以该模型今天既拿不到免费档，也无法实测其视觉能力，**图片能力按厂商声明记录**。
+
+### 改动（`~/.omp/agent/models.yml`，备份 `models.yml.bak-before-claude-caps`）
+
+1. `northstar-kiro/claude-sonnet-5.5`：`input: [text]` → `[text, image]`
+2. `northstar-kiro` 两个模型：`efforts` 补 `minimal` 与 `xhigh` → `[low, medium, high, xhigh, max]`
+   （未写 `minimal`：kiro 实测接受，但该端点的 `[low...]` 下限是既有约定，保持最小改动）
+3. `opencode-zen` 新增 `modelOverrides.claude-fable-5-1`：
+   `reasoning: true`、`input: [text, image]`、`contextWindow: 1000000`、`maxTokens: 128000`、
+   `thinking { mode: effort, efforts: [low,medium,high,xhigh,max] }`
+   （附注释声明图片能力来源为 models.dev，未 live 验证）
+
+> 期间一次插入缩进错误（把 override 插到了 `modelOverrides:` 之前），
+> YAML 立即解析失败并当场修正 → 最终 `Bun.YAML.parse` 通过。
+
+### 验证
+
+```
+omp models northstar-kiro
+  claude-opus-5.5    256K  128K  low,medium,high,xhigh,max  images yes
+  claude-sonnet-5.5  256K  128K  low,medium,high,xhigh,max  images yes
+omp models opencode-zen
+  claude-fable-5-1     1M  128K  low,medium,high,xhigh,max  images yes
+```
+
+端到端（经 omp，非直连）：
+```
+omp -p --model northstar-kiro/claude-sonnet-5.5 '@blue.png' 'What colour?'
+  -> 蓝色     # 修复前此路径不可能成功：图片会被静默丢弃
+```
+
+### 诚实边界
+
+- `opencode-zen/claude-fable-5-1` 的**图片能力未经 live 验证**（402/429 挡住），按 models.dev 声明配置；
+  账号恢复额度或限流解除后应重测。
+- `northstar-kiro/claude-opus-5.5` 的 omp 端到端读图本次返回
+  `Error Code overloaded: Upstream returned an empty response`（该端点已知的间歇故障，
+  DEVLOG 上文已记录）；同模型的**直连**读图 200 且答对，故配置本身有效。
+- `justwoker/claude-opus-4-8` 的 omp 端到端读图返回空正文（同样只有 `Working...`），
+  但**直连上游**读图 200 答对；jw 是 anthropic 流式面，omp 下正文为空是既有现象，
+  未纳入本次改动范围。
+
+## 2026-10-08:`swe2`(SWE-2 High via devin-northstar)接入网关
+
+用户指令(逐字边界):**只把 SWE2 加到网关里**。端点 `https://devin.northstar.cool/`,
+key 见 `.env.local`;不要加该站点的其它 264 个 id。子代理模型用
+`global:deepseek-v4.1-flash`(wb2api)。
+
+### 1. 凭据:两个 key,前一个是死的(先测后用)
+
+- `4aa12f0b8ee3f100e4f0a2bfd809b46720c3378b9a8fa536a7710a6f11d30e37`——`/v1/models`、
+  `/v1/chat/completions`、`/v1/responses` **全部 401**。用户随后给出第二个 key。
+- `e2d4d757...`(64 位 hex,已写入 `.env.local`)——`/v1/models` 200(265 个 id)、
+  chat 200、responses 200,并且能登录该站 Web 面板(`POST /login`
+  `{mode:"api_token"}` -> `{"success":true}`)。
+- 结论:同一个 northstar 账号在 kiro 与 devin 两个域名下共用一把 key。
+
+### 2. 上游能力矩阵(全部直连实测,2026-10-08)
+
+| 探测 | 结果 |
+|---|---|
+| `GET /v1/models` | 200,265 个 id;`swe-2-high` 元数据 `context_tokens=262000`、
+  `max_output_tokens=128000`、`supports_images/tool_calls/parallel_tool_calls=true` |
+| `POST /v1/chat/completions` | 200,正文 `PONG`,同时带 `reasoning_content` |
+| `POST /v1/responses` | 200,output = `reasoning`(`rs_` 前缀 id + `encrypted_content`
+  `sealed.v1...`)+ `message` |
+| **responses 回放**(把上一轮 rs_ 与 encrypted_content 原样回传) | **200 且答对**,密文可回放 |
+| responses + tools + `tool_choice:"required"` | 200,真实 `function_call`,参数 `{"cmd":"ls -la"}` |
+| responses + 图片 | 200,见下 |
+| responses + `stream:true` | 200 SSE,先 `reasoning_content` 再 `content` |
+| 档位 `minimal/low/medium/high/xhigh/max` | **12/12 全部 200**;未公开的 `ultra` 也 200 |
+| 视觉 3 色 x2 轮 + 无图对照 | **6/6 全对**;对照组答 "I can't see an attached image." |
+
+**档位是装饰性的,别当控制杆**:同一道多步算术题,`minimal` 两次输出 2461 / 2209 tokens,
+`max` 两次 2689 / 1930——区间重叠。上游接受 `reasoning.effort` 但不据此改变行为。
+
+**踩过的坑(重要)**:第一轮视觉探测用**手贴的 PNG base64**,三张全答 `black/white` 且**无图
+对照也凭空报颜色**。那串 base64 根本不是有效图片 —— 上游于是自由编造。换成用 `zlib` 现场
+生成的真 PNG(纯色 64x64)后一次全对。**结论:判断视觉能力必须带无图对照组**,否则会把
+编造当成功;这条对以后每个 provider 都适用。
+
+### 3. 网关改动(全部按请求读配置,未重启,零停机)
+
+| 文件 | 改动 |
+|---|---|
+| `providers.json` | 新增 provider `devin-northstar`(`wire:responses`,
+  `keyEnv:DEVIN_NORTHSTAR_API_KEY`,六档 `efforts`);新增**唯一**模型 `swe2` -> `swe-2-high` |
+| `server.mjs` | `ROUTE_PREFIX` 加 `"devin-northstar": "DVN"`(环境变量覆盖 `AR_UPSTREAM_DVN`) |
+| `tools/build-model-catalog.cjs` | `PROVIDER_ABBR` 加 `dv`;`CTX_PIN` 加 `swe-2-high: 262000`;
+  `VISION_SLUGS` 加 `swe2` |
+| `.env.local` | 追加 `DEVIN_NORTHSTAR_API_KEY`(gitignored;备份见 `.tmp/.env.local.bak-*`) |
+| `README.md` | 路由表补一行 |
+
+备份:`.tmp/providers.json.bak-20261008-204351`、`.tmp/.env.local.bak-20261008-205535`、
+`.tmp/omp-model-catalog.json.bak-*`。
+
+### 4. 经**网关**端到端验证(不是直连)
+
+```
+[1] GET /u/v1/models        -> 200,swe2 在册,owned_by=devin-northstar
+[2] /u/v1/responses         -> 200
+[3] tools + tool_choice     -> 200,真实 function_call
+[4] 图片                    -> 200,答"Green"(无图对照答 "Unavailable")
+[5] stream=true             -> 200,17 个事件,response.completed,无 response.failed
+```
+
+流式细节(工具调用):`response.created` -> `response.in_progress` ->
+`response.output_item.added` x2 -> `response.reasoning_summary_text.delta` ->
+`response.function_call_arguments.delta` x6 -> `response.output_item.done` x2 ->
+`response.completed`。工具项 `id=fc_...`、`call_id=call_...#...`。
+
+**多轮工具回放**(Codex 每轮都会走的路):把上一轮的 `reasoning` + `function_call` +
+`function_call_output` 原样回传 -> **200**,模型正确消费工具输出并回答 `hi`。
+
+**命名空间工具**(子代理设施依赖的形状):该上游**原生理解** `type:"namespace"`,
+直接回 `{name:"spawn_agent", namespace:"multi_agent_v1"}`;给它扁平名也照样回扁平名。
+→ 与 kiro 不同,**不需要 `flattenNamespaceTools`**。
+
+回归: `node tools/check-syntax.mjs` 全通过;`test-namespace-passthrough` /
+`test-strict-item-ids` / `test-responses-ids`(16) / `test-realm-fallback` 全通过。
+
+### 5. catalog 与两处**已知漂移**(不是本次引入)
+
+重建 `~/.codex/omp-model-catalog.json`:83 -> 84 个条目,**只增 `swe2`,零删除**。
+`swe2`: `context_window=262000`、`effective=95%`、`auto_compact_token_limit=240708`、
+`input_modalities=[text,image]`、`default=max`、六档、`visibility=hide`(不在 Codex 选择器里,
+但**可按名字当子代理使用**;是否进选择器待用户决定)。
+
+重建时对照旧 catalog,发现 11 处字段漂移,全部与 swe2 无关且**不是本次引入**——是
+wb2api `/v1/models` 的可见集在两次构建之间变了(第一次构建时它正好不可达,wb2api 系模型
+整批退回默认档位)。按 2026-10-06 的裁决,档位跟随上游权威数据是正确行为,故保持现状,
+**但要向用户报告**:
+
+- `global:gpt-5.5`、`global:gpt-5.3-codex` 的 `default_reasoning_level` 由 `xhigh`/`medium`
+  变为 `max`(wb2api 把这些 id 从池子里藏起来了,取不到 `reasoning_supported_efforts`,
+  退回 `EFFORTS_DEFAULT` 后由 `PREFERENCE=[max,xhigh,high]` 选中 `max`)。
+- `cn:deepseek-v4-pro`、`cn:deepseek-v4-flash`、`cn:minimax-m3`、`cn:kimi-k3-1` 现在
+  拿到的是**上游真实**档位(如 minimax-m3 只有 `medium`),比旧 catalog 的猜测值更准。
+- `ag:gemini3.8h`、`ovo05:opus5.5`、`ovoapi:claude-opus-5.5` 的窗口被 `models.yml`
+  抬到 1000000 / 426667:该 provider 的 265 个 id 与这个问题无关,但**这些窗口是未实测的**,
+  若日后压缩行为异常,先怀疑这三个。
+
+`tools/build-model-catalog.cjs` 已知脆弱点(本次踩到,未修):wb2api `curl -m 20` 与
+冷启动竞争,第一次 `-m 20` 超时后整批退回默认档位。**重建 catalog 前先探一次
+`http://127.0.0.1:7863/v1/models`**,或给该脚本加重试。
+
+### 6. 未验证 / 边界(如实标注)
+
+- 上游元数据声明 `supports_documents/video=false`,未测;本次只声明 `[text,image]`。
+- `context_tokens=262000` 是**上游自报**,没有像 kiro 那样做 400k/500k 边界实测。
+- 该站其余 264 个 id **刻意未登记**(用户要求只加 SWE2);`swe-2-medium/max/swe-1-*` 同理。
+- `/v1/responses` 的密文回放只测了**一轮**;更深的链路(多轮 reasoning 累积)未测。
+- 未测该 key 的并发上限与计费口径;该站不在 `pricing.mjs` 的价格表里,`/stats` 会显示 n/a
+  (模型 id `swe-2-high` 在 `models.db` 中**查无此条**,已实测确认)。

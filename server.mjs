@@ -242,7 +242,7 @@ const ROUTES = {
 // tools/build-model-catalog.cjs reads, so the picker and the gateway cannot
 // disagree about which models exist or where they go.
 // ---------------------------------------------------------------------------
-const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", wb2api: "WB", anyrouter: "AN", justwoker: "JW", "northstar-kiro": "KI" };
+const ROUTE_PREFIX = { agentrouter: "AR", relaycat: "RC", "relaycat-cn": "RC", wb2api: "WB", anyrouter: "AN", justwoker: "JW", "northstar-kiro": "KI", "devin-northstar": "DVN" };
 
 // omp's own dashboard client (MIT), vendored from its embedded-client blob. Served
 // as static files so the browser loads index.js/styles.css relative to /stats/.

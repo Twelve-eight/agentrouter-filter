@@ -34,6 +34,7 @@ Codex 的 `model_provider.base_url` 指向 `http://127.0.0.1:7878/<route>/v1`:
 | `anyrouter` | `an` | `https://anyrouter.top` | responses | 否 | 否 |
 | `justwoker` | `jw` | `https://api.justwoker.icu` | **anthropic** | 否 | **是** |
 | `northstar-kiro` | `ki` | `https://kiro.northstar.cool` | responses | 否 | 否 |
+| `devin-northstar` | — | `https://devin.northstar.cool` | responses | 否 | 否 |
 | `antigravity` | — | `http://127.0.0.1:8045` | responses | 否 | 否 |
 | `opencode-zen` | — | `http://127.0.0.1:7901/zen` | **chat** | 否 | 否 |
 | `motomoto` | — | `https://motomoto.lol` | **chat** | 否 | 否 |

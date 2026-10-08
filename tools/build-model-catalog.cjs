@@ -131,6 +131,7 @@ const PROVIDER_ABBR = {
   anyrouter: 'an',
   justwoker: 'jw',
   'northstar-kiro': 'ki',
+  'devin-northstar': 'dv',
   'opencode-zen': 'zen',
   motomoto: 'moto',
   ovoapi: 'ovo',
@@ -243,6 +244,14 @@ const VISION_SLUGS = new Set([
   //   ovo05:opus5.5          -> 403 no access to the claude welfare group
   // Re-probe those two if their upstream quota recovers; do not copy this entry.
   'ki:opus5.5',
+  // devin-northstar SWE-2. Measured 2026-10-08 against the upstream directly (the
+  // gateway path is still unproven at the time of writing): three true-colour
+  // 64x64 PNGs generated with zlib, two rounds each - red/red, blue/Blue,
+  // green/green, all correct - while a no-image control answered "I can't see an
+  // attached image." An earlier round that 'saw' colours in BOTH images and the
+  // control was using an invalid hand-pasted base64; that is why the control is
+  // part of the probe. Do not add a slug here without one.
+  'swe2',
 ]);
 
 // The model list comes from providers.json - the same file the gateway routes on.
@@ -579,6 +588,10 @@ for (const m of merged.models) {
 // it, and this file's own precedence rule is that a recorded value beats a
 // blanket default. Only the sol/base ids are pinned.
 const CTX_PIN = {
+  // devin-northstar states context_tokens=262000 / max_output_tokens=128000 in
+  // its own /v1/models entry for swe-2-high. That is the upstream's published
+  // window and, unlike kiro, no probe shows it accepts more.
+  'swe-2-high': 262000,
   'gpt-6': 240000,
   'gpt-6-sol': 240000,
   'gpt-6.1-sol': 240000,

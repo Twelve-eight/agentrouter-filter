@@ -88,6 +88,20 @@
       "proxy": "http://127.0.0.1:7897",
       "_comment": "kiro.northstar.cool - order 5784 (Claude Code face + Codex/OpenAI face).\n\nWIRE: responses, native passthrough. Probed 2026-10-06: claude-opus-5.5 and\nclaude-sonnet-5.5 each answered 200 on /v1/responses, /v1/chat/completions and\n/v1/messages. Tool calls return real function_calls (exec_command with\n{\"cmd\":\"echo hi\"}) and stream=true returns a complete SSE run ending in\nresponse.completed. No proxy, no filter, no bridge needed.\n\nID HYGIENE: this upstream mints `fc_`/`msg_` ids (function_call came back as\nid=fc_fcc9cd78d62048fe87118ff504cdbf02 with call_id toolu_bdrk_...), so\nstrictItemIds stays OFF.\n\nKEY: NSCN_KIRO_API_KEY is supplied by the User-scope environment variable. It is\nnot in .env.local, so this route only works while that variable exists - add it\nto .env.local if the route must survive the variable being lost.\n\nMODEL COVERAGE: /v1/models also lists auto, claude-opus-5, claude-sonnet-5,\nclaude-opus-4.8/4.7/4.6/4.5, claude-sonnet-4.6/4.5 and gpt-5.6-sol/terra/luna.\nOnly the two ids the user asked for are registered; re-probe before adding the\nrest rather than assuming the whole list serves."
     },
+    "devin-northstar": {
+      "base": "https://devin.northstar.cool",
+      "wire": "responses",
+      "keyEnv": "DEVIN_NORTHSTAR_API_KEY",
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "_comment": "devin.northstar.cool - a Devin2API v0.18.0-fix.1 instance (/healthz). 265 ids listed; ONLY swe-2-high is registered (user instruction: SWE2 only).\nAUTH: the same northstar account key as kiro.northstar.cool. The FIRST key the user pasted (4aa12f0b...) 401d on every face; the second (e2d4d757...) works on /v1/models, /v1/chat/completions, /v1/responses and the web login. Recorded so nobody retries the dead one.\nWIRE: responses, native passthrough. Probed 2026-10-08: chat, responses, tools, SSE streaming and reasoning-item replay (a replayed rs_ id plus its sealed.v1 encrypted_content) all answered 200. We send /v1/responses.\nID HYGIENE: mints rs_ / msg_ / fc_ ids. No foreign-id problem observed, so strictItemIds stays OFF.\nEFFORTS: all six picker levels answered 200 twice (minimal/low/medium/high/xhigh/max); an unadvertised ultra also 200d, so the list is pinned to the six Codex understands. NOTE: they are NOT behaviourally distinct - the same multi-step arithmetic prompt at minimal spent 2461/2209 output tokens and at max 2689/1930, overlapping ranges. The upstream accepts the effort field without acting on it.\nVISION: verified for SWE2 - an earlier round using hand-pasted PNG base64 gave garbage, because that base64 was not a valid image; regenerating true PNGs answered red/blue/green 6/6 with a no-image control answering I cannot see an attached image."
+    },
     "antigravity": {
       "base": "http://127.0.0.1:8045",
       "wire": "responses",
@@ -484,7 +498,20 @@
     "ki:sonnet5.5": {
       "p": "northstar-kiro",
       "m": "claude-sonnet-5.5"
-    }
+    },
+    "swe2": {
+      "p": "devin-northstar",
+      "m": "swe-2-high",
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "_swe2_comment": "SWE-2 High, the ONLY id registered on devin-northstar (see that provider's _comment).\nThe slug is `swe2`, in the `ki:` / `ovo05:` abbreviated style; the wire id is`swe-2-high`. Renaming the slug later would silently change what clients send, sokeep the two in step with tools/build-model-catalog.cjs."
   },
   "_claude_comment": "claude-opus-4-8 is served by justwoker over the anthropic-messages wire (see the anthropic bridge in bridge.mjs). It was briefly removed when only agentrouter offered it: agentrouter registers the claude ids on its anthropic-messages face only (messages=402 quota, responses=503, while a nonexistent model is 503 on both) and codex speaks only responses, so selecting them always failed. That is why the responses->messages bridge exists. claude-opus-5 WAS unavailable on every provider we route until 2026-09-30, when\nthe ovoapi-amz key appeared; it is now served as `ovoapi:claude-opus-5` (probed\nthree rounds, 200 every time, with working tool calls). The same key also brings\nclaude-fable-5, claude-opus-4-7, claude-opus-4.8, claude-opus-5.5 and\nclaude-sonnet-5 - see the ovoapi-amz provider comment."
 }
