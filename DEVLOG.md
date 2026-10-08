@@ -4100,3 +4100,61 @@ omp -p --model ... @swe2-green.png '主色是什么?一个英文词'
 - **档位是装饰性的**(与本文件第 2 节同一结论):omp 里选 max 不会真的让上游更用力。
 - 该 provider 目前只有 1 个模型;该站其余 264 个 id 仍刻意未登记。
 - 现有 omp 会话可能需要重启才能刷新模型列表(本次改动由 CLI 实跑验证,验证进程是新起的)。
+
+### 8. swe-2 另外两个档位 + catalog 脆弱点修复(用户追问"还有 -max 和 -medium 啊?")
+
+用户提醒:`/v1/models` 里 swe-2 有 **三个** id,我只登记了 `swe-2-high`。补测:
+
+| id | context | output | 文本 | 工具 | 图片 | 流式 |
+|---|---|---|---|---|---|---|
+| `swe-2-high`   | 262000 | 128000 | 200 | 200 | 200 答 Green | 200 完整 |
+| `swe-2-medium` | 262000 | 128000 | 200 | 200 | 200 答 Green | 200 完整 |
+| `swe-2-max`    | 262000 | 128000 | 200 | 200 | 200 答 Green | 200 完整 |
+
+三个 id **都不是档位开关**,是三个独立模型(上游把它们并列列出,能力元数据完全一样)。
+各自的 `reasoning.effort` 参数同样只是被接受、不被执行 —— 与 high 那个的结论一致。
+
+**swe-1 系列全部不可用,是上游禁用的,不是我们漏配**:
+`swe-1-7` / `swe-1-7-medium` / `swe-1-7-lightning` / `swe-1-7-lightning-medium` /
+`swe-1-6` / `swe-1-6-fast` 在 `/v1/responses` 和 `/v1/chat/completions` 上**都**返回
+```
+404 {"error":{"message":"model 'swe-1-7' is disabled","stage":"model_..."}}
+```
+→ 这些 id 会出现在 `/v1/models` 里但**永远调不通**。登记前必须真发一次请求
+(只查模型列表会被骗)。
+
+### 改动
+
+| 文件 | 改动 |
+|---|---|
+| `providers.json` | 新增 `swe2-medium` / `swe2-max`(沿用 `devin-northstar`) |
+| `tools/build-model-catalog.cjs` | `VISION_SLUGS` += 两个新 slug;`CTX_PIN` += `swe-2-medium` / `swe-2-max` 262000 |
+| `~/.omp/agent/models.yml` | `devin-northstar` 下补 `swe-2-medium` / `swe-2-max` 两条 |
+| `~/.omp/agent/config.yml` | `enabledModels` 补两条 |
+
+### 验证
+
+```
+GET /u/v1/models            -> ["swe2", "swe2-medium", "swe2-max"]
+/u/v1/responses  x3         -> 200 "OK" 全通
+omp models devin-northstar  -> 3 个模型,均 262K / 128K / 六档 / images=yes
+omp -p --model devin-northstar/swe-2-medium '...'  -> devin-northstar/swe-2-medium OK
+omp -p --model devin-northstar/swe-2-max    '...'  -> devin-northstar/swe-2-max OK
+catalog: 84 -> 86 条目(只增这两个,零删除)
+```
+
+### 顺带修掉的真 bug:`build-model-catalog.cjs` 的 wb2api 冷启动竞争
+
+第 5 节记录过"第一次构建时 wb2api 不可达,档位整批退回默认值"。这次把它钉死了:
+
+- **实测**:wb2api 空闲后 `/v1/models` 要约 **32 秒**首答(本次三次尝试:32.3s -> 200)。
+- **原代码**:`curl -s -m 20`,单次 20 秒上限 → 必然超时 → `EFF` 为空 → 所有 wb2api 模型
+  退回 `EFFORTS_DEFAULT`,再被 `[max, xhigh, high]` 偏好改写成 `max`。
+- **修法**:改成 **3 次尝试 x 75 秒**(覆盖冷启动),并且**总失败时打 `!!` 醒目警告**,而不再是
+  一行不起眼的提示 —— 静默降级看起来和好 catalog 一模一样,这就是它一直没被发现的原因。
+- **效果**:本次重建 `45 个窗口 / 20 组档位 from wb2api`,不再退回默认值。
+
+同时**确认了一个非本次引入的既有差异**(第 5 节已列过,这里给结论):
+`global:gpt-5.3-codex` 与 `global:gpt-5.5` 的 `default_reasoning_level` 变成 `max`,
+原因是 **wb2api 当前没有把这两个 global id 列进 `/v1/models`**(本轮实测:6 个 global:* 全
+ABSENT),于是它们拿不到权威档位。`cn:` 系列本来就在列表里,档位是正确的。

@@ -252,6 +252,8 @@ const VISION_SLUGS = new Set([
   // control was using an invalid hand-pasted base64; that is why the control is
   // part of the probe. Do not add a slug here without one.
   'swe2',
+  'swe2-medium',
+  'swe2-max',
 ]);
 
 // The model list comes from providers.json - the same file the gateway routes on.
@@ -285,12 +287,36 @@ try {
 }
 const CTX = {};
 const EFF = {};
+// wb2api cold-start retry (2026-10-08).
+//
+// WHY: this call used to be a single `curl -m 20`. When wb2api had been idle it
+// needed ~32s to answer /v1/models, the curl timed out, and EVERY wb2api model
+// silently fell back to EFFORTS_DEFAULT - which then let the [max, xhigh, high]
+// preference rewrite cn:kimi-k3-1 (really high/xhigh) and cn:minimax-m3 (really
+// medium-only) to `max`. A degraded catalog looked exactly like a good one.
+//
+// So: try a few times with a per-attempt budget that covers a cold start, and
+// make a total failure LOUD rather than a one-line note.
+//
+// NOTE: the retry only helps because the upstream payload is the authority for
+// efforts; if wb2api is genuinely down the run still succeeds, with defaults.
+const WB_ATTEMPTS = 3;
+let wbRaw = null;
+for (let attempt = 1; attempt <= WB_ATTEMPTS && wbRaw === null; attempt++) {
+  try {
+    wbRaw = require("node:child_process").execFileSync(
+      "curl",
+      ["-s", "-m", "75", "http://127.0.0.1:7863/v1/models", "-H", `Authorization: Bearer ${process.env.WORKBUDDY_API_KEY ?? "sk-workbuddy"}`],
+      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+    );
+  } catch (e) {
+    const why = String(e?.message ?? e).slice(0, 60);
+    console.log(`context windows: wb2api attempt ${attempt}/${WB_ATTEMPTS} failed (${why})`);
+  }
+}
 try {
-  const raw = require("node:child_process").execFileSync(
-    "curl",
-    ["-s", "-m", "20", "http://127.0.0.1:7863/v1/models", "-H", `Authorization: Bearer ${process.env.WORKBUDDY_API_KEY ?? "sk-workbuddy"}`],
-    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
-  );
+  const raw = wbRaw ?? "";
+  if (!raw.trim()) throw new Error("no payload after " + WB_ATTEMPTS + " attempts");
   for (const m of JSON.parse(raw).data ?? []) {
     if (m.context_length > 0) CTX[m.id] = m.context_length;
     // Same payload also carries the authoritative effort set. Guessing it gave
@@ -302,7 +328,8 @@ try {
   }
   console.log(`context windows: ${Object.keys(CTX).length}, effort sets: ${Object.keys(EFF).length} from wb2api`);
 } catch (e) {
-  console.log(`context windows: wb2api unreachable (${e?.message?.slice(0, 40)}); using defaults`);
+  console.log(`!! context windows: wb2api UNREACHABLE (${e?.message?.slice(0, 60)}); using defaults`);
+  console.log("!!   every wb2api model keeps EFFORTS_DEFAULT and may advertise levels it cannot serve");
 }
 
 // Fallback only: agentrouter and relaycat publish no effort metadata, so their
@@ -592,6 +619,8 @@ const CTX_PIN = {
   // its own /v1/models entry for swe-2-high. That is the upstream's published
   // window and, unlike kiro, no probe shows it accepts more.
   'swe-2-high': 262000,
+  'swe-2-max': 262000,
+  'swe-2-medium': 262000,
   'gpt-6': 240000,
   'gpt-6-sol': 240000,
   'gpt-6.1-sol': 240000,
